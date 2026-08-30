@@ -198,3 +198,72 @@ def test_canonical_json_hash_is_independent_of_unordered_input() -> None:
     assert sha256(first.model_dump_json().encode()).digest() == sha256(
         second.model_dump_json().encode()
     ).digest()
+
+
+def test_output_requirements_are_detached_and_recursively_immutable() -> None:
+    caller_owned = {"nested": {"items": [{"value": 1}]}}
+    request = ResearchRequest(
+        question="What changed?",
+        output_requirements=caller_owned,
+        report_language="en",
+        source_languages=("en",),
+        freshness_requirement=FreshnessRequirement(kind="none"),
+        execution_mode="replay",
+        access_profile="local",
+        provider_profile_id="offline",
+        run_purpose="test",
+        budget_preset="low",
+    )
+    digest = sha256(request.model_dump_json().encode()).digest()
+    caller_owned["nested"]["items"][0]["value"] = 2
+
+    assert request.output_requirements["nested"]["items"][0]["value"] == 1
+    assert sha256(request.model_dump_json().encode()).digest() == digest
+    with pytest.raises(TypeError, match="immutable"):
+        request.output_requirements["new"] = True
+    with pytest.raises(TypeError, match="immutable"):
+        request.output_requirements["nested"]["items"].append("new")
+    with pytest.raises(TypeError, match="immutable"):
+        request.output_requirements["nested"]["items"][0]["value"] = 3
+    assert sha256(request.model_dump_json().encode()).digest() == digest
+    assert request.model_dump(mode="json")["output_requirements"] == {
+        "nested": {"items": [{"value": 1}]}
+    }
+
+
+def test_source_type_set_is_frozen_and_unique_in_both_json_schemas() -> None:
+    requirements = EvidenceRequirements(
+        min_independent_sources=1,
+        allowed_source_types=frozenset({"unknown", "paper", "news", "standard"}),
+        must_include_primary=False,
+    )
+
+    assert isinstance(requirements.allowed_source_types, frozenset)
+    assert '"allowed_source_types":["news","paper","standard","unknown"]' in (
+        requirements.model_dump_json()
+    )
+    for mode in ("validation", "serialization"):
+        schema = EvidenceRequirements.model_json_schema(mode=mode)
+        assert schema["properties"]["allowed_source_types"]["uniqueItems"] is True
+
+
+def test_deep_model_copy_preserves_recursive_immutability() -> None:
+    request = ResearchRequest(
+        question="What changed?",
+        output_requirements={"nested": {"items": [{"value": 1}]}},
+        report_language="en",
+        source_languages=("en",),
+        freshness_requirement=FreshnessRequirement(kind="none"),
+        execution_mode="replay",
+        access_profile="local",
+        provider_profile_id="offline",
+        run_purpose="test",
+        budget_preset="low",
+    )
+
+    copied = request.model_copy(deep=True)
+
+    assert copied == request
+    assert copied is not request
+    with pytest.raises(TypeError, match="immutable"):
+        copied.output_requirements["nested"]["items"].append("new")

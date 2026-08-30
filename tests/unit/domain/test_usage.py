@@ -1,4 +1,5 @@
 from decimal import Decimal
+from hashlib import sha256
 
 import pytest
 from pydantic import ValidationError
@@ -147,3 +148,34 @@ def test_budget_and_prompt_mapping_serialization_is_canonical() -> None:
     )
 
     assert first.model_dump_json() == second.model_dump_json()
+
+
+def test_used_by_node_is_detached_and_rejects_invalid_key_injection() -> None:
+    preset = RunBudget.preset("low")
+    caller_owned = dict(preset.used_by_node)
+    budget = RunBudget.model_validate({**preset.model_dump(), "used_by_node": caller_owned})
+    digest = sha256(budget.model_dump_json().encode()).digest()
+    caller_owned["Bad"] = ResourceUsage.zero()
+
+    assert "Bad" not in budget.used_by_node
+    with pytest.raises(TypeError, match="immutable"):
+        budget.used_by_node["Bad"] = ResourceUsage.zero()
+    with pytest.raises(TypeError, match="immutable"):
+        budget.used_by_node.update({"Bad": ResourceUsage.zero()})
+    assert sha256(budget.model_dump_json().encode()).digest() == digest
+
+
+def test_prompt_versions_are_detached_and_immutable() -> None:
+    caller_owned = {"planner": "v1"}
+    payload = run_config().model_dump()
+    payload["prompt_versions"] = caller_owned
+    config = RunConfig.model_validate(payload)
+    digest = sha256(config.model_dump_json().encode()).digest()
+    caller_owned["planner"] = "v2"
+
+    assert config.prompt_versions == {"planner": "v1"}
+    with pytest.raises(TypeError, match="immutable"):
+        config.prompt_versions["planner"] = "v3"
+    with pytest.raises(TypeError, match="immutable"):
+        config.prompt_versions.clear()
+    assert sha256(config.model_dump_json().encode()).digest() == digest

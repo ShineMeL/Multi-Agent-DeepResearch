@@ -1,6 +1,9 @@
+from __future__ import annotations
+
+from collections.abc import Iterable, Iterator
 from datetime import date
 from math import isfinite
-from typing import Annotated, Literal, Self
+from typing import Annotated, Literal, Never, Self, SupportsIndex, TypeVar
 
 from pydantic import (
     BaseModel,
@@ -13,6 +16,108 @@ from pydantic import (
 )
 
 from .enums import AccessProfile, ExecutionMode, RunPurpose, SourceType
+
+_Key = TypeVar("_Key")
+_Value = TypeVar("_Value")
+_Item = TypeVar("_Item")
+
+
+class _FrozenDict(dict[_Key, _Value]):
+    @staticmethod
+    def _raise_immutable() -> Never:
+        raise TypeError("domain mappings are immutable")
+
+    def __setitem__(self, key: _Key, value: _Value) -> Never:
+        self._raise_immutable()
+
+    def __delitem__(self, key: _Key) -> Never:
+        self._raise_immutable()
+
+    def __ior__(self, value: object) -> Never:
+        self._raise_immutable()
+
+    def __copy__(self) -> Self:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> Self:
+        memo[id(self)] = self
+        return self
+
+    def clear(self) -> Never:
+        self._raise_immutable()
+
+    def pop(self, key: _Key, default: object = None) -> Never:
+        self._raise_immutable()
+
+    def popitem(self) -> Never:
+        self._raise_immutable()
+
+    def setdefault(self, key: _Key, default: _Value | None = None) -> Never:
+        self._raise_immutable()
+
+    def update(self, *args: object, **kwargs: object) -> Never:
+        self._raise_immutable()
+
+
+class _FrozenList(list[_Item]):
+    @staticmethod
+    def _raise_immutable() -> Never:
+        raise TypeError("domain lists are immutable")
+
+    def __setitem__(
+        self,
+        index: SupportsIndex | slice[SupportsIndex | None, SupportsIndex | None, SupportsIndex | None],
+        value: _Item | Iterable[_Item],
+    ) -> Never:
+        self._raise_immutable()
+
+    def __delitem__(
+        self,
+        index: SupportsIndex | slice[SupportsIndex | None, SupportsIndex | None, SupportsIndex | None],
+    ) -> Never:
+        self._raise_immutable()
+
+    def __iadd__(self, value: Iterable[_Item]) -> Never:
+        self._raise_immutable()
+
+    def __imul__(self, value: SupportsIndex) -> Never:
+        self._raise_immutable()
+
+    def __copy__(self) -> Self:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> Self:
+        memo[id(self)] = self
+        return self
+
+    def append(self, value: _Item) -> Never:
+        self._raise_immutable()
+
+    def clear(self) -> Never:
+        self._raise_immutable()
+
+    def extend(self, values: Iterable[_Item]) -> Never:
+        self._raise_immutable()
+
+    def insert(self, index: SupportsIndex, value: _Item) -> Never:
+        self._raise_immutable()
+
+    def pop(self, index: SupportsIndex = -1) -> Never:
+        self._raise_immutable()
+
+    def remove(self, value: _Item) -> Never:
+        self._raise_immutable()
+
+    def reverse(self) -> Never:
+        self._raise_immutable()
+
+    def sort(self, *args: object, **kwargs: object) -> Never:
+        self._raise_immutable()
+
+
+class _CanonicalSourceTypes(frozenset[SourceType]):
+    def __iter__(self) -> Iterator[SourceType]:
+        return iter(sorted(super().__iter__()))
 
 
 class FreshnessRequirement(BaseModel):
@@ -51,6 +156,13 @@ class ResearchRequest(BaseModel):
     provider_profile_id: str
     run_purpose: RunPurpose
     budget_preset: Literal["low", "medium", "high"]
+
+    @field_validator("output_requirements")
+    @classmethod
+    def freeze_output_requirements(
+        cls, value: dict[str, JsonValue]
+    ) -> dict[str, JsonValue]:
+        return _freeze_json_mapping(value)
 
     @field_serializer("output_requirements", when_used="json")
     def serialize_output_requirements(
@@ -104,9 +216,12 @@ class EvidenceRequirements(BaseModel):
     must_include_primary: bool
     freshness: FreshnessRequirement | None = None
 
-    @field_serializer("allowed_source_types", when_used="json")
-    def serialize_allowed_source_types(self, value: frozenset[SourceType]) -> list[SourceType]:
-        return sorted(value)
+    @field_validator("allowed_source_types")
+    @classmethod
+    def canonicalize_source_types(
+        cls, value: frozenset[SourceType]
+    ) -> frozenset[SourceType]:
+        return _CanonicalSourceTypes(value)
 
 
 class SubQuestion(BaseModel):
@@ -193,6 +308,22 @@ def _canonical_json(value: JsonValue) -> JsonValue:
         return {key: _canonical_json(value[key]) for key in sorted(value)}
     if isinstance(value, list):
         return [_canonical_json(item) for item in value]
+    return value
+
+
+def _freeze_mapping[Key, Value](value: dict[Key, Value]) -> dict[Key, Value]:
+    return _FrozenDict(value)
+
+
+def _freeze_json_mapping(value: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    return _freeze_mapping({key: _freeze_json(item) for key, item in value.items()})
+
+
+def _freeze_json(value: JsonValue) -> JsonValue:
+    if isinstance(value, dict):
+        return _freeze_json_mapping(value)
+    if isinstance(value, list):
+        return _FrozenList(_freeze_json(item) for item in value)
     return value
 
 

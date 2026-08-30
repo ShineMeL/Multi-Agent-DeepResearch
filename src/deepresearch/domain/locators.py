@@ -1,4 +1,4 @@
-from typing import Annotated, Literal, Self
+from typing import Annotated, Literal, Self, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -34,6 +34,8 @@ class PdfLocator(BaseModel):
         return self
 
 
-type Locator = Annotated[HtmlLocator | PdfLocator, Field(discriminator="kind")]
+Locator: TypeAlias = Annotated[  # noqa: UP040 - exact frozen public contract
+    HtmlLocator | PdfLocator, Field(discriminator="kind")
+]
 
 __all__ = ["HtmlLocator", "Locator", "PdfLocator"]

@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from hashlib import sha256
 from typing import get_args
 
 import pytest
@@ -114,3 +115,22 @@ def test_public_payload_serialization_is_canonical() -> None:
     second = run_event(public_payload={"a": True, "z": {"a": 1, "b": 2}})
 
     assert first.model_dump_json() == second.model_dump_json()
+
+
+def test_public_payload_is_detached_and_recursively_immutable() -> None:
+    caller_owned = {"nested": {"items": [{"value": 1}]}}
+    event = run_event(public_payload=caller_owned)
+    digest = sha256(event.model_dump_json().encode()).digest()
+    caller_owned["nested"]["items"][0]["value"] = 2
+
+    assert event.public_payload["nested"]["items"][0]["value"] == 1
+    with pytest.raises(TypeError, match="immutable"):
+        event.public_payload["new"] = True
+    with pytest.raises(TypeError, match="immutable"):
+        event.public_payload["nested"]["items"].append("new")
+    with pytest.raises(TypeError, match="immutable"):
+        event.public_payload["nested"]["items"][0]["value"] = 3
+    assert sha256(event.model_dump_json().encode()).digest() == digest
+    assert event.model_dump(mode="json")["public_payload"] == {
+        "nested": {"items": [{"value": 1}]}
+    }

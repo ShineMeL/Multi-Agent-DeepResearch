@@ -7,6 +7,7 @@ from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, field_serializer,
 
 from .enums import ClaimType, SourceType, VerificationStatus
 from .locators import Locator
+from .research import _freeze_mapping  # pyright: ignore[reportPrivateUsage]
 
 
 def _require_sha256(value: str) -> str:
@@ -127,6 +128,11 @@ class RerankScore(BaseModel):
         for score in value.values():
             _require_finite(score)
         return value
+
+    @field_validator("feature_scores")
+    @classmethod
+    def freeze_feature_scores(cls, value: dict[str, float]) -> dict[str, float]:
+        return _freeze_mapping(value)
 
 
 __all__ = [

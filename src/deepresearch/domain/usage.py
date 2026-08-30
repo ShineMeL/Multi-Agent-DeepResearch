@@ -1,9 +1,16 @@
 from decimal import Decimal
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
-from .research import ResearchRequest
+from .research import ResearchRequest, _freeze_mapping  # pyright: ignore[reportPrivateUsage]
 
 _NodeName = Literal["Planner", "Ranker", "Writer", "Judge", "Tool"]
 
@@ -58,6 +65,13 @@ class RunBudget(BaseModel):
     max_retries: Annotated[int, Field(ge=0)]
     used_by_node: dict[_NodeName, ResourceUsage]
 
+    @field_validator("used_by_node")
+    @classmethod
+    def freeze_used_by_node(
+        cls, value: dict[_NodeName, ResourceUsage]
+    ) -> dict[_NodeName, ResourceUsage]:
+        return _freeze_mapping(value)
+
     @field_serializer("used_by_node", when_used="json")
     def serialize_used_by_node(
         self, value: dict[_NodeName, ResourceUsage]
@@ -94,6 +108,11 @@ class RunConfig(BaseModel):
     prompt_versions: dict[str, str]
     ranker_weights_version: str | None = None
     seed: int | None = None
+
+    @field_validator("prompt_versions")
+    @classmethod
+    def freeze_prompt_versions(cls, value: dict[str, str]) -> dict[str, str]:
+        return _freeze_mapping(value)
 
     @field_serializer("prompt_versions", when_used="json")
     def serialize_prompt_versions(self, value: dict[str, str]) -> dict[str, str]:

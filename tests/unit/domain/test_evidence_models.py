@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from hashlib import sha256
 from math import inf, nan
 
 import pytest
@@ -187,3 +188,18 @@ def test_rerank_feature_serialization_is_canonical() -> None:
     )
 
     assert first.model_dump_json() == second.model_dump_json()
+
+
+def test_feature_scores_are_detached_and_reject_post_validation_infinity() -> None:
+    caller_owned = {"semantic": 0.5}
+    score = RerankScore(evidence_id="ev-1", total=0.5, feature_scores=caller_owned)
+    digest = sha256(score.model_dump_json().encode()).digest()
+    caller_owned["semantic"] = inf
+
+    assert score.feature_scores == {"semantic": 0.5}
+    with pytest.raises(TypeError, match="immutable"):
+        score.feature_scores["semantic"] = inf
+    with pytest.raises(TypeError, match="immutable"):
+        score.feature_scores["new"] = nan
+    assert sha256(score.model_dump_json().encode()).digest() == digest
+    assert score.model_dump(mode="json")["feature_scores"] == {"semantic": 0.5}

@@ -1,7 +1,9 @@
+from typing import Annotated, TypeAliasType, get_args, get_origin, get_type_hints
+
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
-from deepresearch.domain import HtmlLocator, Locator, PdfLocator
+from deepresearch.domain import EvidenceSpan, HtmlLocator, Locator, PdfLocator
 
 
 def test_html_locator_uses_half_open_unicode_code_point_offsets() -> None:
@@ -51,6 +53,15 @@ def test_locator_union_uses_kind_discriminator() -> None:
 
     assert isinstance(html, HtmlLocator)
     assert isinstance(pdf, PdfLocator)
+
+
+def test_locator_is_the_eager_annotated_alias_used_by_evidence_span() -> None:
+    assert not isinstance(Locator, TypeAliasType)
+    assert get_origin(Locator) is Annotated
+    locator_union, discriminator = get_args(Locator)
+    assert set(get_args(locator_union)) == {HtmlLocator, PdfLocator}
+    assert discriminator.discriminator == "kind"
+    assert get_type_hints(EvidenceSpan, include_extras=True)["locator"] == Locator
 
 
 def test_locator_models_are_frozen_and_forbid_extra_fields() -> None:
