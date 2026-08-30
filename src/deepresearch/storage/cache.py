@@ -13,6 +13,7 @@ from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any, Literal, Never, Self, TypeAlias, cast, override
+from urllib.parse import parse_qsl
 
 from pydantic import (
     AnyHttpUrl,
@@ -42,25 +43,41 @@ _SECRET_KEY_NAMES = frozenset(
         "accesstoken",
         "apikey",
         "apitoken",
+        "authtoken",
         "authorization",
         "bearer",
+        "bearertoken",
+        "clientsecret",
         "cookie",
         "credential",
         "credentials",
+        "csrftoken",
+        "idtoken",
         "password",
         "passwd",
+        "privatekey",
         "refreshtoken",
         "secret",
+        "securitytoken",
+        "sessiontoken",
+        "signature",
         "token",
     }
 )
 _BENIGN_ACCOUNTING_KEYS = frozenset(
     {
         "cachedtokens",
+        "completiontokens",
         "inputtokens",
+        "maxcompletiontokens",
         "maxtokens",
         "outputtokens",
+        "prompttokens",
         "reasoningtokens",
+        "tokenbudget",
+        "tokencount",
+        "tokenlimit",
+        "tokenusage",
         "totaltokens",
     }
 )
@@ -174,11 +191,21 @@ def _is_secret_key(key: str) -> bool:
         "password",
         "passwd",
         "secret",
+        "signature",
     }:
         return True
     if "key" in word_set and word_set & {"api", "client", "private"}:
         return True
     return bool(word_set & {"token", "tokens"})
+
+
+def _is_secret_query_key(key: str) -> bool:
+    compact = _normalized_secret_key(key)
+    return (
+        _is_secret_key(key)
+        or "signature" in _secret_key_words(key)
+        or compact == "googleaccessid"
+    )
 
 
 def _reject_secrets(value: object) -> None:
@@ -330,6 +357,20 @@ class FetchCacheKey(_CacheModel):
     def reject_url_credentials(cls, value: AnyHttpUrl) -> AnyHttpUrl:
         if value.username is not None or value.password is not None:
             raise ValueError("canonical_url credentials/userinfo are forbidden in cache keys")
+        try:
+            query_pairs = parse_qsl(
+                value.query or "",
+                keep_blank_values=True,
+                encoding="utf-8",
+                errors="strict",
+            )
+        except UnicodeDecodeError as error:
+            raise ValueError("canonical_url query must use valid UTF-8 escapes") from error
+        for parameter_name, _ in query_pairs:
+            if _is_secret_query_key(parameter_name):
+                raise ValueError(
+                    f"canonical_url secret query parameter is forbidden: {parameter_name}"
+                )
         return value
 
 

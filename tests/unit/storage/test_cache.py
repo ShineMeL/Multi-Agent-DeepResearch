@@ -126,6 +126,13 @@ def test_cache_allows_benign_token_accounting_names() -> None:
             "total_tokens",
             "cached_tokens",
             "reasoning_tokens",
+            "prompt_tokens",
+            "completionTokens",
+            "token-count",
+            "max_completion_tokens",
+            "tokenLimit",
+            "token-budget",
+            "tokenUsage",
         )
     }
 
@@ -134,11 +141,63 @@ def test_cache_allows_benign_token_accounting_names() -> None:
     assert key.complete_parameters == parameters
 
 
+@pytest.mark.parametrize(
+    "secret_key",
+    [
+        "token",
+        "access_token",
+        "refreshToken",
+        "session-token",
+        "security_token",
+        "apiToken",
+        "auth_token",
+        "bearerToken",
+        "csrf-token",
+        "id_token",
+        "signature",
+        "privateKey",
+        "authorization",
+        "cookie",
+        "credential",
+    ],
+)
+def test_cache_rejects_exact_credential_token_families(secret_key: str) -> None:
+    with pytest.raises(ValidationError, match="secret"):
+        _search_key().model_copy(
+            update={"complete_parameters": {"nested": [{secret_key: "hidden"}]}}
+        )
+
+
 def test_fetch_cache_key_rejects_url_userinfo() -> None:
     with pytest.raises(ValidationError, match="credentials|userinfo|secret"):
         FetchCacheKey(
             snapshot_id="s1",
             canonical_url="https://user:password@example.com/path",
+            fetch_policy="fresh",
+            accepted_content_types=("text/html",),
+        )
+
+
+@pytest.mark.parametrize(
+    "parameter_name",
+    [
+        "api_key",
+        "access_token",
+        "token",
+        "X-Amz-Credential",
+        "X-Amz-Signature",
+        "X-Amz-Security-Token",
+        "X-Goog-Credential",
+        "X-Goog-Signature",
+        "X-Goog-Security-Token",
+        "GoogleAccessId",
+    ],
+)
+def test_fetch_cache_key_rejects_secret_query_parameters(parameter_name: str) -> None:
+    with pytest.raises(ValidationError, match="secret|credential|query"):
+        FetchCacheKey(
+            snapshot_id="s1",
+            canonical_url=f"https://example.com/path?{parameter_name}=hidden",
             fetch_policy="fresh",
             accepted_content_types=("text/html",),
         )

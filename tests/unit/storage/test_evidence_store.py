@@ -80,10 +80,25 @@ def _parsed_document(
         title="Example",
         authors=("Author",),
         normalized_text=text,
-        blocks=blocks or default_blocks,
+        blocks=blocks if blocks is not None else default_blocks,
         parser_id="parser",
         parser_version="parser-1",
         parsed_content_hash=sha256_text(text),
+    )
+
+
+def _html_block(block_id: str, paragraph_id: str, text: str) -> ParsedBlock:
+    from deepresearch.retrieval import sha256_text
+
+    return ParsedBlock(
+        block_id=block_id,
+        text=text,
+        locator=HtmlLocator(
+            paragraph_id=paragraph_id,
+            start_char=0,
+            end_char=len(text),
+        ),
+        text_hash=sha256_text(text),
     )
 
 
@@ -270,6 +285,122 @@ def test_evidence_store_rejects_duplicate_pdf_container_keys(tmp_path: Path) -> 
             source.source_id,
             _parsed_document(text="alpha omega", blocks=(first, duplicate)),
         )
+
+
+def test_evidence_store_binds_ordered_html_blocks_to_exact_source_text(tmp_path: Path) -> None:
+    text = "alpha\n\nomega"
+    source = _source(text=text)
+    parsed = _parsed_document(
+        text=text,
+        blocks=(
+            _html_block("block-1", "paragraph-1", "alpha"),
+            _html_block("block-2", "paragraph-2", "omega"),
+        ),
+    )
+    store = LocalEvidenceStore(tmp_path)
+    store.put_source(source, normalized_text=text)
+
+    assert store.put_parsed_document(source.source_id, parsed) == parsed
+
+
+@pytest.mark.parametrize(
+    "blocks",
+    [
+        (_html_block("fabricated", "paragraph-1", "fabricated"),),
+        (
+            _html_block("block-1", "paragraph-1", "alpha"),
+            _html_block("block-2", "paragraph-2", "omega"),
+        ),
+        (
+            _html_block("block-1", "paragraph-1", "omega"),
+            _html_block("block-2", "paragraph-2", "alpha"),
+        ),
+    ],
+    ids=("fabricated", "omitted-non-whitespace", "reordered"),
+)
+def test_evidence_store_rejects_blocks_not_covering_source_in_order(
+    tmp_path: Path, blocks: tuple[ParsedBlock, ...]
+) -> None:
+    text = "alpha hidden omega"
+    source = _source(text=text)
+    parsed = _parsed_document(text=text, blocks=blocks)
+    store = LocalEvidenceStore(tmp_path)
+    store.put_source(source, normalized_text=text)
+
+    with pytest.raises(EvidenceIntegrityError, match="block|source|content|order"):
+        store.put_parsed_document(source.source_id, parsed)
+
+
+def test_evidence_store_rejects_mixed_html_pdf_blocks(tmp_path: Path) -> None:
+    from deepresearch.retrieval import sha256_text
+
+    text = "alpha omega"
+    blocks = (
+        _html_block("html", "paragraph-1", "alpha"),
+        ParsedBlock(
+            block_id="pdf",
+            text="omega",
+            locator=PdfLocator(page_index=0, block_index=0, start_char=0, end_char=5),
+            text_hash=sha256_text("omega"),
+        ),
+    )
+    store = LocalEvidenceStore(tmp_path)
+    source = _source(text=text)
+    store.put_source(source, normalized_text=text)
+
+    with pytest.raises(EvidenceIntegrityError, match="format|HTML|PDF"):
+        store.put_parsed_document(
+            source.source_id, _parsed_document(text=text, blocks=blocks)
+        )
+
+
+def test_evidence_store_rejects_pdf_container_keys_out_of_tuple_order(tmp_path: Path) -> None:
+    from deepresearch.retrieval import sha256_text
+
+    text = "alpha omega"
+    blocks = (
+        ParsedBlock(
+            block_id="pdf-1",
+            text="alpha",
+            locator=PdfLocator(page_index=0, block_index=1, start_char=0, end_char=5),
+            text_hash=sha256_text("alpha"),
+        ),
+        ParsedBlock(
+            block_id="pdf-0",
+            text="omega",
+            locator=PdfLocator(page_index=0, block_index=0, start_char=0, end_char=5),
+            text_hash=sha256_text("omega"),
+        ),
+    )
+    store = LocalEvidenceStore(tmp_path)
+    source = _source(text=text)
+    store.put_source(source, normalized_text=text)
+
+    with pytest.raises(EvidenceIntegrityError, match="PDF|order|increasing"):
+        store.put_parsed_document(
+            source.source_id, _parsed_document(text=text, blocks=blocks)
+        )
+
+
+@pytest.mark.parametrize(
+    "field,replacement",
+    [
+        ("title", "Different title"),
+        ("authors", ("Different author",)),
+        ("published_at", datetime(2025, 1, 1, tzinfo=UTC)),
+        ("parser_version", "different-parser"),
+    ],
+)
+def test_evidence_store_rejects_mismatched_overlapping_source_metadata(
+    tmp_path: Path, field: str, replacement: object
+) -> None:
+    source = _source()
+    parsed = _parsed_document().model_copy(update={field: replacement})
+    store = LocalEvidenceStore(tmp_path)
+    store.put_source(source, normalized_text="short text")
+
+    with pytest.raises(EvidenceIntegrityError, match=field):
+        store.put_parsed_document(source.source_id, parsed)
 
 
 @pytest.mark.parametrize("subdirectory", ["sources", "evidence", "parsed"])

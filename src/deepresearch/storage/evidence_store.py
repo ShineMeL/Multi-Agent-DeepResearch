@@ -181,11 +181,25 @@ class LocalEvidenceStore:
         self._validate_evidence(evidence)
         return evidence
 
-    def _validate_parsed_structure(self, parsed_document: ParsedDocument) -> None:
+    def _validate_parsed_structure(
+        self,
+        parsed_document: ParsedDocument,
+        normalized_text: str,
+    ) -> None:
         html_keys: set[str] = set()
         pdf_keys: set[tuple[int, int]] = set()
+        locator_type: type[HtmlLocator | PdfLocator] | None = None
+        previous_pdf_key: tuple[int, int] | None = None
+        source_cursor = 0
         for block in parsed_document.blocks:
             locator = block.locator
+            current_locator_type = HtmlLocator if isinstance(locator, HtmlLocator) else PdfLocator
+            if locator_type is None:
+                locator_type = current_locator_type
+            elif current_locator_type is not locator_type:
+                raise EvidenceIntegrityError(
+                    "parsed document blocks must all use the same locator format"
+                )
             if isinstance(locator, HtmlLocator):
                 if locator.paragraph_id in html_keys:
                     raise EvidenceIntegrityError(
@@ -198,7 +212,26 @@ class LocalEvidenceStore:
                     raise EvidenceIntegrityError(
                         "parsed document PDF container keys must be unique"
                     )
+                if previous_pdf_key is not None and key <= previous_pdf_key:
+                    raise EvidenceIntegrityError(
+                        "parsed document PDF container keys must be strictly increasing"
+                    )
                 pdf_keys.add(key)
+                previous_pdf_key = key
+
+            block_start = normalized_text.find(block.text, source_cursor)
+            if block_start < 0:
+                raise EvidenceIntegrityError(
+                    "parsed block text does not match source content in tuple order"
+                )
+            if normalized_text[source_cursor:block_start].strip():
+                raise EvidenceIntegrityError(
+                    "parsed blocks omit non-whitespace source content"
+                )
+            source_cursor = block_start + len(block.text)
+
+        if normalized_text[source_cursor:].strip():
+            raise EvidenceIntegrityError("parsed blocks omit non-whitespace source content")
 
     def _validate_parsed_identity(
         self,
@@ -211,6 +244,14 @@ class LocalEvidenceStore:
             raise EvidenceIntegrityError("parsed document source does not exist") from error
         if parsed_document.canonical_url != source.canonical_url:
             raise EvidenceIntegrityError("parsed document canonical_url does not match source")
+        if parsed_document.title != source.title:
+            raise EvidenceIntegrityError("parsed document title does not match source")
+        if parsed_document.authors != source.authors:
+            raise EvidenceIntegrityError("parsed document authors does not match source")
+        if parsed_document.published_at != source.published_at:
+            raise EvidenceIntegrityError("parsed document published_at does not match source")
+        if parsed_document.parser_version != source.parser_version:
+            raise EvidenceIntegrityError("parsed document parser_version does not match source")
         if parsed_document.parsed_content_hash != source.parsed_content_hash:
             raise EvidenceIntegrityError(
                 "parsed document parsed_content_hash does not match source"
@@ -219,7 +260,7 @@ class LocalEvidenceStore:
             raise EvidenceIntegrityError(
                 "parsed document normalized_text does not match stored source text"
             )
-        self._validate_parsed_structure(parsed_document)
+        self._validate_parsed_structure(parsed_document, normalized_text)
         return source
 
     def _read_parsed_document(self, source_id: str) -> ParsedDocument:
@@ -328,7 +369,6 @@ class LocalEvidenceStore:
         source_id: str,
         parsed_document: ParsedDocument,
     ) -> ParsedDocument:
-        self._validate_parsed_identity(source_id, parsed_document)
         path = self._path(self._parsed_root, source_id)
         lock_path = path.with_suffix(".lock")
         record = {
@@ -348,6 +388,7 @@ class LocalEvidenceStore:
                             "source ID already contains a different parsed document"
                         )
                     return existing
+                self._validate_parsed_identity(source_id, parsed_document)
                 _ensure_safe_file_path(self._root, path)
                 _atomic_write_bytes(path, payload)
         except _UnsafeStoragePathError as error:
