@@ -7,6 +7,7 @@ import json
 import os
 import re
 import stat
+import sys
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
@@ -64,7 +65,6 @@ _SAFE_FETCH_HEADERS = frozenset(
         "content-type",
         "etag",
         "last-modified",
-        "location",
     }
 )
 _RECORD_FILENAME: dict[ReplayOperation, str] = {
@@ -119,7 +119,13 @@ def _unlock(descriptor: int) -> None:
 
 
 def _write_fsynced(path: Path, payload: bytes) -> None:
-    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_CREAT
+        | os.O_EXCL
+        | os.O_WRONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
     descriptor = os.open(path, flags, 0o600)
     try:
         view = memoryview(payload)
@@ -139,6 +145,36 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _atomic_rename_noreplace(source: Path, destination: Path) -> None:
+    """Atomically publish a directory and fail if destination already exists."""
+    if os.name == "nt":
+        os.rename(source, destination)
+        return
+    import ctypes
+    import errno
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    if sys.platform.startswith("linux"):
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise NotImplementedError("atomic no-replace rename is unavailable")
+        result = renameat2(-100, source_bytes, -100, destination_bytes, 1)
+    elif sys.platform == "darwin":
+        renamex_np = getattr(libc, "renamex_np", None)
+        if renamex_np is None:
+            raise NotImplementedError("atomic no-replace rename is unavailable")
+        result = renamex_np(source_bytes, destination_bytes, 0x00000004)
+    else:
+        raise NotImplementedError("atomic no-replace rename is unsupported")
+    if result != 0:
+        error_number = ctypes.get_errno()
+        if error_number == errno.EEXIST:
+            raise FileExistsError(error_number, os.strerror(error_number), destination)
+        raise OSError(error_number, os.strerror(error_number), destination)
 
 
 def _redact_public_message(message: str) -> str:
@@ -346,11 +382,12 @@ class ReplayBundleWriter:
             self._validate_owned_staging()
             if self._final_root.exists():
                 raise FileExistsError(self._final_root)
-            os.rename(staging, self._final_root)
+            _atomic_rename_noreplace(staging, self._final_root)
             published_marker = self._final_root / self._MARKER_NAME
             if _is_link_or_reparse(published_marker):
                 raise ValueError("published replay marker is unsafe")
             published_marker.unlink()
+            _fsync_directory(self._final_root)
             _fsync_directory(self._final_root.parent)
             self._staging_root = None
             self._closed = True
@@ -481,11 +518,23 @@ def _key(
 
 
 class RecordingModelProvider(_RecordingBase):
-    def __init__(self, delegate: ModelProvider, writer: ReplayBundleWriter) -> None:
+    def __init__(
+        self,
+        delegate: ModelProvider,
+        writer: ReplayBundleWriter,
+        *,
+        model_revision: str | None = None,
+    ) -> None:
         super().__init__(writer)
         self._delegate = delegate
         self.provider_id = delegate.provider_id
-        writer.register_provider("model", provider_id=self.provider_id)
+        revision = model_revision or cast("str | None", getattr(delegate, "model_revision", None))
+        if revision is None or not revision.strip():
+            raise ValueError("recording model providers require an immutable model_revision")
+        self.model_revision = revision
+        writer.register_provider(
+            "model", provider_id=self.provider_id, model_revision=self.model_revision
+        )
 
     async def complete(
         self,
@@ -497,7 +546,7 @@ class RecordingModelProvider(_RecordingBase):
         key = _key(
             "model.complete",
             self.provider_id,
-            model_request_payload(request),
+            model_request_payload(request, model_revision=self.model_revision),
             prompt_version=request.prompt_version,
         )
         return await self._record_call(
@@ -524,7 +573,7 @@ class RecordingModelProvider(_RecordingBase):
         key = _key(
             "model.structured",
             self.provider_id,
-            model_request_payload(request),
+            model_request_payload(request, model_revision=self.model_revision),
             prompt_version=request.prompt_version,
         )
         return await self._record_call(
@@ -562,7 +611,7 @@ class RecordingModelProvider(_RecordingBase):
             key = _key(
                 "model.stream",
                 self.provider_id,
-                model_request_payload(request),
+                model_request_payload(request, model_revision=self.model_revision),
                 prompt_version=request.prompt_version,
             )
             chunks = await self._record_call(

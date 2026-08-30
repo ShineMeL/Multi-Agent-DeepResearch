@@ -1,12 +1,14 @@
+import json
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import NoReturn
 
 import pytest
-from pydantic import JsonValue
+from pydantic import BaseModel, JsonValue
 
 from deepresearch.domain import ResourceUsage
 from deepresearch.providers import (
@@ -17,6 +19,7 @@ from deepresearch.providers import (
     ProviderError,
     RawDocument,
     SearchHit,
+    StructuredModelResult,
 )
 from deepresearch.providers.recording import (
     RecordingFetcher,
@@ -72,8 +75,10 @@ def _request() -> ModelRequest:
 class FakeModel:
     provider_id = "record-model"
 
-    def __init__(self) -> None:
+    def __init__(self, *, model_revision: str | None = "revision-1") -> None:
         self.calls = 0
+        if model_revision is not None:
+            self.model_revision = model_revision
 
     async def complete(self, request: ModelRequest, *, deadline: float, cancellation_token: CancellationToken) -> ModelResult[str]:
         del deadline
@@ -87,8 +92,25 @@ class FakeModel:
             raw_response_artifact_id="artifact-model",
         )
 
-    async def structured(self, request: ModelRequest, output_schema: type[object], *, deadline: float, cancellation_token: CancellationToken) -> object:
-        raise AssertionError("not used")
+    async def structured(
+        self,
+        request: ModelRequest,
+        output_schema: type[BaseModel],
+        *,
+        deadline: float,
+        cancellation_token: CancellationToken,
+    ) -> StructuredModelResult[BaseModel]:
+        del deadline
+        cancellation_token.raise_if_cancelled()
+        self.calls += 1
+        return StructuredModelResult(
+            output=output_schema.model_validate({"answer": "structured"}),
+            usage=_usage(),
+            provider_id=self.provider_id,
+            model_id=request.model_id,
+            raw_response_artifact_id="artifact-structured",
+            output_schema_hash=request.output_schema_hash,
+        )
 
     def stream(
         self,
@@ -150,7 +172,12 @@ class FakeFetcher:
             requested_url=url,
             final_url=url,
             status=200,
-            headers={"content-type": "text/plain", "set-cookie": "secret", "x-api-key": "secret"},
+            headers={
+                "content-type": "text/plain",
+                "location": "https://example.com/next?api_key=TOP-SECRET",
+                "set-cookie": "secret",
+                "x-api-key": "secret",
+            },
             content_type="text/plain",
             body_bytes=b"evidence",
             retrieved_at=datetime(2026, 1, 1, tzinfo=UTC),
@@ -201,6 +228,8 @@ async def test_recorded_model_search_fetch_and_embed_replay_without_delegates(tm
     private_text = (final_root / "documents.jsonl").read_text(encoding="utf-8").lower()
     assert "set-cookie" not in private_text
     assert "x-api-key" not in private_text
+    assert "location" not in private_text
+    assert "top-secret" not in private_text
     bundle = ReplayBundle.load(final_root)
     replay_model = await ReplayModelProvider(bundle).complete(
         _request(), deadline=_deadline(), cancellation_token=token
@@ -233,7 +262,11 @@ async def test_writer_abort_remains_safe_after_atomic_rename_failure(
         del source, destination
         raise OSError("synthetic rename failure")
 
-    monkeypatch.setattr("deepresearch.providers.recording.os.rename", fail_rename)
+    monkeypatch.setattr(
+        "deepresearch.providers.recording._atomic_rename_noreplace",
+        fail_rename,
+        raising=False,
+    )
     with pytest.raises(OSError, match="synthetic"):
         await writer.finalize()
     await writer.abort()
@@ -273,6 +306,34 @@ async def test_recorded_stream_replays_ordered_chunks_and_terminal_usage(
     assert [chunk.index for chunk in replayed] == [0, 1]
     assert replayed[-1].final_usage == _usage()
     assert model.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_replay_stream_rechecks_deadline_before_each_yield(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "stream-deadline"
+    writer = ReplayBundleWriter.create(root, run_id="stream-deadline")
+    token = CancellationToken()
+    recorded = RecordingModelProvider(FakeModel(), writer).stream(
+        _request(), deadline=_deadline(), cancellation_token=token
+    )
+    _ = tuple([chunk async for chunk in recorded])
+    await writer.finalize()
+
+    clock = iter((1.0, 1.0, 1.0, 1.0, 11.0))
+    monkeypatch.setattr(
+        "deepresearch.providers.replay.time",
+        SimpleNamespace(monotonic=lambda: next(clock)),
+    )
+    replayed = ReplayModelProvider(ReplayBundle.load(root)).stream(
+        _request(), deadline=10.0, cancellation_token=token
+    )
+
+    assert (await anext(replayed)).index == 0
+    with pytest.raises(ProviderError, match="deadline") as error:
+        await anext(replayed)
+    assert error.value.code == "TIMEOUT"
 
 
 @pytest.mark.asyncio
@@ -322,3 +383,76 @@ async def test_recording_expired_deadline_never_invokes_delegate(tmp_path: Path)
         assert search.calls == 0
     finally:
         await writer.abort()
+
+
+class Answer(BaseModel):
+    answer: str
+
+
+@pytest.mark.asyncio
+async def test_recorded_structured_result_replays_typed_output(tmp_path: Path) -> None:
+    writer = ReplayBundleWriter.create(tmp_path / "structured", run_id="structured-run")
+    token = CancellationToken()
+    recorded = await RecordingModelProvider(FakeModel(), writer).structured(
+        _request(), Answer, deadline=_deadline(), cancellation_token=token
+    )
+    await writer.finalize()
+
+    replayed = await ReplayModelProvider(ReplayBundle.load(tmp_path / "structured")).structured(
+        _request(), Answer, deadline=_deadline(), cancellation_token=token
+    )
+
+    assert replayed == recorded
+    assert replayed.output.answer == "structured"
+
+
+@pytest.mark.asyncio
+async def test_model_revision_is_required_persisted_and_changes_request_identity(
+    tmp_path: Path,
+) -> None:
+    missing_writer = ReplayBundleWriter.create(
+        tmp_path / "missing", run_id="missing-revision"
+    )
+    with pytest.raises(ValueError, match="revision"):
+        RecordingModelProvider(FakeModel(model_revision=None), missing_writer)
+    await missing_writer.abort()
+
+    request_hashes: list[str] = []
+    for revision in ("revision-1", "revision-2"):
+        root = tmp_path / revision
+        writer = ReplayBundleWriter.create(root, run_id=revision)
+        await RecordingModelProvider(FakeModel(model_revision=revision), writer).complete(
+            _request(), deadline=_deadline(), cancellation_token=CancellationToken()
+        )
+        await writer.finalize()
+        record = json.loads((root / "model_responses.jsonl").read_text(encoding="utf-8"))
+        request_hashes.append(record["key"]["request_sha256"])
+        snapshot = json.loads((root / "snapshot.json").read_text(encoding="utf-8"))
+        assert snapshot["providers"]["model"]["model_revision"] == revision
+
+    assert request_hashes[0] != request_hashes[1]
+
+
+@pytest.mark.asyncio
+async def test_writer_uses_atomic_no_replace_helper_for_destination_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writer = ReplayBundleWriter.create(tmp_path / "race", run_id="race-run")
+    called = False
+
+    def collide(source: Path, destination: Path) -> NoReturn:
+        nonlocal called
+        del source, destination
+        called = True
+        raise FileExistsError("synthetic destination race")
+
+    monkeypatch.setattr(
+        "deepresearch.providers.recording._atomic_rename_noreplace",
+        collide,
+        raising=False,
+    )
+    with pytest.raises(FileExistsError, match="destination race"):
+        await writer.finalize()
+    await writer.abort()
+
+    assert called is True

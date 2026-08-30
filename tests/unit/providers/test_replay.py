@@ -1,12 +1,19 @@
 import hashlib
 import json
 import shutil
+import time
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
-from deepresearch.providers import ProviderError
-from deepresearch.providers.replay import ReplaySearchProvider
+from deepresearch.providers import ModelMessage, ModelRequest, ProviderError
+from deepresearch.providers.replay import (
+    ReplayFetcher,
+    ReplayModelProvider,
+    ReplaySearchProvider,
+    ReplayTextEmbedder,
+)
 from deepresearch.providers.replay_schema import ReplayBundle
 from deepresearch.runtime import CancellationToken
 
@@ -18,6 +25,46 @@ def bundle() -> ReplayBundle:
     return ReplayBundle.load(FIXTURE_ROOT)
 
 
+def _future_deadline() -> float:
+    return time.monotonic() + 10.0
+
+
+def _fixture_model_request() -> ModelRequest:
+    return ModelRequest(
+        model_id="fixture-model-v1",
+        messages=(ModelMessage(role="user", content="Synthetic fixture question?"),),
+        temperature=Decimal(0),
+        seed=7,
+        max_output_tokens=32,
+        prompt_version="prompt-v1",
+        system_prompt_hash="a" * 64,
+        tool_schema_hash="b" * 64,
+        output_schema_hash="c" * 64,
+    )
+
+
+def _canonical(value: object) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def _update_file_hash(root: Path, filename: str) -> None:
+    manifest_path = root / "manifest.sha256"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["file_sha256"][filename] = hashlib.sha256(
+        (root / filename).read_bytes()
+    ).hexdigest()
+    manifest_path.write_bytes(_canonical(manifest) + b"\n")
+
+
+def _write_record(root: Path, filename: str, record: dict[str, object]) -> None:
+    outcome = record["outcome"]
+    record["outcome_sha256"] = hashlib.sha256(_canonical(outcome)).hexdigest()
+    (root / filename).write_bytes(_canonical(record) + b"\n")
+    _update_file_hash(root, filename)
+
+
 @pytest.mark.asyncio
 async def test_replay_search_exact_request_returns_recorded_hit(bundle: ReplayBundle) -> None:
     provider = ReplaySearchProvider(bundle)
@@ -26,7 +73,7 @@ async def test_replay_search_exact_request_returns_recorded_hit(bundle: ReplayBu
         "multimodal agents",
         5,
         {"language": "en"},
-        deadline=100.0,
+        deadline=_future_deadline(),
         cancellation_token=CancellationToken(),
     )
 
@@ -43,7 +90,7 @@ async def test_replay_miss_never_falls_back(bundle: ReplayBundle) -> None:
             "unknown query",
             5,
             None,
-            deadline=100.0,
+            deadline=_future_deadline(),
             cancellation_token=CancellationToken(),
         )
 
@@ -56,17 +103,14 @@ def test_bundle_verification_rejects_tampering_and_duplicate_keys(tmp_path: Path
     shutil.copytree(FIXTURE_ROOT, copied)
     search_path = copied / "search.jsonl"
     record = json.loads(search_path.read_text(encoding="utf-8"))
-    search_path.write_text(
-        json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
-        + json.dumps(record, sort_keys=True, separators=(",", ":"))
-        + "\n",
-        encoding="utf-8",
-    )
+    search_path.write_bytes(_canonical(record) + b"\n" + _canonical(record) + b"\n")
+    _update_file_hash(copied, "search.jsonl")
 
     with pytest.raises(ProviderError) as error:
         ReplayBundle.load(copied)
 
     assert error.value.code == "INVALID_SNAPSHOT"
+    assert "duplicate replay request key" in str(error.value.__cause__)
 
 
 def test_bundle_load_rejects_symlinked_record_file(tmp_path: Path) -> None:
@@ -124,3 +168,145 @@ def test_bundle_rejects_snapshot_provider_mismatch_even_with_updated_file_hash(
         ReplayBundle.load(copied)
 
     assert error.value.code == "INVALID_SNAPSHOT"
+
+
+@pytest.mark.asyncio
+async def test_fixture_exactly_replays_every_represented_operation(
+    bundle: ReplayBundle,
+) -> None:
+    token = CancellationToken()
+    model = await ReplayModelProvider(bundle).complete(
+        _fixture_model_request(), deadline=_future_deadline(), cancellation_token=token
+    )
+    search = await ReplaySearchProvider(bundle).search(
+        "multimodal agents",
+        5,
+        {"language": "en"},
+        deadline=_future_deadline(),
+        cancellation_token=token,
+    )
+    document = await ReplayFetcher(bundle).fetch(
+        "https://example.com/document",
+        deadline=_future_deadline(),
+        cancellation_token=token,
+    )
+    embeddings = await ReplayTextEmbedder(bundle).embed(
+        ("synthetic one", "synthetic two"),
+        deadline=_future_deadline(),
+        cancellation_token=token,
+    )
+
+    assert model.output == "Synthetic answer."
+    assert search[0].provider_metadata["source_id"] == "src-1"
+    assert document.body_bytes == b"synthetic document"
+    assert embeddings == ((0.1, 0.2), (0.3, 0.4))
+
+
+@pytest.mark.asyncio
+async def test_all_replay_operations_reject_expired_absolute_deadline(
+    bundle: ReplayBundle,
+) -> None:
+    token = CancellationToken()
+    expired = time.monotonic() - 1
+    calls = (
+        ReplayModelProvider(bundle).complete(
+            _fixture_model_request(), deadline=expired, cancellation_token=token
+        ),
+        ReplayModelProvider(bundle).structured(
+            _fixture_model_request(), dict[str, str], deadline=expired, cancellation_token=token
+        ),
+        ReplaySearchProvider(bundle).search(
+            "multimodal agents",
+            5,
+            {"language": "en"},
+            deadline=expired,
+            cancellation_token=token,
+        ),
+        ReplayFetcher(bundle).fetch(
+            "https://example.com/document", deadline=expired, cancellation_token=token
+        ),
+        ReplayTextEmbedder(bundle).embed(
+            ("synthetic one", "synthetic two"),
+            deadline=expired,
+            cancellation_token=token,
+        ),
+    )
+    for call in calls:
+        with pytest.raises(ProviderError) as error:
+            await call
+        assert error.value.code == "TIMEOUT"
+
+    stream = ReplayModelProvider(bundle).stream(
+        _fixture_model_request(), deadline=expired, cancellation_token=token
+    )
+    with pytest.raises(ProviderError) as stream_error:
+        await anext(stream)
+    assert stream_error.value.code == "TIMEOUT"
+
+
+def test_bundle_rejects_typed_invalid_success_with_consistent_hashes(tmp_path: Path) -> None:
+    copied = tmp_path / "bundle"
+    shutil.copytree(FIXTURE_ROOT, copied)
+    record = json.loads((copied / "search.jsonl").read_text(encoding="utf-8"))
+    record["outcome"]["response"] = "not-a-search-hit-list"
+    _write_record(copied, "search.jsonl", record)
+
+    with pytest.raises(ProviderError) as error:
+        ReplayBundle.load(copied)
+
+    assert error.value.code == "INVALID_SNAPSHOT"
+
+
+def test_bundle_rejects_incomplete_metadata_for_nonzero_operation(tmp_path: Path) -> None:
+    copied = tmp_path / "bundle"
+    shutil.copytree(FIXTURE_ROOT, copied)
+    snapshot_path = copied / "snapshot.json"
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    snapshot["providers"]["embed"].pop("model_revision")
+    snapshot_path.write_bytes(_canonical(snapshot) + b"\n")
+    _update_file_hash(copied, "snapshot.json")
+
+    with pytest.raises(ProviderError) as error:
+        ReplayBundle.load(copied)
+
+    assert error.value.code == "INVALID_SNAPSHOT"
+
+
+@pytest.mark.parametrize("framing", ["crlf", "missing-final-lf"])
+def test_bundle_rejects_noncanonical_jsonl_framing(
+    tmp_path: Path, framing: str
+) -> None:
+    copied = tmp_path / "bundle"
+    shutil.copytree(FIXTURE_ROOT, copied)
+    search_path = copied / "search.jsonl"
+    payload = search_path.read_bytes()
+    if framing == "crlf":
+        payload = payload.replace(b"\n", b"\r\n")
+    else:
+        payload = payload.removesuffix(b"\n")
+    search_path.write_bytes(payload)
+    _update_file_hash(copied, "search.jsonl")
+
+    with pytest.raises(ProviderError) as error:
+        ReplayBundle.load(copied)
+
+    assert error.value.code == "INVALID_SNAPSHOT"
+
+
+def test_bundle_rejects_cross_file_record_with_consistent_hash(tmp_path: Path) -> None:
+    copied = tmp_path / "bundle"
+    shutil.copytree(FIXTURE_ROOT, copied)
+    search_record = json.loads((copied / "search.jsonl").read_text(encoding="utf-8"))
+    model_path = copied / "model_responses.jsonl"
+    model_path.write_bytes(model_path.read_bytes() + _canonical(search_record) + b"\n")
+    _update_file_hash(copied, "model_responses.jsonl")
+    manifest_path = copied / "manifest.sha256"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["record_count_by_operation"]["search"] = 2
+    manifest_path.write_bytes(_canonical(manifest) + b"\n")
+
+    with pytest.raises(ProviderError) as error:
+        ReplayBundle.load(copied)
+
+    assert error.value.code == "INVALID_SNAPSHOT"
+    assert "operation/file mismatch" in str(error.value.__cause__)

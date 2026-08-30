@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
 import stat
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Annotated, Any, Literal, Never, Self, cast, override
 
@@ -21,7 +22,16 @@ from pydantic import (
 )
 
 from deepresearch.domain import ResourceUsage
-from deepresearch.providers import ProviderError
+from deepresearch.providers import (
+    ModelResult,
+    ModelStreamChunk,
+    ProviderError,
+    RawDocument,
+    SearchHit,
+    StructuredModelResult,
+    validate_embeddings,
+    validate_model_stream,
+)
 from deepresearch.retrieval import canonicalize_url, normalize_text
 from deepresearch.storage import FetchCacheKey, SearchCacheKey
 
@@ -139,11 +149,16 @@ def canonical_request_sha256(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
-def model_request_payload(request: object) -> dict[str, JsonValue]:
+def model_request_payload(
+    request: object, *, model_revision: str
+) -> dict[str, JsonValue]:
     dump = getattr(request, "model_dump", None)
     if not callable(dump):
         raise TypeError("model request must support model_dump")
-    return cast("dict[str, JsonValue]", dump(mode="json"))
+    if not model_revision:
+        raise ValueError("model_revision must not be empty")
+    payload = cast("dict[str, JsonValue]", dump(mode="json"))
+    return {**payload, "model_revision": model_revision}
 
 
 def search_request_payload(
@@ -336,6 +351,13 @@ class ReplayProviderSnapshot(_ReplayModel):
     def validate_optional_hash(cls, value: str | None) -> str | None:
         return None if value is None else _require_sha256(value)
 
+    @field_validator("provider_id", "model_id", "model_revision")
+    @classmethod
+    def validate_nonblank_metadata(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("provider metadata must not be blank")
+        return value
+
 
 class ReplaySnapshot(_ReplayModel):
     schema_version: Literal["replay-bundle-v1"]
@@ -408,6 +430,60 @@ def _invalid_snapshot(message: str, error: Exception | None = None) -> ProviderE
     return result
 
 
+def _validate_success_record(
+    record: ReplayRecord, provider: ReplayProviderSnapshot
+) -> None:
+    operation = record.key.operation
+    if operation.startswith("model."):
+        if not provider.model_revision:
+            raise ValueError("model provider metadata requires model_revision")
+    elif operation == "embed" and (
+        not provider.model_id
+        or not provider.model_revision
+        or not provider.snapshot_sha256
+    ):
+        raise ValueError("embedding provider metadata is incomplete")
+    if isinstance(record.outcome, ReplayFailure):
+        return
+    response = record.outcome.response
+    if operation == "model.complete":
+        result = ModelResult[JsonValue].model_validate(response)
+        if result.provider_id != record.key.provider_id or result.usage != record.usage:
+            raise ValueError("model response metadata or usage does not match its record")
+    elif operation == "model.structured":
+        result = StructuredModelResult[JsonValue].model_validate(response)
+        if result.provider_id != record.key.provider_id or result.usage != record.usage:
+            raise ValueError("structured response metadata or usage does not match its record")
+    elif operation == "model.stream":
+        if not isinstance(response, (list, tuple)):
+            raise ValueError("model stream response must be a sequence")
+        chunks = validate_model_stream(
+            tuple(ModelStreamChunk.model_validate(item) for item in response)
+        )
+        if chunks[-1].final_usage != record.usage:
+            raise ValueError("stream final usage does not match its record")
+    elif operation == "search":
+        if not isinstance(response, (list, tuple)):
+            raise ValueError("search response must be a sequence")
+        for item in response:
+            SearchHit.model_validate(item)
+    elif operation == "fetch":
+        if not isinstance(response, dict):
+            raise ValueError("fetch response must be an object")
+        payload: dict[str, object] = dict(response)
+        encoded = payload.pop("body_base64", None)
+        if not isinstance(encoded, str):
+            raise ValueError("fetch response requires body_base64")
+        payload["body_bytes"] = base64.b64decode(encoded, validate=True)
+        RawDocument.model_validate(payload)
+    else:
+        if not isinstance(response, (list, tuple)):
+            raise ValueError("embedding response must be a sequence")
+        vectors = cast("Sequence[Sequence[float]]", response)
+        validate_embeddings(tuple("x" for _ in vectors), vectors)
+
+
+
 class ReplayBundle:
     def __init__(
         self,
@@ -461,8 +537,13 @@ class ReplayBundle:
             for filename, allowed_operations in _RECORD_FILES.items():
                 path = _safe_child(resolved_root, filename)
                 previous_sort_key: bytes | None = None
-                for line_number, raw_line in enumerate(path.read_bytes().splitlines(), start=1):
-                    if not raw_line.strip():
+                payload = path.read_bytes()
+                if payload and (not payload.endswith(b"\n") or b"\r" in payload):
+                    raise ValueError(f"non-canonical JSONL framing in {filename}")
+                raw_lines = () if not payload else payload[:-1].split(b"\n")
+                canonical_lines: list[bytes] = []
+                for line_number, raw_line in enumerate(raw_lines, start=1):
+                    if not raw_line:
                         raise ValueError(f"blank JSONL record in {filename}:{line_number}")
                     loaded: object = json.loads(raw_line)
                     record = ReplayRecord.model_validate(loaded)
@@ -481,6 +562,7 @@ class ReplayBundle:
                     canonical_line = canonical_json_bytes(record.model_dump(mode="json"))
                     if raw_line != canonical_line:
                         raise ValueError(f"non-canonical JSONL record in {filename}:{line_number}")
+                    canonical_lines.append(canonical_line)
                     sort_key = canonical_json_bytes(record.key.model_dump(mode="json"))
                     if previous_sort_key is not None and sort_key < previous_sort_key:
                         raise ValueError(f"unsorted JSONL records in {filename}")
@@ -490,6 +572,12 @@ class ReplayBundle:
                         raise ValueError("duplicate replay request key")
                     records[identity] = record
                     counts[record.key.operation] += 1
+                    _validate_success_record(record, provider)
+                expected_payload = (
+                    b"" if not canonical_lines else b"\n".join(canonical_lines) + b"\n"
+                )
+                if payload != expected_payload:
+                    raise ValueError(f"non-canonical JSONL framing in {filename}")
             complete_counts = {operation: counts[operation] for operation in REPLAY_OPERATIONS}
             if complete_counts != manifest.record_count_by_operation:
                 raise ValueError("replay record counts do not match manifest.sha256")

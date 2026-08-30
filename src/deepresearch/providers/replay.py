@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import TypeVar, cast
 
@@ -79,6 +80,19 @@ class _ReplayProvider:
             )
         return record.outcome
 
+    def _checkpoint(
+        self, *, deadline: float, cancellation_token: CancellationToken, operation: str
+    ) -> None:
+        cancellation_token.raise_if_cancelled()
+        if time.monotonic() >= deadline:
+            raise ProviderError(
+                code="TIMEOUT",
+                provider=self.provider_id,
+                operation=operation,
+                public_message="provider call deadline exceeded",
+                retryable=True,
+            )
+
     @staticmethod
     def _invalid_response(provider: str, operation: str, error: Exception) -> ProviderError:
         return ProviderError(
@@ -93,6 +107,13 @@ class _ReplayProvider:
 class ReplayModelProvider(_ReplayProvider):
     def __init__(self, bundle: ReplayBundle) -> None:
         super().__init__(bundle, provider_kind="model")
+        if not self._provider_snapshot.model_revision:
+            raise ProviderError(
+                code="INVALID_SNAPSHOT", provider=self.provider_id,
+                operation="model", public_message="model replay metadata is incomplete",
+                retryable=False,
+            )
+        self.model_revision = self._provider_snapshot.model_revision
 
     async def complete(
         self,
@@ -101,16 +122,15 @@ class ReplayModelProvider(_ReplayProvider):
         deadline: float,
         cancellation_token: CancellationToken,
     ) -> ModelResult[str]:
-        del deadline
-        cancellation_token.raise_if_cancelled()
+        self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation="model.complete")
         key = self._key(
             "model.complete",
-            model_request_payload(request),
+            model_request_payload(request, model_revision=self.model_revision),
             prompt_version=request.prompt_version,
         )
         outcome = self._lookup(key)
         await asyncio.sleep(0)
-        cancellation_token.raise_if_cancelled()
+        self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation=key.operation)
         try:
             return ModelResult[str].model_validate(outcome.response)
         except ValidationError as error:
@@ -124,16 +144,15 @@ class ReplayModelProvider(_ReplayProvider):
         deadline: float,
         cancellation_token: CancellationToken,
     ) -> StructuredModelResult[T]:
-        del deadline
-        cancellation_token.raise_if_cancelled()
+        self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation="model.structured")
         key = self._key(
             "model.structured",
-            model_request_payload(request),
+            model_request_payload(request, model_revision=self.model_revision),
             prompt_version=request.prompt_version,
         )
         outcome = self._lookup(key)
         await asyncio.sleep(0)
-        cancellation_token.raise_if_cancelled()
+        self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation=key.operation)
         try:
             if not isinstance(outcome.response, dict):
                 raise TypeError("structured replay response must be an object")
@@ -152,16 +171,15 @@ class ReplayModelProvider(_ReplayProvider):
         deadline: float,
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[ModelStreamChunk]:
-        del deadline
-
         async def replay_chunks() -> AsyncIterator[ModelStreamChunk]:
-            cancellation_token.raise_if_cancelled()
+            self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation="model.stream")
             key = self._key(
                 "model.stream",
-                model_request_payload(request),
+                model_request_payload(request, model_revision=self.model_revision),
                 prompt_version=request.prompt_version,
             )
             outcome = self._lookup(key)
+            self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation=key.operation)
             try:
                 raw_chunks = cast("list[object] | tuple[object, ...]", outcome.response)
                 chunks = validate_model_stream(
@@ -170,9 +188,9 @@ class ReplayModelProvider(_ReplayProvider):
             except (TypeError, ValueError, ValidationError) as error:
                 raise self._invalid_response(self.provider_id, key.operation, error) from error
             for chunk in chunks:
-                cancellation_token.raise_if_cancelled()
+                self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation=key.operation)
                 await asyncio.sleep(0)
-                cancellation_token.raise_if_cancelled()
+                self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation=key.operation)
                 yield chunk
 
         return replay_chunks()
@@ -191,12 +209,11 @@ class ReplaySearchProvider(_ReplayProvider):
         deadline: float,
         cancellation_token: CancellationToken,
     ) -> list[SearchHit]:
-        del deadline
-        cancellation_token.raise_if_cancelled()
+        self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation="search")
         key = self._key("search", search_request_payload(query, limit, filters))
         outcome = self._lookup(key)
         await asyncio.sleep(0)
-        cancellation_token.raise_if_cancelled()
+        self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation=key.operation)
         try:
             items = cast("list[object] | tuple[object, ...]", outcome.response)
             return [SearchHit.model_validate(item) for item in items]
@@ -215,12 +232,11 @@ class ReplayFetcher(_ReplayProvider):
         deadline: float,
         cancellation_token: CancellationToken,
     ) -> RawDocument:
-        del deadline
-        cancellation_token.raise_if_cancelled()
+        self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation="fetch")
         key = self._key("fetch", fetch_request_payload(url))
         outcome = self._lookup(key)
         await asyncio.sleep(0)
-        cancellation_token.raise_if_cancelled()
+        self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation=key.operation)
         try:
             response = dict(cast("dict[str, JsonValue]", outcome.response))
             encoded_body = response.pop("body_base64")
@@ -260,13 +276,12 @@ class ReplayTextEmbedder(_ReplayProvider):
         deadline: float,
         cancellation_token: CancellationToken,
     ) -> tuple[tuple[float, ...], ...]:
-        del deadline
-        cancellation_token.raise_if_cancelled()
+        self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation="embed")
         frozen_texts = tuple(texts)
         key = self._key("embed", embed_request_payload(frozen_texts))
         outcome = self._lookup(key)
         await asyncio.sleep(0)
-        cancellation_token.raise_if_cancelled()
+        self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation=key.operation)
         try:
             raw_vectors = cast("list[list[float]] | tuple[tuple[float, ...], ...]", outcome.response)
             return validate_embeddings(frozen_texts, raw_vectors)

@@ -15,6 +15,7 @@ from pydantic import (
     ConfigDict,
     Field,
     JsonValue,
+    ValidationInfo,
     field_serializer,
     field_validator,
     model_validator,
@@ -27,11 +28,20 @@ from deepresearch.domain import (
     RunStatus,
     StopReason,
 )
+from deepresearch.retrieval import canonicalize_url, normalize_text
+from deepresearch.storage import (
+    EmbedCacheKey,
+    FetchCacheKey,
+    ModelCacheKey,
+    ParseCacheKey,
+    SearchCacheKey,
+)
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _GIT_COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}")
 _ARTIFACT_ID = re.compile(r"sha256:[0-9a-f]{64}")
+_MIME_TYPE = re.compile(r"[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+")
 
 
 class _FrozenDict(dict[str, Any]):
@@ -292,7 +302,16 @@ class ProviderCallRecord(_ManifestModel):
         if not self.outcome_code:
             raise ValueError("outcome_code must not be empty")
 
-        required: set[str]
+        def exact(names: set[str]) -> None:
+            if set(self.complete_parameters) != names:
+                raise ValueError(
+                    f"{self.operation} complete_parameters must contain exactly {sorted(names)}"
+                )
+
+        def forbid(*values: object) -> None:
+            if any(value is not None for value in values):
+                raise ValueError(f"{self.operation} call contains operation-irrelevant fields")
+
         if self.operation == "model":
             values = (
                 self.model_id,
@@ -306,10 +325,24 @@ class ProviderCallRecord(_ManifestModel):
                 raise ValueError("model calls require model, revision, prompt and schema fields")
             if self.temperature is None:
                 raise ValueError("model calls require temperature")
+            exact({"seed_supported"})
             if not isinstance(self.complete_parameters.get("seed_supported"), bool):
                 raise ValueError("model calls require explicit seed_supported")
             if self.seed is not None and self.complete_parameters["seed_supported"] is not True:
                 raise ValueError("model seed requires seed support")
+            forbid(self.snapshot_id, self.normalized_query, self.locale, self.time_policy)
+            ModelCacheKey(
+                provider_id=self.provider_id,
+                endpoint_type=self.endpoint_type,
+                model_id=cast("str", self.model_id),
+                prompt_version=cast("str", self.prompt_version),
+                system_prompt_hash=cast("str", self.system_prompt_hash),
+                tool_schema_hash=cast("str", self.tool_schema_hash),
+                output_schema_hash=cast("str", self.output_schema_hash),
+                temperature=self.temperature,
+                seed=self.seed,
+                canonical_request_hash=self.request_sha256,
+            )
             return self
         if self.operation == "search":
             if (
@@ -320,31 +353,95 @@ class ProviderCallRecord(_ManifestModel):
                 or not self.complete_parameters
             ):
                 raise ValueError("search calls require snapshot/query/locale/parameters/time policy")
-            required = {"limit"}
+            exact({"filters", "limit"})
+            forbid(
+                self.model_id, self.model_revision, self.prompt_version,
+                self.system_prompt_hash, self.tool_schema_hash, self.output_schema_hash,
+                self.temperature, self.seed,
+            )
+            if normalize_text(self.normalized_query) != self.normalized_query:
+                raise ValueError("normalized_query is not canonical")
+            SearchCacheKey(
+                snapshot_id=self.snapshot_id,
+                normalized_query=self.normalized_query,
+                provider_id=self.provider_id,
+                endpoint_type=self.endpoint_type,
+                locale=self.locale,
+                complete_parameters=self.complete_parameters,
+                time_policy=self.time_policy,
+            )
         elif self.operation == "fetch":
             if not self.snapshot_id:
                 raise ValueError("fetch calls require snapshot_id")
-            required = {"canonical_url", "fetch_policy", "accepted_content_types"}
+            exact({"canonical_url", "fetch_policy", "accepted_content_types"})
+            forbid(
+                self.model_id, self.model_revision, self.normalized_query, self.locale,
+                self.time_policy, self.prompt_version, self.system_prompt_hash,
+                self.tool_schema_hash, self.output_schema_hash, self.temperature, self.seed,
+            )
+            url = self.complete_parameters["canonical_url"]
+            accepted = self.complete_parameters["accepted_content_types"]
+            if not isinstance(url, str) or canonicalize_url(url) != url:
+                raise ValueError("fetch canonical_url is not canonical")
+            if not isinstance(accepted, (list, tuple)) or any(
+                not isinstance(item, str) or _MIME_TYPE.fullmatch(item) is None
+                for item in accepted
+            ):
+                raise ValueError("accepted_content_types must be MIME type strings")
+            FetchCacheKey.model_validate(
+                {
+                    "snapshot_id": self.snapshot_id,
+                    "canonical_url": url,
+                    "fetch_policy": self.complete_parameters["fetch_policy"],
+                    "accepted_content_types": accepted,
+                }
+            )
         elif self.operation == "parse":
             if not self.snapshot_id:
                 raise ValueError("parse calls require snapshot_id")
-            required = {
+            names = {
                 "raw_content_hash",
                 "parser_id",
                 "parser_version",
                 "normalization_version",
             }
+            exact(names)
+            forbid(
+                self.model_id, self.model_revision, self.normalized_query, self.locale,
+                self.time_policy, self.prompt_version, self.system_prompt_hash,
+                self.tool_schema_hash, self.output_schema_hash, self.temperature, self.seed,
+            )
+            for name in ("parser_id", "parser_version", "normalization_version"):
+                value = self.complete_parameters[name]
+                if not isinstance(value, str):
+                    raise TypeError(f"{name} must be a stable identifier")
+                _require_identifier(value)
+            ParseCacheKey.model_validate(
+                {"snapshot_id": self.snapshot_id, **dict(self.complete_parameters)}
+            )
         else:
             if self.model_id is None or self.model_revision is None:
                 raise ValueError("embed calls require model_id and model_revision")
-            required = {
+            names = {
                 "snapshot_sha256",
                 "normalize_embeddings",
                 "canonical_texts_hash",
             }
-        missing = required.difference(self.complete_parameters)
-        if missing:
-            raise ValueError(f"{self.operation} complete_parameters missing {sorted(missing)}")
+            exact(names)
+            forbid(
+                self.snapshot_id, self.normalized_query, self.locale, self.time_policy,
+                self.prompt_version, self.system_prompt_hash, self.tool_schema_hash,
+                self.output_schema_hash, self.temperature, self.seed,
+            )
+            if type(self.complete_parameters["normalize_embeddings"]) is not bool:
+                raise ValueError("normalize_embeddings must be a boolean")
+            EmbedCacheKey.model_validate(
+                {
+                    "model_id": self.model_id,
+                    "model_revision": self.model_revision,
+                    **dict(self.complete_parameters),
+                }
+            )
         for name in ("raw_content_hash", "snapshot_sha256", "canonical_texts_hash"):
             value = self.complete_parameters.get(name)
             if value is not None:
@@ -542,8 +639,26 @@ class RunManifest(_ManifestModel):
             raise ValueError("identifier lists must be unique")
         return tuple(_require_identifier(item) for item in value)
 
+    @classmethod
+    def create(cls, payload: Mapping[str, object]) -> RunManifest:
+        """Construct a new manifest and intentionally compute its content hash."""
+        values = dict(payload)
+        values["manifest_sha256"] = ""
+        return cls.model_validate(values, context={"rehash_manifest": True})
+
+    @override
+    def model_copy(
+        self, *, update: Mapping[str, Any] | None = None, deep: bool = False
+    ) -> Self:
+        if update is None:
+            return super().model_copy(deep=deep)
+        values = self.model_dump(round_trip=True)
+        values.update(update)
+        values["manifest_sha256"] = ""
+        return type(self).model_validate(values, context={"rehash_manifest": True})
+
     @model_validator(mode="after")
-    def validate_manifest(self) -> RunManifest:
+    def validate_manifest(self, info: ValidationInfo) -> RunManifest:
         if self.finished_at < self.started_at:
             raise ValueError("finished_at must not precede started_at")
         if self.seed is not None and not self.seed_supported:
@@ -561,6 +676,7 @@ class RunManifest(_ManifestModel):
         if self.model_ids != expected_models:
             raise ValueError("model_ids must equal model call model IDs in first-use order")
         self._validate_contiguous_attempts()
+        self._validate_usage_reconciliation()
         self._validate_pricing()
         self._validate_budget_limits()
         parsed_ids = {record.artifact_id for record in self.parsed_artifacts}
@@ -568,7 +684,13 @@ class RunManifest(_ManifestModel):
         if not (parsed_ids | evidence_ids).issubset(set(self.artifact_ids)):
             raise ValueError("record artifact IDs must be present in artifact_ids")
         expected_hash = self.canonical_sha256()
-        object.__setattr__(self, "manifest_sha256", expected_hash)
+        if self.manifest_sha256:
+            if self.manifest_sha256 != expected_hash:
+                raise ValueError("manifest_sha256 does not match canonical manifest content")
+        elif info.context and info.context.get("rehash_manifest") is True:
+            object.__setattr__(self, "manifest_sha256", expected_hash)
+        else:
+            raise ValueError("blank manifest_sha256 requires RunManifest.create")
         return self
 
     def _validate_contiguous_attempts(self) -> None:
@@ -585,6 +707,70 @@ class RunManifest(_ManifestModel):
         for attempts in call_attempts.values():
             if attempts != list(range(1, len(attempts) + 1)):
                 raise ValueError("provider call attempts must be ordered and contiguous")
+
+    @staticmethod
+    def _aggregate_usage(
+        usages: tuple[ResourceUsage, ...], *, wall_seconds: float
+    ) -> ResourceUsage:
+        costs = tuple(item.cost_usd for item in usages)
+        cost = None if any(item is None for item in costs) else sum(
+            (cast("Decimal", item) for item in costs), Decimal(0)
+        )
+        return ResourceUsage(
+            input_tokens=sum(item.input_tokens for item in usages),
+            output_tokens=sum(item.output_tokens for item in usages),
+            reasoning_tokens=sum(item.reasoning_tokens for item in usages),
+            cached_tokens=sum(item.cached_tokens for item in usages),
+            total_tokens=sum(item.total_tokens for item in usages),
+            search_calls=sum(item.search_calls for item in usages),
+            pages=sum(item.pages for item in usages),
+            retries=sum(item.retries for item in usages),
+            wall_seconds=wall_seconds,
+            cost_usd=cost,
+        )
+
+    def _validate_usage_reconciliation(self) -> None:
+        """Reconcile calls into executions, nodes, then the run without summing wall time."""
+        execution_by_attempt = {
+            (execution.node, execution.attempt): execution
+            for execution in self.node_executions
+        }
+        if len(execution_by_attempt) != len(self.node_executions):
+            raise ValueError("node executions must be unique by node and attempt")
+        additive = (
+            "input_tokens", "output_tokens", "reasoning_tokens", "cached_tokens",
+            "total_tokens", "search_calls", "pages", "retries",
+        )
+        calls_by_attempt: defaultdict[tuple[str, int], list[ProviderCallRecord]] = defaultdict(list)
+        for call in self.provider_calls:
+            key = (call.node, call.attempt)
+            if key not in execution_by_attempt:
+                raise ValueError("provider call references a missing node execution attempt")
+            calls_by_attempt[key].append(call)
+        for key, calls in calls_by_attempt.items():
+            execution = execution_by_attempt[key]
+            for field in additive:
+                if sum(getattr(call.usage, field) for call in calls) > getattr(execution.usage, field):
+                    raise ValueError("provider call usage exceeds its node execution usage")
+
+        executions_by_node: defaultdict[str, list[NodeExecutionRecord]] = defaultdict(list)
+        for execution in self.node_executions:
+            executions_by_node[execution.node].append(execution)
+        if set(self.usage_by_node) != set(executions_by_node):
+            raise ValueError("usage_by_node keys must equal node execution nodes")
+        for node, executions in executions_by_node.items():
+            expected = self._aggregate_usage(
+                tuple(item.usage for item in executions),
+                wall_seconds=max((item.usage.wall_seconds for item in executions), default=0),
+            )
+            if self.usage_by_node[node] != expected:
+                raise ValueError("usage_by_node does not match aggregated node executions")
+        expected_run = self._aggregate_usage(
+            tuple(self.usage_by_node.values()),
+            wall_seconds=(self.finished_at - self.started_at).total_seconds(),
+        )
+        if self.usage != expected_run:
+            raise ValueError("manifest usage does not match reconciled node usage")
 
     def _validate_pricing(self) -> None:
         model_calls = tuple(call for call in self.provider_calls if call.operation == "model")

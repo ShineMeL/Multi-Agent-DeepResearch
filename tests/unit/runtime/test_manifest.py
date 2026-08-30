@@ -124,7 +124,7 @@ def _manifest(pricing_snapshot: PricingSnapshot, **updates: object) -> RunManife
         "manifest_sha256": "",
     }
     payload.update(updates)
-    return RunManifest.model_validate(payload)
+    return RunManifest.create(payload)
 
 
 def test_manifest_hash_changes_when_prompt_version_changes(pricing_snapshot: PricingSnapshot) -> None:
@@ -152,12 +152,16 @@ def test_manifest_preserves_cache_hit_usage_without_double_charging(pricing_snap
     cached_call = base.provider_calls[0].model_copy(
         update={"cache_hit": True, "estimated_cost_usd": Decimal(0)}
     )
-    cached = RunManifest.model_validate(
+    cached_usage = base.usage.model_copy(update={"cost_usd": Decimal(0)})
+    cached_execution = base.node_executions[0].model_copy(update={"usage": cached_usage})
+    cached = RunManifest.create(
         {
             **base.model_dump(),
             "provider_calls": (cached_call,),
             "cache_hit_count": 1,
-            "usage": base.usage.model_copy(update={"cost_usd": Decimal(0)}),
+            "usage": cached_usage,
+            "usage_by_node": {"Planner": cached_usage},
+            "node_executions": (cached_execution,),
         }
     )
 
@@ -179,13 +183,17 @@ def test_unknown_pricing_must_remain_unestimated(pricing_snapshot: PricingSnapsh
         update={"pricing_snapshot_id": None, "estimated_cost_usd": None}
     )
 
-    unknown = RunManifest.model_validate(
+    unknown_usage = base.usage.model_copy(update={"cost_usd": None})
+    unknown_execution = base.node_executions[0].model_copy(update={"usage": unknown_usage})
+    unknown = RunManifest.create(
         {
             **base.model_dump(),
             "provider_calls": (unknown_call,),
             "pricing_status": "unknown",
             "pricing_snapshots": (),
-            "usage": base.usage.model_copy(update={"cost_usd": None}),
+            "usage": unknown_usage,
+            "usage_by_node": {"Planner": unknown_usage},
+            "node_executions": (unknown_execution,),
         }
     )
 
@@ -200,3 +208,190 @@ def test_provider_call_revalidates_nonfinite_usage(pricing_snapshot: PricingSnap
 
     with pytest.raises(ValidationError, match="finite|wall_seconds"):
         base.provider_calls[0].model_copy(update={"usage": invalid_usage})
+
+
+def test_manifest_rejects_provider_usage_hidden_by_smaller_aggregates(
+    pricing_snapshot: PricingSnapshot,
+) -> None:
+    base = _manifest(pricing_snapshot)
+    provider_usage = ResourceUsage(
+        input_tokens=3_000_000,
+        output_tokens=0,
+        reasoning_tokens=0,
+        cached_tokens=0,
+        total_tokens=3_000_000,
+        search_calls=0,
+        pages=0,
+        retries=0,
+        wall_seconds=1.0,
+        cost_usd=Decimal("0.3"),
+    )
+    call = base.provider_calls[0].model_copy(
+        update={"usage": provider_usage, "estimated_cost_usd": Decimal("0.3")}
+    )
+    understated = ResourceUsage.zero(cost_known=True).model_copy(
+        update={"cost_usd": Decimal("0.3"), "wall_seconds": 1.0}
+    )
+    execution = base.node_executions[0].model_copy(update={"usage": understated})
+
+    with pytest.raises(ValidationError, match="usage|budget|provider"):
+        RunManifest.create(
+            {
+                **base.model_dump(),
+                "provider_calls": (call,),
+                "node_executions": (execution,),
+                "usage_by_node": {"Planner": understated},
+                "usage": understated,
+            }
+        )
+
+
+def test_manifest_rejects_call_without_matching_node_attempt(
+    pricing_snapshot: PricingSnapshot,
+) -> None:
+    base = _manifest(pricing_snapshot)
+    orphan = base.provider_calls[0].model_copy(update={"node": "Writer"})
+
+    with pytest.raises(ValidationError, match="node|attempt"):
+        RunManifest.create(
+            {**base.model_dump(), "provider_calls": (orphan,)}
+        )
+
+
+def test_manifest_rejects_usage_by_node_that_disagrees_with_executions(
+    pricing_snapshot: PricingSnapshot,
+) -> None:
+    base = _manifest(pricing_snapshot)
+    understated = ResourceUsage.zero(cost_known=True).model_copy(
+        update={"cost_usd": Decimal("0.114"), "wall_seconds": 1.0}
+    )
+
+    with pytest.raises(ValidationError, match="usage_by_node|execution"):
+        RunManifest.create(
+            {**base.model_dump(), "usage_by_node": {"Planner": understated}}
+        )
+
+
+def test_manifest_wall_time_uses_run_envelope_not_concurrent_sum(
+    pricing_snapshot: PricingSnapshot,
+) -> None:
+    base = _manifest(pricing_snapshot)
+    zero = ResourceUsage.zero(cost_known=True).model_copy(update={"wall_seconds": 0.1})
+    writer = base.node_executions[0].model_copy(
+        update={"node": "Writer", "usage": zero}
+    )
+
+    concurrent = base.model_copy(
+        update={
+            "node_executions": (*base.node_executions, writer),
+            "usage_by_node": {**base.usage_by_node, "Writer": zero},
+        }
+    )
+
+    assert concurrent.usage.wall_seconds == 1.0
+    assert sum(item.wall_seconds for item in concurrent.usage_by_node.values()) == 1.1
+
+
+def _call_payload(base: ProviderCallRecord, **updates: object) -> dict[str, object]:
+    payload: dict[str, object] = base.model_dump(round_trip=True)
+    payload.update(updates)
+    return payload
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {
+            "operation": "search",
+            "model_id": None,
+            "model_revision": None,
+            "snapshot_id": "snapshot-1",
+            "normalized_query": "query",
+            "locale": "en-US",
+            "time_policy": "recorded",
+            "prompt_version": None,
+            "system_prompt_hash": None,
+            "tool_schema_hash": None,
+            "output_schema_hash": None,
+            "temperature": None,
+            "seed": None,
+            "complete_parameters": {"limit": 5, "api_key": "TOP-SECRET"},
+            "pricing_snapshot_id": None,
+            "estimated_cost_usd": None,
+        },
+        {
+            "operation": "fetch",
+            "model_id": None,
+            "model_revision": None,
+            "snapshot_id": "snapshot-1",
+            "prompt_version": None,
+            "system_prompt_hash": None,
+            "tool_schema_hash": None,
+            "output_schema_hash": None,
+            "temperature": None,
+            "seed": None,
+            "complete_parameters": {
+                "canonical_url": "HTTPS://Example.COM:443/path?b=2&a=1",
+                "fetch_policy": "recorded",
+                "accepted_content_types": ["not a media type"],
+            },
+            "pricing_snapshot_id": None,
+            "estimated_cost_usd": None,
+        },
+        {
+            "operation": "parse",
+            "model_id": None,
+            "model_revision": None,
+            "snapshot_id": "snapshot-1",
+            "prompt_version": None,
+            "system_prompt_hash": None,
+            "tool_schema_hash": None,
+            "output_schema_hash": None,
+            "temperature": None,
+            "seed": None,
+            "complete_parameters": {
+                "raw_content_hash": "a" * 64,
+                "parser_id": "html",
+                "parser_version": "",
+                "normalization_version": "v1",
+            },
+            "pricing_snapshot_id": None,
+            "estimated_cost_usd": None,
+        },
+        {
+            "operation": "embed",
+            "model_id": "embed-v1",
+            "model_revision": "revision-1",
+            "prompt_version": None,
+            "system_prompt_hash": None,
+            "tool_schema_hash": None,
+            "output_schema_hash": None,
+            "temperature": None,
+            "seed": None,
+            "complete_parameters": {
+                "snapshot_sha256": "a" * 64,
+                "normalize_embeddings": "yes",
+                "canonical_texts_hash": "b" * 64,
+            },
+            "pricing_snapshot_id": None,
+            "estimated_cost_usd": None,
+        },
+        {"complete_parameters": {"seed_supported": True, "password": "secret"}},
+    ],
+)
+def test_provider_call_parameters_are_exact_typed_and_credential_safe(
+    pricing_snapshot: PricingSnapshot, updates: dict[str, object]
+) -> None:
+    base = _manifest(pricing_snapshot).provider_calls[0]
+
+    with pytest.raises(ValidationError):
+        ProviderCallRecord.model_validate(_call_payload(base, **updates))
+
+
+def test_manifest_rejects_stale_nonblank_hash(pricing_snapshot: PricingSnapshot) -> None:
+    base = _manifest(pricing_snapshot)
+    payload = base.model_dump()
+    payload["prompt_versions"] = {"planner": "changed"}
+
+    with pytest.raises(ValidationError, match="manifest_sha256|hash"):
+        RunManifest.model_validate(payload)
