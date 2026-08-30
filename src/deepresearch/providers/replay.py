@@ -5,6 +5,7 @@ import base64
 import binascii
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
+from math import isfinite
 from typing import TypeVar, cast
 
 from pydantic import JsonValue, TypeAdapter, ValidationError
@@ -83,6 +84,8 @@ class _ReplayProvider:
     def _checkpoint(
         self, *, deadline: float, cancellation_token: CancellationToken, operation: str
     ) -> None:
+        if not isfinite(deadline):
+            raise ValueError("deadline must be finite")
         cancellation_token.raise_if_cancelled()
         if time.monotonic() >= deadline:
             raise ProviderError(

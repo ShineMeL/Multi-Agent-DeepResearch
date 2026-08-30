@@ -14,8 +14,8 @@ from deepresearch.providers.replay import (
     ReplaySearchProvider,
     ReplayTextEmbedder,
 )
-from deepresearch.providers.replay_schema import ReplayBundle
-from deepresearch.runtime import CancellationToken
+from deepresearch.providers.replay_schema import REPLAY_FILES, ReplayBundle
+from deepresearch.runtime import CancellationToken, OperationCancelled
 
 FIXTURE_ROOT = Path(__file__).parents[2] / "fixtures" / "replay" / "provider_contract"
 
@@ -171,6 +171,43 @@ def test_bundle_rejects_snapshot_provider_mismatch_even_with_updated_file_hash(
 
 
 @pytest.mark.asyncio
+async def test_bundle_hashes_and_parses_each_exact_file_read_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copied = tmp_path / "bundle"
+    shutil.copytree(FIXTURE_ROOT, copied)
+    search_path = copied / "search.jsonl"
+    record = json.loads(search_path.read_text(encoding="utf-8"))
+    record["outcome"]["response"][0]["title"] = "swapped title"
+    record["outcome_sha256"] = hashlib.sha256(
+        _canonical(record["outcome"])
+    ).hexdigest()
+    swapped = _canonical(record) + b"\n"
+    original_read_bytes = Path.read_bytes
+    reads: dict[str, int] = {}
+
+    def swapping_read(path: Path) -> bytes:
+        if path.parent == copied:
+            reads[path.name] = reads.get(path.name, 0) + 1
+            if path == search_path and reads[path.name] > 1:
+                return swapped
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", swapping_read)
+    loaded = ReplayBundle.load(copied)
+    hits = await ReplaySearchProvider(loaded).search(
+        "multimodal agents",
+        5,
+        {"language": "en"},
+        deadline=_future_deadline(),
+        cancellation_token=CancellationToken(),
+    )
+
+    assert hits[0].title == "Synthetic result"
+    assert reads == {"manifest.sha256": 1, **dict.fromkeys(REPLAY_FILES, 1)}
+
+
+@pytest.mark.asyncio
 async def test_fixture_exactly_replays_every_represented_operation(
     bundle: ReplayBundle,
 ) -> None:
@@ -244,12 +281,63 @@ async def test_all_replay_operations_reject_expired_absolute_deadline(
     assert stream_error.value.code == "TIMEOUT"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deadline", (float("nan"), float("inf"), float("-inf")))
+async def test_replay_rejects_nonfinite_deadlines_for_unary_and_stream(
+    bundle: ReplayBundle, deadline: float
+) -> None:
+    cancelled = CancellationToken()
+    cancelled.cancel()
+    with pytest.raises(ValueError, match="finite"):
+        await ReplayModelProvider(bundle).complete(
+            _fixture_model_request(),
+            deadline=deadline,
+            cancellation_token=cancelled,
+        )
+    stream = ReplayModelProvider(bundle).stream(
+        _fixture_model_request(),
+        deadline=deadline,
+        cancellation_token=cancelled,
+    )
+    with pytest.raises(ValueError, match="finite"):
+        await anext(stream)
+
+
+@pytest.mark.asyncio
+async def test_replay_finite_deadline_keeps_cancellation_first(bundle: ReplayBundle) -> None:
+    token = CancellationToken()
+    token.cancel()
+    with pytest.raises(OperationCancelled):
+        await ReplayModelProvider(bundle).complete(
+            _fixture_model_request(),
+            deadline=time.monotonic() - 1,
+            cancellation_token=token,
+        )
+
+
 def test_bundle_rejects_typed_invalid_success_with_consistent_hashes(tmp_path: Path) -> None:
     copied = tmp_path / "bundle"
     shutil.copytree(FIXTURE_ROOT, copied)
     record = json.loads((copied / "search.jsonl").read_text(encoding="utf-8"))
     record["outcome"]["response"] = "not-a-search-hit-list"
     _write_record(copied, "search.jsonl", record)
+
+    with pytest.raises(ProviderError) as error:
+        ReplayBundle.load(copied)
+
+    assert error.value.code == "INVALID_SNAPSHOT"
+
+
+def test_bundle_rejects_non_string_model_complete_output_with_consistent_hashes(
+    tmp_path: Path,
+) -> None:
+    copied = tmp_path / "bundle"
+    shutil.copytree(FIXTURE_ROOT, copied)
+    record = json.loads(
+        (copied / "model_responses.jsonl").read_text(encoding="utf-8")
+    )
+    record["outcome"]["response"]["output"] = {"wrong": "type"}
+    _write_record(copied, "model_responses.jsonl", record)
 
     with pytest.raises(ProviderError) as error:
         ReplayBundle.load(copied)

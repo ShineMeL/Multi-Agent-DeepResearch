@@ -292,6 +292,242 @@ def test_manifest_wall_time_uses_run_envelope_not_concurrent_sum(
     assert sum(item.wall_seconds for item in concurrent.usage_by_node.values()) == 1.1
 
 
+def _search_call(
+    started: datetime,
+    *,
+    request_sha256: str,
+    attempt: int = 1,
+    offset_ms: int = 10,
+) -> ProviderCallRecord:
+    usage = ResourceUsage.zero().model_copy(
+        update={"search_calls": 1, "wall_seconds": 0.01}
+    )
+    call_started = started + timedelta(milliseconds=offset_ms)
+    return ProviderCallRecord(
+        operation="search",
+        node="Tool",
+        provider_id="search-provider",
+        endpoint_type="search",
+        request_sha256=request_sha256,
+        snapshot_id="search-snapshot",
+        normalized_query=f"query-{request_sha256[0]}",
+        locale="en-US",
+        complete_parameters={"filters": None, "limit": 5},
+        time_policy="recorded",
+        started_at=call_started,
+        finished_at=call_started + timedelta(milliseconds=10),
+        latency_ms=10,
+        attempt=attempt,
+        cache_hit=False,
+        outcome_code="SUCCESS",
+        usage=usage,
+    )
+
+
+def _fetch_call(
+    started: datetime,
+    *,
+    request_sha256: str = "f" * 64,
+    path: str = "document",
+    offset_ms: int = 30,
+) -> ProviderCallRecord:
+    usage = ResourceUsage.zero().model_copy(
+        update={"pages": 1, "wall_seconds": 0.01}
+    )
+    call_started = started + timedelta(milliseconds=offset_ms)
+    return ProviderCallRecord(
+        operation="fetch",
+        node="Tool",
+        provider_id="fetch-provider",
+        endpoint_type="fetch",
+        request_sha256=request_sha256,
+        snapshot_id="fetch-snapshot",
+        complete_parameters={
+            "canonical_url": f"https://example.com/{path}",
+            "fetch_policy": "recorded",
+            "accepted_content_types": ["text/html"],
+        },
+        started_at=call_started,
+        finished_at=call_started + timedelta(milliseconds=10),
+        latency_ms=10,
+        attempt=1,
+        cache_hit=False,
+        outcome_code="SUCCESS",
+        usage=usage,
+    )
+
+
+@pytest.mark.parametrize("cache_hit", (False, True))
+def test_estimated_manifest_supports_priced_model_with_unpriced_search_and_fetch(
+    pricing_snapshot: PricingSnapshot, cache_hit: bool
+) -> None:
+    base = _manifest(pricing_snapshot)
+    started = base.started_at
+    charged = Decimal(0) if cache_hit else Decimal("0.114")
+    model_call = base.provider_calls[0].model_copy(
+        update={"cache_hit": cache_hit, "estimated_cost_usd": charged}
+    )
+    planner_usage = base.usage.model_copy(update={"cost_usd": charged})
+    planner_execution = base.node_executions[0].model_copy(
+        update={"usage": planner_usage}
+    )
+    search = _search_call(started, request_sha256="a" * 64)
+    fetch = _fetch_call(started)
+    tool_observed = ResourceUsage.zero().model_copy(
+        update={"search_calls": 1, "pages": 1, "wall_seconds": 0.1}
+    )
+    tool_attributed = tool_observed.model_copy(update={"cost_usd": Decimal(0)})
+    tool_execution = NodeExecutionRecord(
+        node="Tool",
+        attempt=1,
+        started_at=started,
+        finished_at=started + timedelta(milliseconds=100),
+        latency_ms=100,
+        status="completed",
+        input_artifact_ids=(),
+        output_artifact_ids=(),
+        usage=tool_observed,
+    )
+    run_usage = planner_usage.model_copy(
+        update={"search_calls": 1, "pages": 1, "wall_seconds": 1.0}
+    )
+
+    mixed = RunManifest.create(
+        {
+            **base.model_dump(),
+            "provider_calls": (model_call, search, fetch),
+            "node_executions": (planner_execution, tool_execution),
+            "usage_by_node": {
+                "Planner": planner_usage,
+                "Tool": tool_attributed,
+            },
+            "usage": run_usage,
+            "cache_hit_count": int(cache_hit),
+        }
+    )
+
+    assert mixed.usage.cost_usd == charged
+    assert mixed.usage_by_node["Tool"].cost_usd == 0
+    assert mixed.usage.search_calls == 1
+    assert mixed.usage.pages == 1
+
+
+def test_provider_attempts_are_per_request_and_link_by_containing_execution(
+    pricing_snapshot: PricingSnapshot,
+) -> None:
+    base = _manifest(pricing_snapshot)
+    started = base.started_at
+    calls = (
+        _search_call(started, request_sha256="a" * 64, offset_ms=10),
+        _search_call(started, request_sha256="b" * 64, offset_ms=30),
+        _search_call(started, request_sha256="c" * 64, attempt=1, offset_ms=50),
+        _search_call(started, request_sha256="c" * 64, attempt=2, offset_ms=70),
+    )
+    fetches = (
+        _fetch_call(
+            started, request_sha256="d" * 64, path="first", offset_ms=20
+        ),
+        _fetch_call(
+            started, request_sha256="e" * 64, path="second", offset_ms=40
+        ),
+    )
+    tool_observed = ResourceUsage.zero().model_copy(
+        update={"search_calls": 4, "pages": 2, "wall_seconds": 0.1}
+    )
+    tool_attributed = tool_observed.model_copy(update={"cost_usd": Decimal(0)})
+    tool_execution = NodeExecutionRecord(
+        node="Tool", attempt=1, started_at=started,
+        finished_at=started + timedelta(milliseconds=100), latency_ms=100,
+        status="completed", input_artifact_ids=(), output_artifact_ids=(),
+        usage=tool_observed,
+    )
+    run_usage = base.usage.model_copy(
+        update={"search_calls": 4, "pages": 2, "wall_seconds": 1.0}
+    )
+
+    manifest = RunManifest.create(
+        {
+            **base.model_dump(),
+            "provider_calls": (*base.provider_calls, *calls, *fetches),
+            "node_executions": (*base.node_executions, tool_execution),
+            "usage_by_node": {**base.usage_by_node, "Tool": tool_attributed},
+            "usage": run_usage,
+        }
+    )
+
+    assert [call.attempt for call in manifest.provider_calls[1:]] == [1, 1, 1, 2, 1, 1]
+
+
+@pytest.mark.parametrize("ambiguous", (False, True))
+def test_provider_call_requires_exactly_one_containing_node_execution(
+    pricing_snapshot: PricingSnapshot, ambiguous: bool
+) -> None:
+    base = _manifest(pricing_snapshot)
+    started = base.started_at
+    call = _search_call(
+        started, request_sha256="a" * 64, offset_ms=10
+    ).model_copy(update={"usage": ResourceUsage.zero(cost_known=True).model_copy(
+        update={"search_calls": 1, "wall_seconds": 0.01}
+    )})
+    observed = call.usage
+    first_start = started if ambiguous else started + timedelta(milliseconds=30)
+    first = NodeExecutionRecord(
+        node="Tool", attempt=1, started_at=first_start,
+        finished_at=started + timedelta(milliseconds=100),
+        latency_ms=round((started + timedelta(milliseconds=100) - first_start).total_seconds() * 1000),
+        status="completed", input_artifact_ids=(), output_artifact_ids=(), usage=observed,
+    )
+    executions = [first]
+    if ambiguous:
+        executions.append(first.model_copy(update={"attempt": 2}))
+    node_usage = ResourceUsage.zero().model_copy(
+        update={"search_calls": len(executions), "wall_seconds": 0.01, "cost_usd": Decimal(0)}
+    )
+    run_usage = base.usage.model_copy(
+        update={"search_calls": len(executions), "wall_seconds": 1.0}
+    )
+
+    with pytest.raises(ValidationError, match="contain|execution"):
+        RunManifest.create(
+            {
+                **base.model_dump(),
+                "provider_calls": (*base.provider_calls, call),
+                "node_executions": (*base.node_executions, *executions),
+                "usage_by_node": {**base.usage_by_node, "Tool": node_usage},
+                "usage": run_usage,
+            }
+        )
+
+
+def test_node_artifact_references_are_content_addressed_and_linked(
+    pricing_snapshot: PricingSnapshot,
+) -> None:
+    base = _manifest(pricing_snapshot)
+    artifact_id = f"sha256:{'a' * 64}"
+    with pytest.raises(ValidationError, match="artifact"):
+        base.node_executions[0].model_copy(
+            update={"input_artifact_ids": ("not-a-hash",)}
+        )
+    with pytest.raises(ValidationError, match="artifact|unique"):
+        base.node_executions[0].model_copy(
+            update={"output_artifact_ids": (artifact_id, artifact_id)}
+        )
+
+    linked_execution = base.node_executions[0].model_copy(
+        update={"input_artifact_ids": (artifact_id,)}
+    )
+    with pytest.raises(ValidationError, match="artifact"):
+        base.model_copy(update={"node_executions": (linked_execution,)})
+
+    linked = base.model_copy(
+        update={
+            "node_executions": (linked_execution,),
+            "artifact_ids": (artifact_id,),
+        }
+    )
+    assert linked.node_executions[0].input_artifact_ids == (artifact_id,)
+
+
 def _call_payload(base: ProviderCallRecord, **updates: object) -> dict[str, object]:
     payload: dict[str, object] = base.model_dump(round_trip=True)
     payload.update(updates)
@@ -317,6 +553,96 @@ def _call_payload(base: ProviderCallRecord, **updates: object) -> dict[str, obje
             "seed": None,
             "complete_parameters": {"limit": 5, "api_key": "TOP-SECRET"},
             "pricing_snapshot_id": None,
+            "estimated_cost_usd": None,
+        },
+        {
+            "operation": "search",
+            "model_id": None,
+            "model_revision": None,
+            "snapshot_id": "snapshot-1",
+            "normalized_query": "query",
+            "locale": "en-US",
+            "time_policy": "recorded",
+            "prompt_version": None,
+            "system_prompt_hash": None,
+            "tool_schema_hash": None,
+            "output_schema_hash": None,
+            "temperature": None,
+            "seed": None,
+            "complete_parameters": {"filters": {}, "limit": "five"},
+            "pricing_snapshot_id": None,
+            "estimated_cost_usd": None,
+        },
+        {
+            "operation": "search",
+            "model_id": None,
+            "model_revision": None,
+            "snapshot_id": "snapshot-1",
+            "normalized_query": "query",
+            "locale": "en-US",
+            "time_policy": "recorded",
+            "prompt_version": None,
+            "system_prompt_hash": None,
+            "tool_schema_hash": None,
+            "output_schema_hash": None,
+            "temperature": None,
+            "seed": None,
+            "complete_parameters": {"filters": None, "limit": True},
+            "pricing_snapshot_id": None,
+            "estimated_cost_usd": None,
+        },
+        {
+            "operation": "search",
+            "model_id": None,
+            "model_revision": None,
+            "snapshot_id": "snapshot-1",
+            "normalized_query": "query",
+            "locale": "en-US",
+            "time_policy": "recorded",
+            "prompt_version": None,
+            "system_prompt_hash": None,
+            "tool_schema_hash": None,
+            "output_schema_hash": None,
+            "temperature": None,
+            "seed": None,
+            "complete_parameters": {"filters": None, "limit": 0},
+            "pricing_snapshot_id": None,
+            "estimated_cost_usd": None,
+        },
+        {
+            "operation": "search",
+            "model_id": None,
+            "model_revision": None,
+            "snapshot_id": "snapshot-1",
+            "normalized_query": "query",
+            "locale": "en-US",
+            "time_policy": "recorded",
+            "prompt_version": None,
+            "system_prompt_hash": None,
+            "tool_schema_hash": None,
+            "output_schema_hash": None,
+            "temperature": None,
+            "seed": None,
+            "complete_parameters": {"filters": ["not", "mapping"], "limit": 5},
+            "pricing_snapshot_id": None,
+            "estimated_cost_usd": None,
+        },
+        {
+            "operation": "search",
+            "model_id": None,
+            "model_revision": None,
+            "snapshot_id": "snapshot-1",
+            "normalized_query": "query",
+            "locale": "en-US",
+            "time_policy": "recorded",
+            "prompt_version": None,
+            "system_prompt_hash": None,
+            "tool_schema_hash": None,
+            "output_schema_hash": None,
+            "temperature": None,
+            "seed": None,
+            "complete_parameters": {"filters": None, "limit": 5},
+            "pricing_snapshot_id": "pricing-v1",
             "estimated_cost_usd": None,
         },
         {

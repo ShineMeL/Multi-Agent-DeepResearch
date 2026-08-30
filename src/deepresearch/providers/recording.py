@@ -32,7 +32,9 @@ from deepresearch.providers import (
     TextEmbedder,
     validate_model_stream,
 )
+from deepresearch.retrieval import canonicalize_url
 from deepresearch.runtime import CancellationToken
+from deepresearch.storage import FetchCacheKey
 
 from .replay_schema import (
     REPLAY_BUNDLE_SCHEMA_VERSION,
@@ -139,12 +141,54 @@ def _write_fsynced(path: Path, payload: bytes) -> None:
 
 def _fsync_directory(path: Path) -> None:
     if os.name == "nt":
+        _flush_windows_directory(path)
         return
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _flush_windows_directory(path: Path) -> None:
+    """Flush directory metadata using a native backup-semantics handle."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.FlushFileBuffers.argtypes = (wintypes.HANDLE,)
+    kernel32.FlushFileBuffers.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.CreateFileW(
+        str(path),
+        0x40000000,
+        0x00000001 | 0x00000002 | 0x00000004,
+        None,
+        3,
+        0x02000000,
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    flush_succeeded = False
+    try:
+        if not kernel32.FlushFileBuffers(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+        flush_succeeded = True
+    finally:
+        if not kernel32.CloseHandle(handle) and flush_succeeded:
+            raise ctypes.WinError(ctypes.get_last_error())
 
 
 def _atomic_rename_noreplace(source: Path, destination: Path) -> None:
@@ -194,10 +238,27 @@ def _safe_fetch_response(document: RawDocument) -> dict[str, JsonValue]:
         for key, value in document.headers.items()
         if key.casefold() in _SAFE_FETCH_HEADERS
     }
+    final_url = ""
+    final_url_is_safe = True
+    try:
+        final_url = str(document.final_url)
+        canonical_final_url = canonicalize_url(final_url)
+        FetchCacheKey.model_validate(
+            {
+                "snapshot_id": "replay-final-url",
+                "canonical_url": canonical_final_url,
+                "fetch_policy": "recorded-redirect",
+                "accepted_content_types": (),
+            }
+        )
+    except (TypeError, ValueError):
+        final_url_is_safe = False
+    if not final_url_is_safe:
+        raise ValueError("final_url violates credential-safe URL policy")
     return {
         "body_base64": base64.b64encode(document.body_bytes).decode("ascii"),
         "content_type": document.content_type,
-        "final_url": str(document.final_url),
+        "final_url": final_url,
         "headers": cast("dict[str, JsonValue]", headers),
         "requested_url": str(document.requested_url),
         "retrieved_at": document.retrieved_at.isoformat().replace("+00:00", "Z"),
@@ -236,6 +297,7 @@ class ReplayBundleWriter:
         self._providers: dict[str, ReplayProviderSnapshot] = {}
         self._append_lock = asyncio.Lock()
         self._closed = False
+        self._published = False
 
     @classmethod
     def create(cls, final_root: Path, *, run_id: str) -> ReplayBundleWriter:
@@ -312,6 +374,26 @@ class ReplayBundleWriter:
             raise ValueError(f"conflicting provider metadata for {kind}")
         self._providers[kind] = snapshot
 
+    def configure_model_provider(
+        self, *, provider_id: str, model_revision: str
+    ) -> None:
+        """Register immutable model identity before constructing its recorder."""
+        self.register_provider(
+            "model", provider_id=provider_id, model_revision=model_revision
+        )
+
+    def model_revision_for(self, provider_id: str) -> str:
+        configured = self._providers.get("model")
+        if (
+            configured is None
+            or configured.provider_id != provider_id
+            or configured.model_revision is None
+        ):
+            raise ValueError(
+                "recording model provider revision configuration is missing or conflicting"
+            )
+        return configured.model_revision
+
     async def append(
         self,
         *,
@@ -383,34 +465,47 @@ class ReplayBundleWriter:
             if self._final_root.exists():
                 raise FileExistsError(self._final_root)
             _atomic_rename_noreplace(staging, self._final_root)
-            published_marker = self._final_root / self._MARKER_NAME
-            if _is_link_or_reparse(published_marker):
-                raise ValueError("published replay marker is unsafe")
-            published_marker.unlink()
-            _fsync_directory(self._final_root)
-            _fsync_directory(self._final_root.parent)
             self._staging_root = None
-            self._closed = True
-            self._release_lock()
+            self._published = True
+            try:
+                published_marker = self._final_root / self._MARKER_NAME
+                if _is_link_or_reparse(published_marker):
+                    raise ValueError("published replay marker is unsafe")
+                published_marker.unlink()
+                _fsync_directory(self._final_root)
+                _fsync_directory(self._final_root.parent)
+            except Exception as error:
+                raise OSError(
+                    "replay bundle was published but durability finalization failed"
+                ) from error
+            finally:
+                self._closed = True
+                self._release_lock()
             return self._final_root
 
     async def abort(self) -> None:
         async with self._append_lock:
-            if self._staging_root is not None:
-                staging = self._validate_owned_staging()
-                children = sorted(staging.rglob("*"), key=lambda item: len(item.parts), reverse=True)
-                for child in children:
-                    if _is_link_or_reparse(child):
-                        raise ValueError("owned staging contains a symlink or reparse point")
-                for child in children:
-                    if child.is_dir():
-                        child.rmdir()
-                    else:
-                        child.unlink()
-                staging.rmdir()
-                self._staging_root = None
-            self._closed = True
-            self._release_lock()
+            try:
+                if not self._published and self._staging_root is not None:
+                    staging = self._validate_owned_staging()
+                    children = sorted(
+                        staging.rglob("*"), key=lambda item: len(item.parts), reverse=True
+                    )
+                    for child in children:
+                        if _is_link_or_reparse(child):
+                            raise ValueError(
+                                "owned staging contains a symlink or reparse point"
+                            )
+                    for child in children:
+                        if child.is_dir():
+                            child.rmdir()
+                        else:
+                            child.unlink()
+                    staging.rmdir()
+                    self._staging_root = None
+            finally:
+                self._closed = True
+                self._release_lock()
 
     def _validate_owned_staging(self) -> Path:
         staging = self._staging_root
@@ -518,23 +613,11 @@ def _key(
 
 
 class RecordingModelProvider(_RecordingBase):
-    def __init__(
-        self,
-        delegate: ModelProvider,
-        writer: ReplayBundleWriter,
-        *,
-        model_revision: str | None = None,
-    ) -> None:
+    def __init__(self, delegate: ModelProvider, writer: ReplayBundleWriter) -> None:
         super().__init__(writer)
         self._delegate = delegate
         self.provider_id = delegate.provider_id
-        revision = model_revision or cast("str | None", getattr(delegate, "model_revision", None))
-        if revision is None or not revision.strip():
-            raise ValueError("recording model providers require an immutable model_revision")
-        self.model_revision = revision
-        writer.register_provider(
-            "model", provider_id=self.provider_id, model_revision=self.model_revision
-        )
+        self.model_revision = writer.model_revision_for(self.provider_id)
 
     async def complete(
         self,

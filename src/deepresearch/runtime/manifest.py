@@ -354,6 +354,12 @@ class ProviderCallRecord(_ManifestModel):
             ):
                 raise ValueError("search calls require snapshot/query/locale/parameters/time policy")
             exact({"filters", "limit"})
+            limit = self.complete_parameters["limit"]
+            filters = self.complete_parameters["filters"]
+            if type(limit) is not int or limit <= 0:
+                raise ValueError("search limit must be a positive integer")
+            if filters is not None and not isinstance(filters, dict):
+                raise ValueError("search filters must be a mapping or null")
             forbid(
                 self.model_id, self.model_revision, self.prompt_version,
                 self.system_prompt_hash, self.tool_schema_hash, self.output_schema_hash,
@@ -448,8 +454,8 @@ class ProviderCallRecord(_ManifestModel):
                 if not isinstance(value, str):
                     raise ValueError(f"{name} must be a SHA-256 string")
                 _require_sha256(value)
-        if self.estimated_cost_usd is not None:
-            raise ValueError("non-model calls must not have estimated_cost_usd")
+        if self.estimated_cost_usd is not None or self.pricing_snapshot_id is not None:
+            raise ValueError("non-model calls must not have pricing metadata")
         return self
 
 
@@ -468,6 +474,15 @@ class NodeExecutionRecord(_ManifestModel):
     _node_id = field_validator("node")(_require_identifier)
     _aware_times = field_validator("started_at", "finished_at")(_require_aware)
     _usage = field_validator("usage", mode="before")(_revalidate_usage)
+
+    @field_validator("input_artifact_ids", "output_artifact_ids")
+    @classmethod
+    def validate_artifact_references(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError("node artifact references must be unique")
+        if any(_ARTIFACT_ID.fullmatch(item) is None for item in value):
+            raise ValueError("node artifact references must be content-addressed SHA-256 IDs")
+        return value
 
     @model_validator(mode="after")
     def validate_timing_and_status(self) -> NodeExecutionRecord:
@@ -681,7 +696,17 @@ class RunManifest(_ManifestModel):
         self._validate_budget_limits()
         parsed_ids = {record.artifact_id for record in self.parsed_artifacts}
         evidence_ids = {record.artifact_id for record in self.evidence_hashes}
-        if not (parsed_ids | evidence_ids).issubset(set(self.artifact_ids)):
+        node_artifact_ids = {
+            artifact_id
+            for execution in self.node_executions
+            for artifact_id in (
+                *execution.input_artifact_ids,
+                *execution.output_artifact_ids,
+            )
+        }
+        if not (parsed_ids | evidence_ids | node_artifact_ids).issubset(
+            set(self.artifact_ids)
+        ):
             raise ValueError("record artifact IDs must be present in artifact_ids")
         expected_hash = self.canonical_sha256()
         if self.manifest_sha256:
@@ -701,21 +726,19 @@ class RunManifest(_ManifestModel):
             if attempts != list(range(1, len(attempts) + 1)):
                 raise ValueError("node execution attempts must be ordered and contiguous")
 
-        call_attempts: defaultdict[tuple[str, str, str], list[int]] = defaultdict(list)
+        call_attempts: defaultdict[tuple[str, str, str, str], list[int]] = defaultdict(list)
         for call in self.provider_calls:
-            call_attempts[(call.node, call.operation, call.provider_id)].append(call.attempt)
+            call_attempts[
+                (call.node, call.operation, call.provider_id, call.request_sha256)
+            ].append(call.attempt)
         for attempts in call_attempts.values():
             if attempts != list(range(1, len(attempts) + 1)):
                 raise ValueError("provider call attempts must be ordered and contiguous")
 
     @staticmethod
     def _aggregate_usage(
-        usages: tuple[ResourceUsage, ...], *, wall_seconds: float
+        usages: tuple[ResourceUsage, ...], *, wall_seconds: float, cost_usd: Decimal | None
     ) -> ResourceUsage:
-        costs = tuple(item.cost_usd for item in usages)
-        cost = None if any(item is None for item in costs) else sum(
-            (cast("Decimal", item) for item in costs), Decimal(0)
-        )
         return ResourceUsage(
             input_tokens=sum(item.input_tokens for item in usages),
             output_tokens=sum(item.output_tokens for item in usages),
@@ -726,29 +749,43 @@ class RunManifest(_ManifestModel):
             pages=sum(item.pages for item in usages),
             retries=sum(item.retries for item in usages),
             wall_seconds=wall_seconds,
-            cost_usd=cost,
+            cost_usd=cost_usd,
         )
+
+    def _charged_cost(self, calls: tuple[ProviderCallRecord, ...]) -> Decimal | None:
+        if self.pricing_status == "unknown":
+            return None
+        charged = Decimal(0)
+        for call in calls:
+            if call.operation != "model" or call.cache_hit:
+                continue
+            if call.estimated_cost_usd is None:
+                raise ValueError("estimated model calls require an estimated cost")
+            charged += call.estimated_cost_usd
+        return charged.quantize(CostCalculator.QUANTUM, rounding=ROUND_HALF_EVEN)
 
     def _validate_usage_reconciliation(self) -> None:
         """Reconcile calls into executions, nodes, then the run without summing wall time."""
-        execution_by_attempt = {
-            (execution.node, execution.attempt): execution
-            for execution in self.node_executions
-        }
-        if len(execution_by_attempt) != len(self.node_executions):
-            raise ValueError("node executions must be unique by node and attempt")
         additive = (
             "input_tokens", "output_tokens", "reasoning_tokens", "cached_tokens",
             "total_tokens", "search_calls", "pages", "retries",
         )
-        calls_by_attempt: defaultdict[tuple[str, int], list[ProviderCallRecord]] = defaultdict(list)
+        calls_by_execution: defaultdict[int, list[ProviderCallRecord]] = defaultdict(list)
         for call in self.provider_calls:
-            key = (call.node, call.attempt)
-            if key not in execution_by_attempt:
-                raise ValueError("provider call references a missing node execution attempt")
-            calls_by_attempt[key].append(call)
-        for key, calls in calls_by_attempt.items():
-            execution = execution_by_attempt[key]
+            containing = [
+                index
+                for index, execution in enumerate(self.node_executions)
+                if execution.node == call.node
+                and execution.started_at <= call.started_at
+                and call.finished_at <= execution.finished_at
+            ]
+            if len(containing) != 1:
+                raise ValueError(
+                    "provider call must have exactly one containing node execution"
+                )
+            calls_by_execution[containing[0]].append(call)
+        for index, calls in calls_by_execution.items():
+            execution = self.node_executions[index]
             for field in additive:
                 if sum(getattr(call.usage, field) for call in calls) > getattr(execution.usage, field):
                     raise ValueError("provider call usage exceeds its node execution usage")
@@ -759,15 +796,20 @@ class RunManifest(_ManifestModel):
         if set(self.usage_by_node) != set(executions_by_node):
             raise ValueError("usage_by_node keys must equal node execution nodes")
         for node, executions in executions_by_node.items():
+            node_calls = tuple(
+                call for call in self.provider_calls if call.node == node
+            )
             expected = self._aggregate_usage(
                 tuple(item.usage for item in executions),
                 wall_seconds=max((item.usage.wall_seconds for item in executions), default=0),
+                cost_usd=self._charged_cost(node_calls),
             )
             if self.usage_by_node[node] != expected:
                 raise ValueError("usage_by_node does not match aggregated node executions")
         expected_run = self._aggregate_usage(
             tuple(self.usage_by_node.values()),
             wall_seconds=(self.finished_at - self.started_at).total_seconds(),
+            cost_usd=self._charged_cost(self.provider_calls),
         )
         if self.usage != expected_run:
             raise ValueError("manifest usage does not match reconciled node usage")

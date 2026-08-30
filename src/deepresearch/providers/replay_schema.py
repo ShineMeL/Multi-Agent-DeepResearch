@@ -447,7 +447,7 @@ def _validate_success_record(
         return
     response = record.outcome.response
     if operation == "model.complete":
-        result = ModelResult[JsonValue].model_validate(response)
+        result = ModelResult[str].model_validate(response)
         if result.provider_id != record.key.provider_id or result.usage != record.usage:
             raise ValueError("model response metadata or usage does not match its record")
     elif operation == "model.structured":
@@ -522,22 +522,24 @@ class ReplayBundle:
             manifest = _ReplayManifest.model_validate_json(raw_manifest)
 
             actual_hashes: dict[str, str] = {}
+            file_payloads: dict[str, bytes] = {}
             for filename in REPLAY_FILES:
                 path = _safe_child(resolved_root, filename)
                 if not path.is_file():
                     raise ValueError(f"required replay file is missing: {filename}")
-                actual_hashes[filename] = hashlib.sha256(path.read_bytes()).hexdigest()
+                payload = path.read_bytes()
+                file_payloads[filename] = payload
+                actual_hashes[filename] = hashlib.sha256(payload).hexdigest()
             if actual_hashes != manifest.file_sha256:
                 raise ValueError("replay file hashes do not match manifest.sha256")
 
-            snapshot_path = _safe_child(resolved_root, "snapshot.json")
-            snapshot = ReplaySnapshot.model_validate_json(snapshot_path.read_bytes())
+            snapshot = ReplaySnapshot.model_validate_json(file_payloads["snapshot.json"])
             records: dict[tuple[str, str, str, str | None, str], ReplayRecord] = {}
             counts: Counter[str] = Counter()
             for filename, allowed_operations in _RECORD_FILES.items():
                 path = _safe_child(resolved_root, filename)
                 previous_sort_key: bytes | None = None
-                payload = path.read_bytes()
+                payload = file_payloads[filename]
                 if payload and (not payload.endswith(b"\n") or b"\r" in payload):
                     raise ValueError(f"non-canonical JSONL framing in {filename}")
                 raw_lines = () if not payload else payload[:-1].split(b"\n")

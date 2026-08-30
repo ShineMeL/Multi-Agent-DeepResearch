@@ -1,18 +1,20 @@
 import json
+import os
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from typing import NoReturn
+from typing import NoReturn, TypeVar
 
 import pytest
-from pydantic import BaseModel, JsonValue
+from pydantic import BaseModel, JsonValue, TypeAdapter
 
 from deepresearch.domain import ResourceUsage
 from deepresearch.providers import (
     ModelMessage,
+    ModelProvider,
     ModelRequest,
     ModelResult,
     ModelStreamChunk,
@@ -21,6 +23,7 @@ from deepresearch.providers import (
     SearchHit,
     StructuredModelResult,
 )
+from deepresearch.providers import recording as recording_module
 from deepresearch.providers.recording import (
     RecordingFetcher,
     RecordingModelProvider,
@@ -38,6 +41,7 @@ from deepresearch.providers.replay_schema import ReplayBundle
 from deepresearch.runtime import CancellationToken
 
 SHA256 = "a" * 64
+T = TypeVar("T")
 
 
 def _deadline() -> float:
@@ -75,10 +79,8 @@ def _request() -> ModelRequest:
 class FakeModel:
     provider_id = "record-model"
 
-    def __init__(self, *, model_revision: str | None = "revision-1") -> None:
+    def __init__(self) -> None:
         self.calls = 0
-        if model_revision is not None:
-            self.model_revision = model_revision
 
     async def complete(self, request: ModelRequest, *, deadline: float, cancellation_token: CancellationToken) -> ModelResult[str]:
         del deadline
@@ -95,16 +97,16 @@ class FakeModel:
     async def structured(
         self,
         request: ModelRequest,
-        output_schema: type[BaseModel],
+        output_schema: type[T],
         *,
         deadline: float,
         cancellation_token: CancellationToken,
-    ) -> StructuredModelResult[BaseModel]:
+    ) -> StructuredModelResult[T]:
         del deadline
         cancellation_token.raise_if_cancelled()
         self.calls += 1
         return StructuredModelResult(
-            output=output_schema.model_validate({"answer": "structured"}),
+            output=TypeAdapter(output_schema).validate_python({"answer": "structured"}),
             usage=_usage(),
             provider_id=self.provider_id,
             model_id=request.model_id,
@@ -161,8 +163,9 @@ class FakeSearch:
 class FakeFetcher:
     provider_id = "record-fetch"
 
-    def __init__(self) -> None:
+    def __init__(self, *, final_url: str | None = None) -> None:
         self.calls = 0
+        self.final_url = final_url
 
     async def fetch(self, url: str, *, deadline: float, cancellation_token: CancellationToken) -> RawDocument:
         del deadline
@@ -170,7 +173,7 @@ class FakeFetcher:
         self.calls += 1
         return RawDocument(
             requested_url=url,
-            final_url=url,
+            final_url=self.final_url or url,
             status=200,
             headers={
                 "content-type": "text/plain",
@@ -200,6 +203,36 @@ class FakeEmbedder:
         return tuple((float(index), 1.0) for index, _ in enumerate(texts))
 
 
+def _recording_model(
+    delegate: ModelProvider,
+    writer: ReplayBundleWriter,
+    *,
+    revision: str = "revision-1",
+) -> RecordingModelProvider:
+    writer.configure_model_provider(
+        provider_id=delegate.provider_id, model_revision=revision
+    )
+    return RecordingModelProvider(delegate, writer)
+
+
+def test_windows_directory_fsync_uses_native_flush(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows native directory flush boundary")
+    flushed: list[Path] = []
+    monkeypatch.setattr(
+        recording_module,
+        "_flush_windows_directory",
+        lambda path: flushed.append(path),
+        raising=False,
+    )
+
+    recording_module._fsync_directory(tmp_path)
+
+    assert flushed == [tmp_path]
+
+
 @pytest.mark.asyncio
 async def test_recorded_model_search_fetch_and_embed_replay_without_delegates(tmp_path: Path) -> None:
     final_root = tmp_path / "bundle"
@@ -210,7 +243,8 @@ async def test_recorded_model_search_fetch_and_embed_replay_without_delegates(tm
     embedder = FakeEmbedder()
     token = CancellationToken()
 
-    model_result = await RecordingModelProvider(model, writer).complete(
+    assert isinstance(model, ModelProvider)
+    model_result = await _recording_model(model, writer).complete(
         _request(), deadline=_deadline(), cancellation_token=token
     )
     search_result = await RecordingSearchProvider(search, writer).search(
@@ -286,7 +320,7 @@ async def test_recorded_stream_replays_ordered_chunks_and_terminal_usage(
     recorded = tuple(
         [
             chunk
-            async for chunk in RecordingModelProvider(model, writer).stream(
+            async for chunk in _recording_model(model, writer).stream(
                 _request(), deadline=_deadline(), cancellation_token=token
             )
         ]
@@ -315,7 +349,7 @@ async def test_replay_stream_rechecks_deadline_before_each_yield(
     root = tmp_path / "stream-deadline"
     writer = ReplayBundleWriter.create(root, run_id="stream-deadline")
     token = CancellationToken()
-    recorded = RecordingModelProvider(FakeModel(), writer).stream(
+    recorded = _recording_model(FakeModel(), writer).stream(
         _request(), deadline=_deadline(), cancellation_token=token
     )
     _ = tuple([chunk async for chunk in recorded])
@@ -393,7 +427,7 @@ class Answer(BaseModel):
 async def test_recorded_structured_result_replays_typed_output(tmp_path: Path) -> None:
     writer = ReplayBundleWriter.create(tmp_path / "structured", run_id="structured-run")
     token = CancellationToken()
-    recorded = await RecordingModelProvider(FakeModel(), writer).structured(
+    recorded = await _recording_model(FakeModel(), writer).structured(
         _request(), Answer, deadline=_deadline(), cancellation_token=token
     )
     await writer.finalize()
@@ -414,14 +448,26 @@ async def test_model_revision_is_required_persisted_and_changes_request_identity
         tmp_path / "missing", run_id="missing-revision"
     )
     with pytest.raises(ValueError, match="revision"):
-        RecordingModelProvider(FakeModel(model_revision=None), missing_writer)
+        RecordingModelProvider(FakeModel(), missing_writer)
     await missing_writer.abort()
+
+    conflicting_writer = ReplayBundleWriter.create(
+        tmp_path / "conflicting", run_id="conflicting-revision"
+    )
+    conflicting_writer.configure_model_provider(
+        provider_id=FakeModel.provider_id, model_revision="revision-1"
+    )
+    with pytest.raises(ValueError, match="conflicting"):
+        conflicting_writer.configure_model_provider(
+            provider_id=FakeModel.provider_id, model_revision="revision-2"
+        )
+    await conflicting_writer.abort()
 
     request_hashes: list[str] = []
     for revision in ("revision-1", "revision-2"):
         root = tmp_path / revision
         writer = ReplayBundleWriter.create(root, run_id=revision)
-        await RecordingModelProvider(FakeModel(model_revision=revision), writer).complete(
+        await _recording_model(FakeModel(), writer, revision=revision).complete(
             _request(), deadline=_deadline(), cancellation_token=CancellationToken()
         )
         await writer.finalize()
@@ -431,6 +477,76 @@ async def test_model_revision_is_required_persisted_and_changes_request_identity
         assert snapshot["providers"]["model"]["model_revision"] == revision
 
     assert request_hashes[0] != request_hashes[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "secret_url",
+    (
+        "https://example.com/redirect?api_key=TOP-SECRET",
+        "https://user:TOP-SECRET@example.com/redirect",
+    ),
+)
+async def test_recording_fetch_fails_closed_for_secret_final_url(
+    tmp_path: Path, secret_url: str
+) -> None:
+    writer = ReplayBundleWriter.create(tmp_path / "secret-final", run_id="secret-final")
+    recorder = RecordingFetcher(FakeFetcher(final_url=secret_url), writer)
+
+    try:
+        with pytest.raises(ValueError) as error:
+            await recorder.fetch(
+                "https://example.com/start",
+                deadline=_deadline(),
+                cancellation_token=CancellationToken(),
+            )
+        assert "TOP-SECRET" not in str(error.value)
+        assert error.value.__context__ is None
+        assert error.value.__cause__ is None
+    finally:
+        await writer.abort()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_point", ("marker", "final", "parent"))
+async def test_post_publish_failures_release_lock_and_abort_never_deletes_final(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_point: str
+) -> None:
+    final_root = tmp_path / f"published-{failure_point}"
+    writer = ReplayBundleWriter.create(final_root, run_id=f"published-{failure_point}")
+    original_unlink = Path.unlink
+
+    if failure_point == "marker":
+        def fail_marker(path: Path, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+            if path.parent == final_root and path.name == ".replay-writer-owner.json":
+                raise OSError("synthetic marker durability failure")
+            original_unlink(path)
+
+        monkeypatch.setattr(Path, "unlink", fail_marker)
+    else:
+        def fail_fsync(path: Path) -> None:
+            target = final_root if failure_point == "final" else final_root.parent
+            if path == target:
+                raise OSError(f"synthetic {failure_point} durability failure")
+
+        monkeypatch.setattr(
+            "deepresearch.providers.recording._fsync_directory", fail_fsync
+        )
+
+    with pytest.raises(OSError, match="published|durability"):
+        await writer.finalize()
+    assert final_root.exists()
+    await writer.abort()
+    assert final_root.exists()
+
+    monkeypatch.undo()
+    moved = tmp_path / f"saved-{failure_point}"
+    final_root.rename(moved)
+    replacement = ReplayBundleWriter.create(
+        final_root, run_id=f"replacement-{failure_point}"
+    )
+    await replacement.abort()
 
 
 @pytest.mark.asyncio
