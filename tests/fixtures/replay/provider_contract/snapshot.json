@@ -1,0 +1,1 @@
+{"providers":{"embed":{"model_id":"fixture-embed-v1","model_revision":"revision-1","provider_id":"fixture-embed","snapshot_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},"fetch":{"provider_id":"fixture-fetch"},"model":{"provider_id":"fixture-model"},"search":{"provider_id":"fixture-search"}},"run_id":"fixture-run","schema_version":"replay-bundle-v1"}
