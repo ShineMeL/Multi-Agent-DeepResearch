@@ -124,8 +124,10 @@ class ProviderCallExecutor:
             invocations += tuple(fallback_invocations)
 
         last_error: ProviderError | None = None
+        retries_used = 0
         for invocation_index, candidate in enumerate(invocations):
-            for attempt_index in range(self._policy.max_retries + 1):
+            attempt_index = 0
+            while True:
                 if self._clock() >= remaining_deadline:
                     raise self._deadline_error(operation)
                 attempt_deadline = min(
@@ -151,14 +153,18 @@ class ProviderCallExecutor:
                     may_retry = error.retryable and error.code in _RETRIED_CODES
                     if not may_retry:
                         raise
-                    if attempt_index == self._policy.max_retries:
+                    if self._clock() >= remaining_deadline:
+                        raise self._deadline_error(operation) from error
+                    if retries_used >= self._policy.max_retries:
                         break
                     delay = self._retry_delay(error, attempt_index)
                     if self._clock() + delay >= remaining_deadline:
-                        raise self._deadline_error(operation) from error
+                        break
                     await self._sleeper(delay)
                     if self._clock() >= remaining_deadline:
                         raise self._deadline_error(operation) from error
+                    retries_used += 1
+                    attempt_index += 1
                 else:
                     self._attempts.append(
                         ProviderCallAttempt(
@@ -185,7 +191,7 @@ class ProviderCallExecutor:
         jitter = self._random.uniform(
             1 - self._policy.jitter_ratio, 1 + self._policy.jitter_ratio
         )
-        return exponential * jitter
+        return min(exponential * jitter, self._policy.max_delay_seconds)
 
     @staticmethod
     def _deadline_error(operation: ProviderOperation) -> ProviderError:

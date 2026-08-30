@@ -1,7 +1,9 @@
+import ast
 from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
 from math import inf, nan
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -20,6 +22,28 @@ from deepresearch.providers.types import (
 )
 
 SHA256 = "a" * 64
+
+
+def test_task3_production_imports_only_the_public_domain_surface() -> None:
+    source_root = Path(__file__).parents[3] / "src" / "deepresearch"
+    production_files = sorted((source_root / "providers").glob("*.py")) + sorted(
+        (source_root / "runtime").glob("*.py")
+    )
+    offenders: list[str] = []
+
+    for path in production_files:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                if module.startswith("deepresearch.domain."):
+                    offenders.append(f"{path.name}:{node.lineno}:{module}")
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.startswith("deepresearch.domain."):
+                        offenders.append(f"{path.name}:{node.lineno}:{alias.name}")
+
+    assert offenders == []
 
 
 def usage(*, tokens: int = 0) -> ResourceUsage:

@@ -1,3 +1,5 @@
+import asyncio
+from collections.abc import Callable
 from datetime import UTC, datetime
 from hashlib import sha256
 
@@ -7,6 +9,16 @@ from deepresearch.domain import HtmlLocator
 from deepresearch.providers import Parser, ProviderError
 from deepresearch.providers.types import ParsedBlock, ParsedDocument, RawDocument
 from deepresearch.runtime import CancellationToken, OperationCancelled
+
+
+class AwaitGate:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def wait(self) -> None:
+        self.started.set()
+        await self.release.wait()
 
 
 def raw(content_type: str = "text/plain", body: bytes = b"evidence") -> RawDocument:
@@ -24,6 +36,9 @@ def raw(content_type: str = "text/plain", body: bytes = b"evidence") -> RawDocum
 class FakeParser:
     parser_id = "fake-parser"
     parser_version = "v1"
+
+    def __init__(self, *, gate: AwaitGate | None = None) -> None:
+        self._gate = gate
 
     def supports(self, content_type: str) -> bool:
         return content_type == "text/plain"
@@ -55,7 +70,10 @@ class FakeParser:
                 public_message="malformed supported content",
                 retryable=False,
             ) from error
-        await _yield_once()
+        if self._gate is not None:
+            await self._gate.wait()
+        else:
+            await _yield_once()
         cancellation_token.raise_if_cancelled()
         block = ParsedBlock(
             block_id="block-1",
@@ -81,6 +99,7 @@ async def _yield_once() -> None:
 
 class ParserContract:
     parser: Parser
+    parser_factory: Callable[[AwaitGate], Parser]
 
     @pytest.mark.asyncio
     async def test_success_returns_stable_typed_document(self) -> None:
@@ -119,6 +138,21 @@ class ParserContract:
         with pytest.raises(OperationCancelled):
             await self.parser.parse(raw(), deadline=10.0, cancellation_token=token)
 
+    @pytest.mark.asyncio
+    async def test_cancellation_after_await_is_enforced(self) -> None:
+        gate = AwaitGate()
+        parser = self.parser_factory(gate)
+        token = CancellationToken()
+        task = asyncio.create_task(
+            parser.parse(raw(), deadline=10.0, cancellation_token=token)
+        )
+        await gate.started.wait()
+        token.cancel()
+        gate.release.set()
+        with pytest.raises(OperationCancelled):
+            await task
+
 
 class TestFakeParser(ParserContract):
     parser = FakeParser()
+    parser_factory = staticmethod(lambda gate: FakeParser(gate=gate))

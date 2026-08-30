@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from decimal import Decimal
 
 import pytest
@@ -18,6 +18,16 @@ from deepresearch.providers.types import (
 from deepresearch.runtime import CancellationToken, OperationCancelled
 
 SHA256 = "a" * 64
+
+
+class AwaitGate:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def wait(self) -> None:
+        self.started.set()
+        await self.release.wait()
 
 
 def usage() -> ResourceUsage:
@@ -59,7 +69,9 @@ class InvalidAnswer(BaseModel):
 class FakeModelProvider:
     provider_id = "fake-model-provider"
 
-    def __init__(self) -> None:
+    def __init__(self, *, gate: AwaitGate | None = None) -> None:
+        self._gate = gate
+        self.io_closed = False
         self.stream_closed = False
 
     async def complete(
@@ -79,15 +91,18 @@ class FakeModelProvider:
                 public_message="model timed out",
                 retryable=True,
             )
-        await _yield_once()
-        cancellation_token.raise_if_cancelled()
-        return ModelResult(
-            output="answer",
-            usage=usage(),
-            provider_id=self.provider_id,
-            model_id=request.model_id,
-            raw_response_artifact_id="artifact-1",
-        )
+        try:
+            await self._await_io()
+            cancellation_token.raise_if_cancelled()
+            return ModelResult(
+                output="answer",
+                usage=usage(),
+                provider_id=self.provider_id,
+                model_id=request.model_id,
+                raw_response_artifact_id="artifact-1",
+            )
+        finally:
+            self.io_closed = True
 
     async def structured[T: BaseModel](
         self,
@@ -109,7 +124,7 @@ class FakeModelProvider:
                 public_message="invalid structured response",
                 retryable=False,
             ) from error
-        await _yield_once()
+        await self._await_io()
         cancellation_token.raise_if_cancelled()
         return StructuredModelResult(
             output=output,
@@ -133,7 +148,7 @@ class FakeModelProvider:
             try:
                 cancellation_token.raise_if_cancelled()
                 yield ModelStreamChunk(index=0, text_delta="answer")
-                await _yield_once()
+                await self._await_io()
                 cancellation_token.raise_if_cancelled()
                 yield ModelStreamChunk(index=1, finish_reason="stop", final_usage=usage())
             finally:
@@ -141,13 +156,22 @@ class FakeModelProvider:
 
         return chunks()
 
+    async def _await_io(self) -> None:
+        if self._gate is not None:
+            await self._gate.wait()
+        else:
+            await _yield_once()
+
 
 async def _yield_once() -> None:
-    await asyncio.sleep(0)
+    return None
 
 
 class ModelProviderContract:
     provider: ModelProvider
+    provider_factory: Callable[[AwaitGate], ModelProvider]
+    io_closed: Callable[[ModelProvider], bool]
+    stream_closed: Callable[[ModelProvider], bool]
 
     @pytest.mark.asyncio
     async def test_complete_returns_typed_usage_with_stable_serialization(self) -> None:
@@ -200,19 +224,41 @@ class ModelProviderContract:
             )
         assert invalid.value.code == "INVALID_RESPONSE"
 
+    @pytest.mark.asyncio
+    async def test_cancellation_after_await_closes_model_response(self) -> None:
+        gate = AwaitGate()
+        provider = self.provider_factory(gate)
+        token = CancellationToken()
+        task = asyncio.create_task(
+            provider.complete(request(), deadline=10.0, cancellation_token=token)
+        )
+        await gate.started.wait()
 
-class TestFakeModelProvider(ModelProviderContract):
-    provider = FakeModelProvider()
+        token.cancel()
+        gate.release.set()
+        with pytest.raises(OperationCancelled):
+            await task
+        assert self.io_closed(provider) is True
 
     @pytest.mark.asyncio
     async def test_stream_cancellation_closes_the_upstream_iterator(self) -> None:
+        gate = AwaitGate()
+        provider = self.provider_factory(gate)
         token = CancellationToken()
-        stream = self.provider.stream(
-            request(), deadline=10.0, cancellation_token=token
-        )
+        stream = provider.stream(request(), deadline=10.0, cancellation_token=token)
 
         assert (await anext(stream)).text_delta == "answer"
+        pending_chunk = asyncio.create_task(anext(stream))
+        await gate.started.wait()
         token.cancel()
+        gate.release.set()
         with pytest.raises(OperationCancelled):
-            await anext(stream)
-        assert self.provider.stream_closed is True
+            await pending_chunk
+        assert self.stream_closed(provider) is True
+
+
+class TestFakeModelProvider(ModelProviderContract):
+    provider = FakeModelProvider()
+    provider_factory = staticmethod(lambda gate: FakeModelProvider(gate=gate))
+    io_closed = staticmethod(lambda provider: provider.io_closed)
+    stream_closed = staticmethod(lambda provider: provider.stream_closed)

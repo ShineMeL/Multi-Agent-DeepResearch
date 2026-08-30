@@ -1,3 +1,5 @@
+import asyncio
+from collections.abc import Callable
 from decimal import Decimal
 
 import pytest
@@ -8,11 +10,23 @@ from deepresearch.providers.types import SearchHit
 from deepresearch.runtime import CancellationToken, OperationCancelled
 
 
+class AwaitGate:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def wait(self) -> None:
+        self.started.set()
+        await self.release.wait()
+
+
 class FakeSearchProvider:
     provider_id = "fake-search"
 
-    def __init__(self) -> None:
+    def __init__(self, *, gate: AwaitGate | None = None) -> None:
+        self._gate = gate
         self.calls = 0
+        self.response_closed = False
 
     async def search(
         self,
@@ -42,17 +56,23 @@ class FakeSearchProvider:
                 public_message="invalid search request",
                 retryable=False,
             )
-        await _yield_once()
-        cancellation_token.raise_if_cancelled()
-        return [
-            SearchHit(
-                url="https://example.com",
-                title="Example",
-                snippet="Result",
-                rank=1,
-                provider_metadata={"query": query},
-            )
-        ][:limit]
+        try:
+            if self._gate is not None:
+                await self._gate.wait()
+            else:
+                await _yield_once()
+            cancellation_token.raise_if_cancelled()
+            return [
+                SearchHit(
+                    url="https://example.com",
+                    title="Example",
+                    snippet="Result",
+                    rank=1,
+                    provider_metadata={"query": query},
+                )
+            ][:limit]
+        finally:
+            self.response_closed = True
 
 
 async def _yield_once() -> None:
@@ -76,6 +96,9 @@ def search_usage() -> ResourceUsage:
 
 class SearchProviderContract:
     provider: SearchProvider
+    provider_factory: Callable[[AwaitGate], SearchProvider]
+    response_closed: Callable[[SearchProvider], bool]
+    call_count: Callable[[SearchProvider], int]
 
     @pytest.mark.asyncio
     async def test_success_is_typed_stable_and_has_operation_level_usage(self) -> None:
@@ -105,19 +128,39 @@ class SearchProviderContract:
             )
         assert invalid.value.code == "INVALID_REQUEST"
 
+    @pytest.mark.asyncio
+    async def test_cancellation_before_and_after_await_is_enforced(self) -> None:
+        before_provider = self.provider_factory(AwaitGate())
+        before_token = CancellationToken()
+        before_token.cancel()
+        with pytest.raises(OperationCancelled):
+            await before_provider.search(
+                "agent planning",
+                5,
+                None,
+                deadline=10.0,
+                cancellation_token=before_token,
+            )
+        assert self.call_count(before_provider) == 0
+
+        gate = AwaitGate()
+        provider = self.provider_factory(gate)
+        token = CancellationToken()
+        task = asyncio.create_task(
+            provider.search(
+                "agent planning", 5, None, deadline=10.0, cancellation_token=token
+            )
+        )
+        await gate.started.wait()
+        token.cancel()
+        gate.release.set()
+        with pytest.raises(OperationCancelled):
+            await task
+        assert self.response_closed(provider) is True
+
 
 class TestFakeSearchProvider(SearchProviderContract):
     provider = FakeSearchProvider()
-
-
-@pytest.mark.asyncio
-async def test_cancelled_search_fails_before_provider_call() -> None:
-    provider = FakeSearchProvider()
-    token = CancellationToken()
-    token.cancel()
-
-    with pytest.raises(OperationCancelled):
-        await provider.search(
-            "agent planning", 5, None, deadline=100.0, cancellation_token=token
-        )
-    assert provider.calls == 0
+    provider_factory = staticmethod(lambda gate: FakeSearchProvider(gate=gate))
+    response_closed = staticmethod(lambda provider: provider.response_closed)
+    call_count = staticmethod(lambda provider: provider.calls)

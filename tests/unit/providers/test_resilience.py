@@ -198,3 +198,104 @@ async def test_strict_replay_disables_fallback_and_expired_deadline_skips_work()
         await executor.call("fetch", never_called, remaining_deadline=clock.now)
     assert deadline_error.value.code == "TIMEOUT"
     assert never_called.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_retry_allowance_is_shared_across_primary_and_fallback() -> None:
+    clock = FakeClock()
+    primary = SequenceCall(
+        [provider_error("NETWORK", retryable=True) for _ in range(3)]
+    )
+    fallback = SequenceCall(
+        [provider_error("UPSTREAM_5XX", retryable=True) for _ in range(3)]
+    )
+    executor = ProviderCallExecutor(
+        policy=ProviderCallPolicy.defaults(),
+        clock=clock,
+        sleeper=FakeSleeper(clock),
+        random=Random(1),
+    )
+
+    with pytest.raises(ProviderError) as error:
+        await executor.call(
+            "fetch",
+            primary,
+            remaining_deadline=100.0,
+            fallback_invocations=(fallback,),
+        )
+
+    assert error.value.code == "UPSTREAM_5XX"
+    assert primary.calls == 3
+    assert fallback.calls == 1
+    assert sum(attempt.attempt_index > 0 for attempt in executor.attempts) == 2
+
+
+@pytest.mark.asyncio
+async def test_unfit_primary_retry_advances_to_eligible_fallback() -> None:
+    clock = FakeClock(now=0.0)
+    sleeper = FakeSleeper(clock)
+    primary = SequenceCall(
+        [provider_error("NETWORK", retryable=True, retry_after=10.0)]
+    )
+    fallback = SequenceCall(["fallback-ok"])
+    executor = ProviderCallExecutor(
+        policy=ProviderCallPolicy.defaults(),
+        clock=clock,
+        sleeper=sleeper,
+        random=Random(1),
+    )
+
+    result = await executor.call(
+        "fetch",
+        primary,
+        remaining_deadline=1.0,
+        fallback_invocations=(fallback,),
+    )
+
+    assert result == "fallback-ok"
+    assert primary.calls == 1
+    assert fallback.calls == 1
+    assert sleeper.delays == []
+
+
+@pytest.mark.asyncio
+async def test_unfit_retry_without_fallback_preserves_original_error() -> None:
+    clock = FakeClock(now=0.0)
+    primary = SequenceCall(
+        [provider_error("NETWORK", retryable=True, retry_after=10.0)]
+    )
+    executor = ProviderCallExecutor(
+        policy=ProviderCallPolicy.defaults(),
+        clock=clock,
+        sleeper=FakeSleeper(clock),
+        random=Random(1),
+    )
+
+    with pytest.raises(ProviderError) as error:
+        await executor.call("fetch", primary, remaining_deadline=1.0)
+
+    assert error.value.code == "NETWORK"
+    assert clock.now == 0.0
+
+
+@pytest.mark.asyncio
+async def test_final_jittered_delay_is_capped_by_policy_maximum() -> None:
+    clock = FakeClock(now=0.0)
+    sleeper = FakeSleeper(clock)
+    policy = ProviderCallPolicy(
+        default_timeout_seconds=ProviderCallPolicy.defaults().default_timeout_seconds,
+        max_retries=1,
+        base_delay_seconds=4.0,
+        max_delay_seconds=4.0,
+        jitter_ratio=1.0,
+    )
+    call = SequenceCall([provider_error("NETWORK", retryable=True), "ok"])
+    executor = ProviderCallExecutor(
+        policy=policy,
+        clock=clock,
+        sleeper=sleeper,
+        random=Random(0),
+    )
+
+    assert await executor.call("fetch", call, remaining_deadline=100.0) == "ok"
+    assert sleeper.delays == [4.0]

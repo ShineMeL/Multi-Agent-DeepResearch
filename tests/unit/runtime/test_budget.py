@@ -56,6 +56,18 @@ def estimate(
     )
 
 
+def unsafe_usage(**updates: object) -> ResourceUsage:
+    payload = usage(tokens=1, cost="0.01").model_dump()
+    payload.update(updates)
+    return ResourceUsage.model_construct(**payload)
+
+
+def unsafe_estimate(**updates: object) -> ResourceEstimate:
+    payload = estimate(cost="0.01").model_dump()
+    payload.update(updates)
+    return ResourceEstimate.model_construct(**payload)
+
+
 def test_budget_reserve_rejects_all_hard_limit_overruns_without_mutation() -> None:
     accountant = BudgetAccountant(RunBudget.preset("medium"))
     before = accountant.snapshot()
@@ -234,3 +246,164 @@ def test_concurrent_settlement_charges_actual_usage_once() -> None:
 
     assert totals == (100,) * 100
     assert accountant.snapshot().used_tokens == 100
+
+
+def test_enabled_cost_budget_rejects_unknown_reservation_without_mutation() -> None:
+    accountant = BudgetAccountant(RunBudget.preset("low"))
+    before = accountant.snapshot()
+
+    with pytest.raises(ValueError, match="known cost"):
+        accountant.reserve(
+            estimate(tokens=1, cost=None),
+            node="Tool",
+            idempotency_key="unknown-cost",
+        )
+
+    assert accountant.snapshot() == before
+    reservation = accountant.reserve(
+        estimate(tokens=1, cost="0.25"),
+        node="Tool",
+        idempotency_key="known-cost",
+    )
+    assert reservation.estimate.cost_usd == Decimal("0.25")
+    assert accountant.snapshot().reserved_cost_usd == Decimal("0.25")
+
+
+@pytest.mark.parametrize(
+    "bad_estimate",
+    [
+        unsafe_estimate(cost_usd=Decimal("-0.01")),
+        unsafe_estimate(cost_usd=Decimal("NaN")),
+        unsafe_estimate(cost_usd=Decimal("Infinity")),
+        unsafe_estimate(wall_seconds=-1.0),
+        unsafe_estimate(wall_seconds=float("inf")),
+    ],
+)
+def test_reserve_revalidates_adversarial_estimate_instances(
+    bad_estimate: ResourceEstimate,
+) -> None:
+    accountant = BudgetAccountant(RunBudget.preset("low"))
+    before = accountant.snapshot()
+
+    with pytest.raises(ValueError):
+        accountant.reserve(
+            bad_estimate, node="Tool", idempotency_key="invalid-estimate"
+        )
+
+    assert accountant.snapshot() == before
+
+
+def test_enabled_cost_budget_rejects_unknown_charged_actual_atomically() -> None:
+    accountant = BudgetAccountant(RunBudget.preset("low"))
+    reservation = accountant.reserve(
+        estimate(cost="0.01"), node="Tool", idempotency_key="unknown-actual"
+    )
+    before = accountant.snapshot()
+
+    with pytest.raises(ValueError, match="known cost"):
+        accountant.settle(reservation, actual=usage(tokens=1, cost=None))
+
+    assert accountant.snapshot() == before
+    settled = accountant.settle(
+        reservation, actual=usage(tokens=1, cost="0.01")
+    )
+    assert settled.used_cost_usd == Decimal("0.01")
+
+
+@pytest.mark.parametrize(
+    "bad_actual",
+    [
+        unsafe_usage(cost_usd=Decimal("-0.01")),
+        unsafe_usage(cost_usd=Decimal("NaN")),
+        unsafe_usage(cost_usd=Decimal("Infinity")),
+        unsafe_usage(search_calls=-1),
+        unsafe_usage(pages=-1),
+        unsafe_usage(retries=-1),
+        unsafe_usage(input_tokens=-1, total_tokens=-1),
+        unsafe_usage(wall_seconds=-1.0),
+        unsafe_usage(wall_seconds=float("inf")),
+    ],
+)
+def test_rejected_settlement_is_atomic_and_reservation_remains_repeatable(
+    bad_actual: ResourceUsage,
+) -> None:
+    accountant = BudgetAccountant(RunBudget.preset("low"))
+    reservation = accountant.reserve(
+        estimate(cost="0.01"), node="Judge", idempotency_key="bad-actual"
+    )
+    before = accountant.snapshot()
+
+    with pytest.raises(ValueError, match="finite|non-negative"):
+        accountant.settle(reservation, actual=bad_actual)
+
+    assert accountant.snapshot() == before
+    settled = accountant.settle(
+        reservation, actual=usage(tokens=1, cost="0.01")
+    )
+    assert settled.used_tokens == 1
+    assert settled.used_cost_usd == Decimal("0.01")
+
+
+@pytest.mark.parametrize(
+    "bad_actual",
+    [
+        unsafe_usage(cost_usd=Decimal("-0.01")),
+        unsafe_usage(cost_usd=Decimal("NaN")),
+        unsafe_usage(cost_usd=Decimal("Infinity")),
+        unsafe_usage(wall_seconds=float("inf"), cost_usd=None),
+    ],
+)
+def test_uncharged_observation_still_rejects_invalid_numeric_usage(
+    bad_actual: ResourceUsage,
+) -> None:
+    accountant = BudgetAccountant(RunBudget.preset("low"))
+    reservation = accountant.reserve(
+        estimate(cost="0.01"), node="Tool", idempotency_key="bad-observation"
+    )
+    before = accountant.snapshot()
+
+    with pytest.raises(ValueError, match="finite|non-negative"):
+        accountant.settle(reservation, actual=bad_actual, charge=False)
+
+    assert accountant.snapshot() == before
+
+
+def test_uncharged_unknown_cost_is_observable_without_nulling_enabled_totals() -> None:
+    accountant = BudgetAccountant(RunBudget.preset("low"))
+    reservation = accountant.reserve(
+        estimate(cost="0.01"), node="Tool", idempotency_key="unknown-observation"
+    )
+
+    snapshot = accountant.settle(
+        reservation, actual=usage(tokens=1, cost=None), charge=False
+    )
+
+    assert snapshot.used_cost_usd == Decimal(0)
+    assert snapshot.reserved_cost_usd == Decimal(0)
+    assert snapshot.last_observed_usage.cost_usd is None
+
+
+@pytest.mark.parametrize(
+    "bad_seed",
+    [
+        unsafe_usage(cost_usd=Decimal("-0.01")),
+        unsafe_usage(cost_usd=Decimal("NaN")),
+        unsafe_usage(cost_usd=Decimal("Infinity")),
+        unsafe_usage(wall_seconds=float("inf")),
+        unsafe_usage(cost_usd=None),
+    ],
+)
+def test_accountant_rejects_invalid_or_unknown_chargeable_seed_usage(
+    bad_seed: ResourceUsage,
+) -> None:
+    budget = RunBudget.preset("low").model_copy(
+        update={
+            "used_by_node": {
+                **RunBudget.preset("low").used_by_node,
+                "Tool": bad_seed,
+            }
+        }
+    )
+
+    with pytest.raises(ValueError, match="finite|non-negative|known cost"):
+        BudgetAccountant(budget)

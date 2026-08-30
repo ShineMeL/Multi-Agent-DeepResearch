@@ -1,14 +1,26 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from decimal import Decimal
 from hashlib import sha256
 from math import isfinite
-from typing import Annotated, Generic, Literal, TypeAlias, TypeVar, cast
+from typing import (
+    Annotated,
+    Any,
+    Generic,
+    Literal,
+    Never,
+    Self,
+    TypeAlias,
+    TypeVar,
+    cast,
+    override,
+)
 
 from pydantic import (
     AnyHttpUrl,
+    BaseModel,
     ConfigDict,
     Field,
     JsonValue,
@@ -18,16 +30,92 @@ from pydantic import (
 )
 
 from deepresearch.domain import Locator, ResourceUsage
-from deepresearch.domain.locators import _DomainModel  # pyright: ignore[reportPrivateUsage]
-from deepresearch.domain.research import (
-    _canonical_json,  # pyright: ignore[reportPrivateUsage]
-    _freeze_json_mapping,  # pyright: ignore[reportPrivateUsage]
-    _freeze_mapping,  # pyright: ignore[reportPrivateUsage]
-    _thaw_internal_json,  # pyright: ignore[reportPrivateUsage]
-)
 
 Deadline: TypeAlias = float  # noqa: UP040 - exact frozen public contract
 T = TypeVar("T")
+_Key = TypeVar("_Key")
+_Value = TypeVar("_Value")
+type _InternalJson = JsonValue | tuple[_InternalJson, ...]
+
+
+class _FrozenDict(dict[_Key, _Value]):
+    @staticmethod
+    def _raise_immutable() -> Never:
+        raise TypeError("provider mappings are immutable")
+
+    def __setitem__(self, key: _Key, value: _Value) -> Never:
+        self._raise_immutable()
+
+    def __delitem__(self, key: _Key) -> Never:
+        self._raise_immutable()
+
+    def __ior__(self, value: object) -> Never:
+        self._raise_immutable()
+
+    def __copy__(self) -> Self:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> Self:
+        memo[id(self)] = self
+        return self
+
+    def clear(self) -> Never:
+        self._raise_immutable()
+
+    def pop(self, key: _Key, default: object = None) -> Never:
+        self._raise_immutable()
+
+    def popitem(self) -> Never:
+        self._raise_immutable()
+
+    def setdefault(self, key: _Key, default: _Value | None = None) -> Never:
+        self._raise_immutable()
+
+    def update(self, *args: object, **kwargs: object) -> Never:
+        self._raise_immutable()
+
+
+class _FrozenJsonArray(tuple[_InternalJson, ...]):
+    def __copy__(self) -> Self:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> Self:
+        memo[id(self)] = self
+        return self
+
+
+def _freeze_mapping[Key, Value](value: dict[Key, Value]) -> dict[Key, Value]:
+    return _FrozenDict(value)
+
+
+def _canonical_json(value: _InternalJson) -> JsonValue:
+    if isinstance(value, dict):
+        return {key: _canonical_json(value[key]) for key in sorted(value)}
+    if isinstance(value, (list, tuple)):
+        return [_canonical_json(item) for item in value]
+    return value
+
+
+def _freeze_json_mapping(value: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    frozen = _freeze_mapping({key: _freeze_json(item) for key, item in value.items()})
+    return cast("dict[str, JsonValue]", frozen)
+
+
+def _freeze_json(value: JsonValue) -> _InternalJson:
+    if isinstance(value, dict):
+        return _freeze_json_mapping(value)
+    if isinstance(value, list):
+        return _FrozenJsonArray(_freeze_json(item) for item in value)
+    return value
+
+
+def _thaw_internal_json(value: object) -> object:
+    if isinstance(value, _FrozenJsonArray):
+        return [_thaw_internal_json(item) for item in value]
+    if isinstance(value, dict):
+        mapping = cast("dict[object, object]", value)
+        return {key: _thaw_internal_json(item) for key, item in mapping.items()}
+    return value
 
 
 def _require_timezone(value: datetime | None) -> datetime | None:
@@ -46,7 +134,7 @@ def _require_sha256(value: str) -> str:
     return value
 
 
-class _ProviderModel(_DomainModel):
+class _ProviderModel(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
         frozen=True,
@@ -54,6 +142,19 @@ class _ProviderModel(_DomainModel):
         ser_json_bytes="base64",
         val_json_bytes="base64",
     )
+
+    @override
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if update is None:
+            return super().model_copy(deep=deep)
+        values = self.model_dump(round_trip=True)
+        values.update(update)
+        return type(self).model_validate(values)
 
 
 class SearchHit(_ProviderModel):

@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from hashlib import sha256
+from math import isfinite
 from threading import RLock
-from typing import Annotated, Literal, TypeAlias
+from typing import (
+    Annotated,
+    Any,
+    Literal,
+    Never,
+    Self,
+    TypeAlias,
+    TypeVar,
+    override,
+)
 
-from pydantic import ConfigDict, Field, field_serializer, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
 from deepresearch.domain import ResourceUsage, RunBudget
-from deepresearch.domain.locators import _DomainModel  # pyright: ignore[reportPrivateUsage]
-from deepresearch.domain.research import _freeze_mapping  # pyright: ignore[reportPrivateUsage]
 
 BudgetNode: TypeAlias = Literal[  # noqa: UP040 - exact frozen public contract
     "Planner", "Ranker", "Writer", "Judge", "Tool"
@@ -20,9 +29,69 @@ BudgetDimension: TypeAlias = Literal[  # noqa: UP040 - exact frozen public contr
 ]
 
 _NODES: tuple[BudgetNode, ...] = ("Planner", "Ranker", "Writer", "Judge", "Tool")
+_Key = TypeVar("_Key")
+_Value = TypeVar("_Value")
 
 
-class ResourceEstimate(_DomainModel):
+class _FrozenDict(dict[_Key, _Value]):
+    @staticmethod
+    def _raise_immutable() -> Never:
+        raise TypeError("runtime mappings are immutable")
+
+    def __setitem__(self, key: _Key, value: _Value) -> Never:
+        self._raise_immutable()
+
+    def __delitem__(self, key: _Key) -> Never:
+        self._raise_immutable()
+
+    def __ior__(self, value: object) -> Never:
+        self._raise_immutable()
+
+    def __copy__(self) -> Self:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> Self:
+        memo[id(self)] = self
+        return self
+
+    def clear(self) -> Never:
+        self._raise_immutable()
+
+    def pop(self, key: _Key, default: object = None) -> Never:
+        self._raise_immutable()
+
+    def popitem(self) -> Never:
+        self._raise_immutable()
+
+    def setdefault(self, key: _Key, default: _Value | None = None) -> Never:
+        self._raise_immutable()
+
+    def update(self, *args: object, **kwargs: object) -> Never:
+        self._raise_immutable()
+
+
+def _freeze_mapping[Key, Value](value: dict[Key, Value]) -> dict[Key, Value]:
+    return _FrozenDict(value)
+
+
+class _RuntimeModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    @override
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if update is None:
+            return super().model_copy(deep=deep)
+        values = self.model_dump(round_trip=True)
+        values.update(update)
+        return type(self).model_validate(values)
+
+
+class ResourceEstimate(_RuntimeModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
 
     search_calls: Annotated[int, Field(ge=0)] = 0
@@ -33,7 +102,7 @@ class ResourceEstimate(_DomainModel):
     retries: Annotated[int, Field(ge=0)] = 0
 
 
-class BudgetReservation(_DomainModel):
+class BudgetReservation(_RuntimeModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     reservation_id: str
@@ -42,7 +111,7 @@ class BudgetReservation(_DomainModel):
     estimate: ResourceEstimate
 
 
-class BudgetSnapshot(_DomainModel):
+class BudgetSnapshot(_RuntimeModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
 
     used_search_calls: Annotated[int, Field(ge=0)]
@@ -108,9 +177,19 @@ class BudgetAccountant:
         self._idempotency_index: dict[str, str] = {}
         self._cost_enabled = budget.max_cost_usd is not None
         zero = ResourceUsage.zero(cost_known=self._cost_enabled)
-        self._used_by_node: dict[BudgetNode, ResourceUsage] = {
-            node: budget.used_by_node.get(node, zero) for node in _NODES
-        }
+        used_by_node: dict[BudgetNode, ResourceUsage] = {}
+        for node in _NODES:
+            seeded = self._validate_usage(
+                budget.used_by_node.get(node, zero),
+                require_known_cost=False,
+                label=f"seeded {node} usage",
+            )
+            if self._cost_enabled and seeded.cost_usd is None:
+                if not _usage_is_zero(seeded):
+                    raise ValueError(f"seeded {node} usage must have known cost")
+                seeded = seeded.model_copy(update={"cost_usd": Decimal(0)})
+            used_by_node[node] = seeded
+        self._used_by_node = used_by_node
         self._last_observed_usage = zero
 
     def snapshot(self) -> BudgetSnapshot:
@@ -128,6 +207,9 @@ class BudgetAccountant:
             raise ValueError("node must be one of the five canonical budget buckets")
         if not idempotency_key:
             raise ValueError("idempotency_key must not be empty")
+        estimate = ResourceEstimate.model_validate(estimate.model_dump())
+        if self._cost_enabled and estimate.cost_usd is None:
+            raise ValueError("chargeable reservation must have known cost")
         budget_node = node
         with self._lock:
             existing_id = self._idempotency_index.get(idempotency_key)
@@ -173,13 +255,26 @@ class BudgetAccountant:
             if state.status == "released":
                 raise ValueError("cannot settle a released reservation")
 
-            self._last_observed_usage = actual
+            actual = self._validate_usage(
+                actual,
+                require_known_cost=self._cost_enabled and charge,
+                label="actual usage",
+            )
+            tentative_used_by_node = dict(self._used_by_node)
             if charge:
-                current = self._used_by_node[reservation.node]
-                self._used_by_node[reservation.node] = self._add_usage(current, actual)
+                current = tentative_used_by_node[reservation.node]
+                tentative_used_by_node[reservation.node] = self._add_usage(current, actual)
+            terminal_snapshot = self._snapshot_locked(
+                used_by_node=tentative_used_by_node,
+                last_observed_usage=actual,
+                exclude_reservation_id=reservation.reservation_id,
+            )
+
+            self._used_by_node = tentative_used_by_node
+            self._last_observed_usage = actual
             state.status = "settled"
-            state.terminal_snapshot = self._snapshot_locked()
-            return state.terminal_snapshot
+            state.terminal_snapshot = terminal_snapshot
+            return terminal_snapshot
 
     def release(self, reservation: BudgetReservation) -> BudgetSnapshot:
         with self._lock:
@@ -191,9 +286,12 @@ class BudgetAccountant:
             if state.status == "settled":
                 raise ValueError("cannot release a settled reservation")
 
+            terminal_snapshot = self._snapshot_locked(
+                exclude_reservation_id=reservation.reservation_id
+            )
             state.status = "released"
-            state.terminal_snapshot = self._snapshot_locked()
-            return state.terminal_snapshot
+            state.terminal_snapshot = terminal_snapshot
+            return terminal_snapshot
 
     def _owned_state(self, reservation: BudgetReservation) -> _ReservationState:
         state = self._states.get(reservation.reservation_id)
@@ -201,9 +299,21 @@ class BudgetAccountant:
             raise ValueError("reservation belongs to another accountant or is unknown")
         return state
 
-    def _snapshot_locked(self) -> BudgetSnapshot:
-        used = self._used_totals()
-        reserved = self._reserved_totals()
+    def _snapshot_locked(
+        self,
+        *,
+        used_by_node: dict[BudgetNode, ResourceUsage] | None = None,
+        last_observed_usage: ResourceUsage | None = None,
+        exclude_reservation_id: str | None = None,
+    ) -> BudgetSnapshot:
+        usage_by_node = self._used_by_node if used_by_node is None else used_by_node
+        observed = (
+            self._last_observed_usage
+            if last_observed_usage is None
+            else last_observed_usage
+        )
+        used = self._used_totals(usage_by_node)
+        reserved = self._reserved_totals(exclude_reservation_id=exclude_reservation_id)
         exhausted = self._exhausted_dimensions(used, reserved)
         return BudgetSnapshot(
             used_search_calls=used.search_calls,
@@ -219,20 +329,28 @@ class BudgetAccountant:
             reserved_cost_usd=reserved.cost_usd if self._cost_enabled else None,
             reserved_retries=reserved.retries,
             exhausted=frozenset(exhausted),
-            last_observed_usage=self._last_observed_usage,
-            used_by_node=dict(self._used_by_node),
+            last_observed_usage=observed,
+            used_by_node=dict(usage_by_node),
         )
 
-    def _used_totals(self) -> ResourceUsage:
+    def _used_totals(
+        self, used_by_node: dict[BudgetNode, ResourceUsage]
+    ) -> ResourceUsage:
         total = ResourceUsage.zero(cost_known=self._cost_enabled)
         for node in _NODES:
-            total = self._add_usage(total, self._used_by_node[node])
+            total = self._add_usage(total, used_by_node[node])
         return total
 
-    def _reserved_totals(self) -> ResourceEstimate:
-        active = [state.reservation.estimate for state in self._states.values() if state.status == "active"]
+    def _reserved_totals(
+        self, *, exclude_reservation_id: str | None = None
+    ) -> ResourceEstimate:
+        active = [
+            state.reservation.estimate
+            for reservation_id, state in self._states.items()
+            if state.status == "active" and reservation_id != exclude_reservation_id
+        ]
         cost: Decimal | None
-        if not self._cost_enabled or any(item.cost_usd is None for item in active):
+        if not self._cost_enabled:
             cost = None
         else:
             cost = sum((item.cost_usd or Decimal(0) for item in active), Decimal(0))
@@ -247,13 +365,7 @@ class BudgetAccountant:
 
     def _add_usage(self, left: ResourceUsage, right: ResourceUsage) -> ResourceUsage:
         cost: Decimal | None
-        if (
-            not self._cost_enabled
-            or left.cost_usd is None
-            and not _usage_is_zero(left)
-            or right.cost_usd is None
-            and not _usage_is_zero(right)
-        ):
+        if not self._cost_enabled:
             cost = None
         else:
             cost = (left.cost_usd or Decimal(0)) + (right.cost_usd or Decimal(0))
@@ -269,6 +381,25 @@ class BudgetAccountant:
             wall_seconds=left.wall_seconds + right.wall_seconds,
             cost_usd=cost,
         )
+
+    @staticmethod
+    def _validate_usage(
+        usage: ResourceUsage,
+        *,
+        require_known_cost: bool,
+        label: str,
+    ) -> ResourceUsage:
+        if not isfinite(usage.wall_seconds) or usage.wall_seconds < 0:
+            raise ValueError(f"{label} wall_seconds must be finite and non-negative")
+        if usage.cost_usd is None:
+            if require_known_cost:
+                raise ValueError(f"{label} must have known cost")
+        elif not usage.cost_usd.is_finite() or usage.cost_usd < 0:
+            raise ValueError(f"{label} cost_usd must be finite and non-negative")
+        try:
+            return ResourceUsage.model_validate(usage.model_dump())
+        except ValueError as error:
+            raise ValueError(f"{label} dimensions must be finite and non-negative") from error
 
     def _offending_dimensions(
         self, snapshot: BudgetSnapshot, estimate: ResourceEstimate

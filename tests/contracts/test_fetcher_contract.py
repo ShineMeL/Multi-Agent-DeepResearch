@@ -1,3 +1,5 @@
+import asyncio
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 import pytest
@@ -7,8 +9,22 @@ from deepresearch.providers.types import RawDocument
 from deepresearch.runtime import CancellationToken, OperationCancelled
 
 
+class AwaitGate:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def wait(self) -> None:
+        self.started.set()
+        await self.release.wait()
+
+
 class FakeFetcher:
     provider_id = "fake-fetcher"
+
+    def __init__(self, *, gate: AwaitGate | None = None) -> None:
+        self._gate = gate
+        self.response_closed = False
 
     async def fetch(
         self,
@@ -35,17 +51,23 @@ class FakeFetcher:
                 public_message="malformed upstream response",
                 retryable=False,
             )
-        await _yield_once()
-        cancellation_token.raise_if_cancelled()
-        return RawDocument(
-            requested_url=url,
-            final_url=url,
-            status=200,
-            headers={"content-type": "text/plain"},
-            content_type="text/plain",
-            body_bytes=b"evidence",
-            retrieved_at=datetime(2026, 1, 1, tzinfo=UTC),
-        )
+        try:
+            if self._gate is not None:
+                await self._gate.wait()
+            else:
+                await _yield_once()
+            cancellation_token.raise_if_cancelled()
+            return RawDocument(
+                requested_url=url,
+                final_url=url,
+                status=200,
+                headers={"content-type": "text/plain"},
+                content_type="text/plain",
+                body_bytes=b"evidence",
+                retrieved_at=datetime(2026, 1, 1, tzinfo=UTC),
+            )
+        finally:
+            self.response_closed = True
 
 
 async def _yield_once() -> None:
@@ -54,6 +76,8 @@ async def _yield_once() -> None:
 
 class FetcherContract:
     fetcher: Fetcher
+    fetcher_factory: Callable[[AwaitGate], Fetcher]
+    response_closed: Callable[[Fetcher], bool]
 
     @pytest.mark.asyncio
     async def test_success_preserves_body_for_immediate_artifact_write(self) -> None:
@@ -89,6 +113,25 @@ class FetcherContract:
                 "https://example.com/doc", deadline=10.0, cancellation_token=token
             )
 
+    @pytest.mark.asyncio
+    async def test_cancellation_after_await_closes_fetch_response(self) -> None:
+        gate = AwaitGate()
+        fetcher = self.fetcher_factory(gate)
+        token = CancellationToken()
+        task = asyncio.create_task(
+            fetcher.fetch(
+                "https://example.com/doc", deadline=10.0, cancellation_token=token
+            )
+        )
+        await gate.started.wait()
+        token.cancel()
+        gate.release.set()
+        with pytest.raises(OperationCancelled):
+            await task
+        assert self.response_closed(fetcher) is True
+
 
 class TestFakeFetcher(FetcherContract):
     fetcher = FakeFetcher()
+    fetcher_factory = staticmethod(lambda gate: FakeFetcher(gate=gate))
+    response_closed = staticmethod(lambda fetcher: fetcher.response_closed)
