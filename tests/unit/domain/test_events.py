@@ -1,3 +1,5 @@
+import heapq
+import json
 from datetime import UTC, datetime
 from hashlib import sha256
 from typing import get_args
@@ -126,7 +128,7 @@ def test_public_payload_is_detached_and_recursively_immutable() -> None:
     assert event.public_payload["nested"]["items"][0]["value"] == 1
     with pytest.raises(TypeError, match="immutable"):
         event.public_payload["new"] = True
-    with pytest.raises(TypeError, match="immutable"):
+    with pytest.raises(AttributeError):
         event.public_payload["nested"]["items"].append("new")
     with pytest.raises(TypeError, match="immutable"):
         event.public_payload["nested"]["items"][0]["value"] = 3
@@ -134,3 +136,60 @@ def test_public_payload_is_detached_and_recursively_immutable() -> None:
     assert event.model_dump(mode="json")["public_payload"] == {
         "nested": {"items": [{"value": 1}]}
     }
+
+
+@pytest.mark.parametrize("deep", [False, True])
+def test_event_update_copy_detaches_payload_and_revalidates_timestamp(deep: bool) -> None:
+    event = run_event()
+    caller_owned = {"nested": {"items": [{"value": 1}]}}
+
+    copied = event.model_copy(update={"public_payload": caller_owned}, deep=deep)
+    caller_owned["nested"]["items"][0]["value"] = 2
+
+    assert copied.public_payload["nested"]["items"][0]["value"] == 1
+    with pytest.raises(AttributeError):
+        copied.public_payload["nested"]["items"].append("new")
+    with pytest.raises(ValidationError):
+        event.model_copy(update={"public_payload": {"invalid": object()}}, deep=deep)
+    with pytest.raises(ValidationError, match="timezone"):
+        event.model_copy(
+            update={"timestamp": datetime(2026, 8, 29)},  # noqa: DTZ001 - invalid fixture
+            deep=deep,
+        )
+
+
+@pytest.mark.parametrize("deep", [False, True])
+def test_result_update_copy_revalidates_status(deep: bool) -> None:
+    result = RunResult(
+        run_id="run-1",
+        thread_id="thread-1",
+        status="completed",
+        is_partial=False,
+        final_usage=ResourceUsage.zero(),
+    )
+
+    with pytest.raises(ValidationError):
+        result.model_copy(update={"status": "not-a-status"}, deep=deep)
+
+
+def test_nested_event_arrays_reject_heapq_and_keep_json_wire_shape() -> None:
+    event = run_event(public_payload={"values": [3, 1, 2]})
+    values = event.public_payload["values"]
+    digest = sha256(event.model_dump_json().encode()).digest()
+
+    assert isinstance(values, tuple)
+    with pytest.raises(TypeError):
+        heapq.heappush(values, 0)
+    assert sha256(event.model_dump_json().encode()).digest() == digest
+    assert json.loads(event.model_dump_json())["public_payload"]["values"] == [3, 1, 2]
+    assert event.model_dump()["public_payload"]["values"] == [3, 1, 2]
+
+
+@pytest.mark.parametrize("deep", [False, True])
+def test_event_update_copy_accepts_its_own_internal_json_mapping(deep: bool) -> None:
+    event = run_event(public_payload={"values": [3, 1, 2]})
+
+    copied = event.model_copy(update={"public_payload": event.public_payload}, deep=deep)
+
+    assert copied == event
+    assert isinstance(copied.public_payload["values"], tuple)

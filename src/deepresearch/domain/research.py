@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterator
 from datetime import date
 from math import isfinite
-from typing import Annotated, Literal, Never, Self, SupportsIndex, TypeVar
+from typing import Annotated, Literal, Never, Self, TypeVar, cast
 
 from pydantic import (
-    BaseModel,
     ConfigDict,
     Field,
     JsonValue,
@@ -16,10 +15,11 @@ from pydantic import (
 )
 
 from .enums import AccessProfile, ExecutionMode, RunPurpose, SourceType
+from .locators import _DomainModel  # pyright: ignore[reportPrivateUsage]
 
 _Key = TypeVar("_Key")
 _Value = TypeVar("_Value")
-_Item = TypeVar("_Item")
+type _InternalJson = JsonValue | tuple[_InternalJson, ...]
 
 
 class _FrozenDict(dict[_Key, _Value]):
@@ -59,30 +59,7 @@ class _FrozenDict(dict[_Key, _Value]):
         self._raise_immutable()
 
 
-class _FrozenList(list[_Item]):
-    @staticmethod
-    def _raise_immutable() -> Never:
-        raise TypeError("domain lists are immutable")
-
-    def __setitem__(
-        self,
-        index: SupportsIndex | slice[SupportsIndex | None, SupportsIndex | None, SupportsIndex | None],
-        value: _Item | Iterable[_Item],
-    ) -> Never:
-        self._raise_immutable()
-
-    def __delitem__(
-        self,
-        index: SupportsIndex | slice[SupportsIndex | None, SupportsIndex | None, SupportsIndex | None],
-    ) -> Never:
-        self._raise_immutable()
-
-    def __iadd__(self, value: Iterable[_Item]) -> Never:
-        self._raise_immutable()
-
-    def __imul__(self, value: SupportsIndex) -> Never:
-        self._raise_immutable()
-
+class _FrozenJsonArray(tuple[_InternalJson, ...]):
     def __copy__(self) -> Self:
         return self
 
@@ -90,37 +67,13 @@ class _FrozenList(list[_Item]):
         memo[id(self)] = self
         return self
 
-    def append(self, value: _Item) -> Never:
-        self._raise_immutable()
-
-    def clear(self) -> Never:
-        self._raise_immutable()
-
-    def extend(self, values: Iterable[_Item]) -> Never:
-        self._raise_immutable()
-
-    def insert(self, index: SupportsIndex, value: _Item) -> Never:
-        self._raise_immutable()
-
-    def pop(self, index: SupportsIndex = -1) -> Never:
-        self._raise_immutable()
-
-    def remove(self, value: _Item) -> Never:
-        self._raise_immutable()
-
-    def reverse(self) -> Never:
-        self._raise_immutable()
-
-    def sort(self, *args: object, **kwargs: object) -> Never:
-        self._raise_immutable()
-
 
 class _CanonicalSourceTypes(frozenset[SourceType]):
     def __iter__(self) -> Iterator[SourceType]:
         return iter(sorted(super().__iter__()))
 
 
-class FreshnessRequirement(BaseModel):
+class FreshnessRequirement(_DomainModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     kind: Literal["none", "published_after", "retrieved_within_days"]
@@ -143,7 +96,7 @@ class FreshnessRequirement(BaseModel):
         return self
 
 
-class ResearchRequest(BaseModel):
+class ResearchRequest(_DomainModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     question: str
@@ -157,6 +110,11 @@ class ResearchRequest(BaseModel):
     run_purpose: RunPurpose
     budget_preset: Literal["low", "medium", "high"]
 
+    @field_validator("output_requirements", mode="before")
+    @classmethod
+    def thaw_internal_output_requirements(cls, value: object) -> object:
+        return _thaw_internal_json(value)
+
     @field_validator("output_requirements")
     @classmethod
     def freeze_output_requirements(
@@ -164,14 +122,14 @@ class ResearchRequest(BaseModel):
     ) -> dict[str, JsonValue]:
         return _freeze_json_mapping(value)
 
-    @field_serializer("output_requirements", when_used="json")
+    @field_serializer("output_requirements")
     def serialize_output_requirements(
         self, value: dict[str, JsonValue]
     ) -> dict[str, JsonValue]:
         return {key: _canonical_json(value[key]) for key in sorted(value)}
 
 
-class DateRange(BaseModel):
+class DateRange(_DomainModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     start: date | None = None
@@ -184,7 +142,7 @@ class DateRange(BaseModel):
         return self
 
 
-class ResearchScope(BaseModel):
+class ResearchScope(_DomainModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     included_topics: tuple[str, ...]
@@ -193,7 +151,7 @@ class ResearchScope(BaseModel):
     answer_shape: str
 
 
-class InformationNeed(BaseModel):
+class InformationNeed(_DomainModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     need_id: str
@@ -208,7 +166,7 @@ class InformationNeed(BaseModel):
         return value
 
 
-class EvidenceRequirements(BaseModel):
+class EvidenceRequirements(_DomainModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     min_independent_sources: Annotated[int, Field(ge=1)]
@@ -224,7 +182,7 @@ class EvidenceRequirements(BaseModel):
         return _CanonicalSourceTypes(value)
 
 
-class SubQuestion(BaseModel):
+class SubQuestion(_DomainModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     id: str
@@ -244,7 +202,7 @@ class SubQuestion(BaseModel):
         return value
 
 
-class ResearchPlan(BaseModel):
+class ResearchPlan(_DomainModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     plan_id: str
@@ -303,10 +261,10 @@ def _require_unique(values: list[str], *, label: str) -> None:
         raise ValueError(f"duplicate {label} IDs: {names}")
 
 
-def _canonical_json(value: JsonValue) -> JsonValue:
+def _canonical_json(value: _InternalJson) -> JsonValue:
     if isinstance(value, dict):
         return {key: _canonical_json(value[key]) for key in sorted(value)}
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [_canonical_json(item) for item in value]
     return value
 
@@ -316,14 +274,24 @@ def _freeze_mapping[Key, Value](value: dict[Key, Value]) -> dict[Key, Value]:
 
 
 def _freeze_json_mapping(value: dict[str, JsonValue]) -> dict[str, JsonValue]:
-    return _freeze_mapping({key: _freeze_json(item) for key, item in value.items()})
+    frozen = _freeze_mapping({key: _freeze_json(item) for key, item in value.items()})
+    return cast("dict[str, JsonValue]", frozen)
 
 
-def _freeze_json(value: JsonValue) -> JsonValue:
+def _freeze_json(value: JsonValue) -> _InternalJson:
     if isinstance(value, dict):
         return _freeze_json_mapping(value)
     if isinstance(value, list):
-        return _FrozenList(_freeze_json(item) for item in value)
+        return _FrozenJsonArray(_freeze_json(item) for item in value)
+    return value
+
+
+def _thaw_internal_json(value: object) -> object:
+    if isinstance(value, _FrozenJsonArray):
+        return [_thaw_internal_json(item) for item in value]
+    if isinstance(value, dict):
+        mapping = cast("dict[object, object]", value)
+        return {key: _thaw_internal_json(item) for key, item in mapping.items()}
     return value
 
 

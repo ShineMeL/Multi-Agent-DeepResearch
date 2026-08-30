@@ -2,7 +2,6 @@ from decimal import Decimal
 from typing import Annotated, Literal, Self
 
 from pydantic import (
-    BaseModel,
     ConfigDict,
     Field,
     field_serializer,
@@ -10,12 +9,13 @@ from pydantic import (
     model_validator,
 )
 
+from .locators import _DomainModel  # pyright: ignore[reportPrivateUsage]
 from .research import ResearchRequest, _freeze_mapping  # pyright: ignore[reportPrivateUsage]
 
 _NodeName = Literal["Planner", "Ranker", "Writer", "Judge", "Tool"]
 
 
-class ResourceUsage(BaseModel):
+class ResourceUsage(_DomainModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     input_tokens: Annotated[int, Field(ge=0)]
@@ -54,7 +54,7 @@ class ResourceUsage(BaseModel):
         return self
 
 
-class RunBudget(BaseModel):
+class RunBudget(_DomainModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     max_search_calls: Annotated[int, Field(ge=0)]
@@ -97,7 +97,7 @@ class RunBudget(BaseModel):
         )
 
 
-class RunConfig(BaseModel):
+class RunConfig(_DomainModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     request: ResearchRequest

@@ -1,21 +1,18 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, JsonValue, field_serializer, field_validator
+from pydantic import ConfigDict, JsonValue, field_serializer, field_validator
 
 from .enums import RunStatus, StopReason
-from .research import _freeze_json_mapping  # pyright: ignore[reportPrivateUsage]
+from .locators import _DomainModel  # pyright: ignore[reportPrivateUsage]
+from .research import (
+    _canonical_json,  # pyright: ignore[reportPrivateUsage]
+    _freeze_json_mapping,  # pyright: ignore[reportPrivateUsage]
+    _thaw_internal_json,  # pyright: ignore[reportPrivateUsage]
+)
 from .usage import ResourceUsage
 
 
-def _canonical_json(value: JsonValue) -> JsonValue:
-    if isinstance(value, dict):
-        return {key: _canonical_json(value[key]) for key in sorted(value)}
-    if isinstance(value, list):
-        return [_canonical_json(item) for item in value]
-    return value
-
-
-class RunEvent(BaseModel):
+class RunEvent(_DomainModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     seq: int
@@ -29,12 +26,17 @@ class RunEvent(BaseModel):
     artifact_ids: tuple[str, ...]
     error_code: str | None = None
 
+    @field_validator("public_payload", mode="before")
+    @classmethod
+    def thaw_internal_public_payload(cls, value: object) -> object:
+        return _thaw_internal_json(value)
+
     @field_validator("public_payload")
     @classmethod
     def freeze_public_payload(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
         return _freeze_json_mapping(value)
 
-    @field_serializer("public_payload", when_used="json")
+    @field_serializer("public_payload")
     def serialize_public_payload(self, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
         return {key: _canonical_json(value[key]) for key in sorted(value)}
 
@@ -46,7 +48,7 @@ class RunEvent(BaseModel):
         return value
 
 
-class RunResult(BaseModel):
+class RunResult(_DomainModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     run_id: str

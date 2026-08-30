@@ -203,3 +203,26 @@ def test_feature_scores_are_detached_and_reject_post_validation_infinity() -> No
         score.feature_scores["new"] = nan
     assert sha256(score.model_dump_json().encode()).digest() == digest
     assert score.model_dump(mode="json")["feature_scores"] == {"semantic": 0.5}
+
+
+@pytest.mark.parametrize("deep", [False, True])
+def test_feature_score_update_copy_revalidates_and_detaches(deep: bool) -> None:
+    score = RerankScore(evidence_id="ev-1", total=0.5, feature_scores={"semantic": 0.5})
+    caller_owned = {"semantic": 0.7}
+
+    copied = score.model_copy(update={"feature_scores": caller_owned}, deep=deep)
+    caller_owned["semantic"] = 0.9
+
+    assert copied.feature_scores == {"semantic": 0.7}
+    with pytest.raises(TypeError, match="immutable"):
+        copied.feature_scores["semantic"] = 0.8
+    with pytest.raises(ValidationError, match="finite"):
+        score.model_copy(update={"feature_scores": {"semantic": inf}}, deep=deep)
+
+
+@pytest.mark.parametrize("deep", [False, True])
+def test_update_copy_cannot_bypass_hash_validation(deep: bool) -> None:
+    source = source_document()
+
+    with pytest.raises(ValidationError, match="SHA-256"):
+        source.model_copy(update={"content_hash": "bad"}, deep=deep)

@@ -71,3 +71,13 @@ def test_locator_models_are_frozen_and_forbid_extra_fields() -> None:
         HtmlLocator(paragraph_id="p", start_char=0, end_char=1, section="intro")
     with pytest.raises(ValidationError):
         locator.end_char = 2
+
+
+@pytest.mark.parametrize("deep", [False, True])
+def test_locator_update_copy_revalidates_ranges(deep: bool) -> None:
+    locator = HtmlLocator(paragraph_id="p", start_char=0, end_char=2)
+
+    with pytest.raises(ValidationError, match="end_char"):
+        locator.model_copy(update={"end_char": 0}, deep=deep)
+
+    assert locator.model_copy(deep=deep) == locator

@@ -3,10 +3,10 @@ from datetime import datetime
 from math import isfinite
 from typing import Annotated, Literal
 
-from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, field_serializer, field_validator
+from pydantic import AnyHttpUrl, ConfigDict, Field, field_serializer, field_validator
 
 from .enums import ClaimType, SourceType, VerificationStatus
-from .locators import Locator
+from .locators import Locator, _DomainModel  # pyright: ignore[reportPrivateUsage]
 from .research import _freeze_mapping  # pyright: ignore[reportPrivateUsage]
 
 
@@ -28,7 +28,7 @@ def _require_finite(value: float) -> float:
     return value
 
 
-class CoverageLedgerEntry(BaseModel):
+class CoverageLedgerEntry(_DomainModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     subquestion_id: str
@@ -46,7 +46,7 @@ class CoverageLedgerEntry(BaseModel):
     )(_require_finite)
 
 
-class SourceDocument(BaseModel):
+class SourceDocument(_DomainModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     source_id: str
@@ -65,7 +65,7 @@ class SourceDocument(BaseModel):
     _sha256_hashes = field_validator("content_hash", "parsed_content_hash")(_require_sha256)
 
 
-class EvidenceSpan(BaseModel):
+class EvidenceSpan(_DomainModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     evidence_id: str
@@ -79,7 +79,7 @@ class EvidenceSpan(BaseModel):
     _sha256_hash = field_validator("excerpt_hash")(_require_sha256)
 
 
-class Claim(BaseModel):
+class Claim(_DomainModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     claim_id: str
@@ -92,7 +92,7 @@ class Claim(BaseModel):
     verification_status: VerificationStatus
 
 
-class ClaimEvidenceLink(BaseModel):
+class ClaimEvidenceLink(_DomainModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     claim_id: str
@@ -107,7 +107,7 @@ class ClaimEvidenceLink(BaseModel):
     _finite_scores = field_validator("entailment_score", "relevance_score")(_require_finite)
 
 
-class RerankScore(BaseModel):
+class RerankScore(_DomainModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     evidence_id: str

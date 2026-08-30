@@ -1,9 +1,27 @@
-from typing import Annotated, Literal, Self, TypeAlias
+from collections.abc import Mapping
+from typing import Annotated, Any, Literal, Self, TypeAlias, override
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-class HtmlLocator(BaseModel):
+class _DomainModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    @override
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if update is None:
+            return super().model_copy(deep=deep)
+        values = self.model_dump(round_trip=True)
+        values.update(update)
+        return type(self).model_validate(values)
+
+
+class HtmlLocator(_DomainModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     kind: Literal["html"] = "html"
@@ -18,7 +36,7 @@ class HtmlLocator(BaseModel):
         return self
 
 
-class PdfLocator(BaseModel):
+class PdfLocator(_DomainModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     kind: Literal["pdf"] = "pdf"

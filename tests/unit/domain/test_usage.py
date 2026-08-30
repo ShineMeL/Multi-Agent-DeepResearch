@@ -179,3 +179,58 @@ def test_prompt_versions_are_detached_and_immutable() -> None:
     with pytest.raises(TypeError, match="immutable"):
         config.prompt_versions.clear()
     assert sha256(config.model_dump_json().encode()).digest() == digest
+
+
+@pytest.mark.parametrize("deep", [False, True])
+def test_budget_update_copy_rejects_invalid_nodes_and_freezes_valid_mapping(
+    deep: bool,
+) -> None:
+    budget = RunBudget.preset("low")
+    caller_owned = dict(budget.used_by_node)
+
+    copied = budget.model_copy(update={"used_by_node": caller_owned}, deep=deep)
+    caller_owned["Bad"] = ResourceUsage.zero()
+
+    assert "Bad" not in copied.used_by_node
+    with pytest.raises(TypeError, match="immutable"):
+        copied.used_by_node["Bad"] = ResourceUsage.zero()
+    with pytest.raises(ValidationError):
+        budget.model_copy(
+            update={"used_by_node": {"Bad": ResourceUsage.zero()}}, deep=deep
+        )
+    assert budget.model_copy(update={"max_cost_usd": None}, deep=deep).max_cost_usd is None
+
+
+@pytest.mark.parametrize("deep", [False, True])
+def test_prompt_update_copy_detaches_and_revalidates_run_config(deep: bool) -> None:
+    config = run_config()
+    caller_owned = {"planner": "v2"}
+
+    copied = config.model_copy(update={"prompt_versions": caller_owned}, deep=deep)
+    caller_owned["planner"] = "changed"
+
+    assert copied.prompt_versions == {"planner": "v2"}
+    with pytest.raises(TypeError, match="immutable"):
+        copied.prompt_versions.clear()
+    with pytest.raises(ValidationError):
+        config.model_copy(
+            update={"prompt_versions": {"planner": object()}}, deep=deep
+        )
+
+    token_only = RunBudget.preset("medium").model_copy(update={"max_cost_usd": None})
+    with pytest.raises(ValidationError, match="max_cost_usd"):
+        config.model_copy(
+            update={
+                "request": request(access_profile="public_live"),
+                "budget": token_only,
+            },
+            deep=deep,
+        )
+
+
+@pytest.mark.parametrize("deep", [False, True])
+def test_usage_update_copy_revalidates_token_totals(deep: bool) -> None:
+    usage = ResourceUsage.zero()
+
+    with pytest.raises(ValidationError, match="total_tokens"):
+        usage.model_copy(update={"output_tokens": 1}, deep=deep)

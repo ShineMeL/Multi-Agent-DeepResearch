@@ -1,3 +1,8 @@
+import heapq
+import json
+import os
+import subprocess
+import sys
 from datetime import date
 from hashlib import sha256
 from typing import get_args
@@ -221,7 +226,7 @@ def test_output_requirements_are_detached_and_recursively_immutable() -> None:
     assert sha256(request.model_dump_json().encode()).digest() == digest
     with pytest.raises(TypeError, match="immutable"):
         request.output_requirements["new"] = True
-    with pytest.raises(TypeError, match="immutable"):
+    with pytest.raises(AttributeError):
         request.output_requirements["nested"]["items"].append("new")
     with pytest.raises(TypeError, match="immutable"):
         request.output_requirements["nested"]["items"][0]["value"] = 3
@@ -265,5 +270,160 @@ def test_deep_model_copy_preserves_recursive_immutability() -> None:
 
     assert copied == request
     assert copied is not request
-    with pytest.raises(TypeError, match="immutable"):
+    with pytest.raises(AttributeError):
         copied.output_requirements["nested"]["items"].append("new")
+
+
+@pytest.mark.parametrize("deep", [False, True])
+def test_request_update_copy_detaches_and_freezes_nested_json(deep: bool) -> None:
+    request = ResearchRequest(
+        question="What changed?",
+        output_requirements={},
+        report_language="en",
+        source_languages=("en",),
+        freshness_requirement=FreshnessRequirement(kind="none"),
+        execution_mode="replay",
+        access_profile="local",
+        provider_profile_id="offline",
+        run_purpose="test",
+        budget_preset="low",
+    )
+    caller_owned = {"nested": {"items": [{"value": 1}]}}
+
+    copied = request.model_copy(update={"output_requirements": caller_owned}, deep=deep)
+    caller_owned["nested"]["items"][0]["value"] = 2
+
+    assert copied.output_requirements["nested"]["items"][0]["value"] == 1
+    with pytest.raises(AttributeError):
+        copied.output_requirements["nested"]["items"].append("new")
+    with pytest.raises(ValidationError):
+        request.model_copy(update={"unexpected": True}, deep=deep)
+    with pytest.raises(ValidationError):
+        request.model_copy(
+            update={"output_requirements": {"invalid": object()}}, deep=deep
+        )
+
+
+@pytest.mark.parametrize("deep", [False, True])
+def test_source_type_update_copy_recanonicalizes_frozenset(deep: bool) -> None:
+    requirements = EvidenceRequirements(
+        min_independent_sources=1,
+        allowed_source_types=frozenset({"paper"}),
+        must_include_primary=False,
+    )
+
+    copied = requirements.model_copy(
+        update={"allowed_source_types": frozenset({"unknown", "paper", "news", "standard"})},
+        deep=deep,
+    )
+
+    assert isinstance(copied.allowed_source_types, frozenset)
+    assert '"allowed_source_types":["news","paper","standard","unknown"]' in (
+        copied.model_dump_json()
+    )
+    with pytest.raises(ValidationError):
+        requirements.model_copy(
+            update={"allowed_source_types": frozenset({"not-a-source-type"})},
+            deep=deep,
+        )
+
+
+def test_source_type_update_copy_is_stable_across_hash_seeds() -> None:
+    code = (
+        "from deepresearch.domain import EvidenceRequirements;"
+        "x=EvidenceRequirements(min_independent_sources=1,"
+        "allowed_source_types=frozenset({'paper'}),must_include_primary=False);"
+        "print(x.model_copy(update={'allowed_source_types':"
+        "frozenset({'unknown','paper','news','standard'})}).model_dump_json())"
+    )
+    outputs = []
+    for seed in ("1", "42", "99"):
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            check=True,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONHASHSEED": seed},
+        )
+        outputs.append(result.stdout.strip())
+
+    assert len(set(outputs)) == 1
+    assert '["news","paper","standard","unknown"]' in outputs[0]
+
+
+@pytest.mark.parametrize("deep", [False, True])
+def test_update_copy_cannot_bypass_date_or_graph_validation(deep: bool) -> None:
+    date_range = DateRange(start=date(2026, 1, 1), end=date(2026, 2, 1))
+    with pytest.raises(ValidationError, match="start"):
+        date_range.model_copy(update={"start": date(2026, 3, 1)}, deep=deep)
+
+    plan = research_plan(
+        subquestion("sq-1"),
+        subquestion("sq-2", dependencies=("sq-1",), need_ids=("need-2",)),
+    )
+    cycle = (
+        subquestion("sq-1", dependencies=("sq-2",)),
+        subquestion("sq-2", dependencies=("sq-1",), need_ids=("need-2",)),
+    )
+    with pytest.raises(ValidationError, match="cycle"):
+        plan.model_copy(update={"subquestions": cycle}, deep=deep)
+
+
+def test_nested_request_arrays_reject_heapq_and_keep_json_array_schema() -> None:
+    request = ResearchRequest(
+        question="What changed?",
+        output_requirements={"values": [3, 1, 2]},
+        report_language="en",
+        source_languages=("en",),
+        freshness_requirement=FreshnessRequirement(kind="none"),
+        execution_mode="replay",
+        access_profile="local",
+        provider_profile_id="offline",
+        run_purpose="test",
+        budget_preset="low",
+    )
+    values = request.output_requirements["values"]
+    digest = sha256(request.model_dump_json().encode()).digest()
+
+    assert isinstance(values, tuple)
+    with pytest.raises(TypeError):
+        heapq.heappush(values, 0)
+    with pytest.raises(TypeError):
+        heapq.heappop(values)
+    with pytest.raises(TypeError):
+        heapq.heapify(values)
+    with pytest.raises(TypeError):
+        heapq.heapreplace(values, 0)
+    assert sha256(request.model_dump_json().encode()).digest() == digest
+    assert json.loads(request.model_dump_json())["output_requirements"]["values"] == [3, 1, 2]
+    assert request.model_dump()["output_requirements"]["values"] == [3, 1, 2]
+    for mode in ("validation", "serialization"):
+        schema_json = json.dumps(ResearchRequest.model_json_schema(mode=mode), sort_keys=True)
+        assert '"type": "array"' in schema_json
+
+
+@pytest.mark.parametrize("deep", [False, True])
+def test_request_update_copy_accepts_its_own_internal_json_mapping(deep: bool) -> None:
+    request = ResearchRequest(
+        question="What changed?",
+        output_requirements={"values": [3, 1, 2]},
+        report_language="en",
+        source_languages=("en",),
+        freshness_requirement=FreshnessRequirement(kind="none"),
+        execution_mode="replay",
+        access_profile="local",
+        provider_profile_id="offline",
+        run_purpose="test",
+        budget_preset="low",
+    )
+
+    copied = request.model_copy(
+        update={"output_requirements": request.output_requirements}, deep=deep
+    )
+
+    assert copied == request
+    assert isinstance(copied.output_requirements["values"], tuple)
+    with pytest.raises(ValidationError):
+        request.model_copy(
+            update={"output_requirements": {"values": (3, 1, 2)}}, deep=deep
+        )
