@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
 import time
 from collections.abc import Generator
@@ -24,6 +25,84 @@ class ArtifactIntegrityError(ValueError):
 
 class ArtifactConflictError(ArtifactIntegrityError):
     pass
+
+
+class _UnsafeStoragePathError(ValueError):
+    pass
+
+
+def _is_link_or_reparse(path: Path) -> bool:
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    file_attributes = getattr(metadata, "st_file_attributes", 0)
+    is_junction = getattr(path, "is_junction", lambda: False)
+    return stat.S_ISLNK(metadata.st_mode) or bool(file_attributes & reparse_flag) or is_junction()
+
+
+def _ensure_safe_directory(root: Path, directory: Path) -> None:
+    try:
+        relative = directory.absolute().relative_to(root)
+    except ValueError as error:
+        raise _UnsafeStoragePathError("storage path is not contained by its configured root") from error
+    current = root
+    for component in relative.parts:
+        current /= component
+        if _is_link_or_reparse(current):
+            raise _UnsafeStoragePathError("storage path contains a symlink or reparse point")
+        try:
+            current.mkdir()
+        except FileExistsError:
+            pass
+        if _is_link_or_reparse(current):
+            raise _UnsafeStoragePathError("storage path contains a symlink or reparse point")
+        if not current.is_dir():
+            raise _UnsafeStoragePathError("storage path component is not a directory")
+        try:
+            current.resolve(strict=True).relative_to(root)
+        except (OSError, ValueError) as error:
+            raise _UnsafeStoragePathError(
+                "resolved storage path is not contained by its configured root"
+            ) from error
+
+
+def _ensure_safe_file_path(root: Path, path: Path) -> None:
+    _ensure_safe_directory(root, path.parent)
+    if _is_link_or_reparse(path):
+        raise _UnsafeStoragePathError("storage final or lock path is a symlink or reparse point")
+
+
+def _try_advisory_lock(descriptor: int) -> bool:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    if os.name == "nt":
+        import msvcrt
+
+        try:
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+    import fcntl  # pyright: ignore[reportMissingImports]
+
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def _release_advisory_lock(descriptor: int) -> None:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        return
+    import fcntl  # pyright: ignore[reportMissingImports]
+
+    fcntl.flock(descriptor, fcntl.LOCK_UN)
 
 
 class ArtifactRef(BaseModel):
@@ -56,21 +135,32 @@ def _digest_from_artifact_id(artifact_id: str) -> str:
 def _key_lock(lock_path: Path, *, timeout_seconds: float = 10.0) -> Generator[None, None, None]:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + timeout_seconds
-    descriptor: int | None = None
-    while descriptor is None:
-        try:
-            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"timed out waiting for storage lock {lock_path.name}")
-            time.sleep(0.005)
+    if _is_link_or_reparse(lock_path):
+        raise _UnsafeStoragePathError("storage lock path is a symlink or reparse point")
+    descriptor = os.open(
+        lock_path,
+        os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    acquired = False
     try:
-        os.write(descriptor, str(os.getpid()).encode("ascii"))
-        os.fsync(descriptor)
+        if os.fstat(descriptor).st_size == 0:
+            os.write(descriptor, b"\0")
+            os.fsync(descriptor)
+        while not acquired:
+            acquired = _try_advisory_lock(descriptor)
+            if not acquired:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"timed out waiting for storage lock {lock_path.name}")
+                time.sleep(0.005)
         yield
     finally:
+        if acquired:
+            try:
+                _release_advisory_lock(descriptor)
+            except OSError:
+                pass
         os.close(descriptor)
-        lock_path.unlink(missing_ok=True)
 
 
 def _atomic_write_bytes(destination: Path, payload: bytes) -> None:
@@ -99,7 +189,11 @@ class LocalArtifactStore:
     def __init__(self, root: str | Path) -> None:
         self._root = Path(root).resolve()
         self._artifact_root = self._root / "artifacts"
-        self._artifact_root.mkdir(parents=True, exist_ok=True)
+        try:
+            self._root.mkdir(parents=True, exist_ok=True)
+            _ensure_safe_directory(self._root, self._artifact_root)
+        except _UnsafeStoragePathError as error:
+            raise ArtifactIntegrityError(str(error)) from error
 
     def _path_for_digest(self, digest: str) -> Path:
         if _SHA256_PATTERN.fullmatch(digest) is None:
@@ -110,6 +204,7 @@ class LocalArtifactStore:
         digest = _digest_from_artifact_id(artifact_id)
         path = self._path_for_digest(digest)
         try:
+            _ensure_safe_file_path(self._root, path)
             loaded: object = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(loaded, dict):
                 raise TypeError("artifact envelope is not an object")
@@ -182,13 +277,22 @@ class LocalArtifactStore:
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
-        with _key_lock(lock_path):
-            if path.exists():
-                existing_ref, existing_data = self._read(ref.artifact_id)
-                if existing_data != data or existing_ref.media_type != media_type:
-                    raise ArtifactConflictError("artifact ID already has different content or metadata")
-                return existing_ref
-            _atomic_write_bytes(path, payload)
+        try:
+            _ensure_safe_file_path(self._root, path)
+            _ensure_safe_file_path(self._root, lock_path)
+            with _key_lock(lock_path):
+                _ensure_safe_file_path(self._root, path)
+                if path.exists():
+                    existing_ref, existing_data = self._read(ref.artifact_id)
+                    if existing_data != data or existing_ref.media_type != media_type:
+                        raise ArtifactConflictError(
+                            "artifact ID already has different content or metadata"
+                        )
+                    return existing_ref
+                _ensure_safe_file_path(self._root, path)
+                _atomic_write_bytes(path, payload)
+        except _UnsafeStoragePathError as error:
+            raise ArtifactIntegrityError(str(error)) from error
         return ref
 
     def get_bytes(self, artifact_id: str) -> bytes:
@@ -199,7 +303,12 @@ class LocalArtifactStore:
             digest = _digest_from_artifact_id(artifact_id)
         except ArtifactIntegrityError:
             return False
-        return self._path_for_digest(digest).is_file()
+        path = self._path_for_digest(digest)
+        try:
+            _ensure_safe_file_path(self._root, path)
+        except _UnsafeStoragePathError as error:
+            raise ArtifactIntegrityError(str(error)) from error
+        return path.is_file()
 
 
 __all__ = [

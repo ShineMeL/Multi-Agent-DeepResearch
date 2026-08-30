@@ -93,9 +93,15 @@ def canonicalize_url(url: str) -> str:
     display_host = f"[{host}]" if ":" in host else host
     netloc = display_host if port is None or port == default_port else f"{display_host}:{port}"
     try:
-        pairs = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=False)
-    except ValueError as error:
-        raise URLSecurityError("URL query syntax is invalid") from error
+        pairs = parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+            strict_parsing=False,
+            encoding="utf-8",
+            errors="strict",
+        )
+    except (UnicodeError, ValueError) as error:
+        raise URLSecurityError("URL query syntax or UTF-8 encoding is invalid") from error
     filtered_pairs = sorted(
         (key, value) for key, value in pairs if key.casefold() not in TRACKING_QUERY_KEYS
     )

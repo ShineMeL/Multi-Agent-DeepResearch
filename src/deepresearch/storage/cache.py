@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import tempfile
@@ -25,6 +26,15 @@ from pydantic import (
 
 from deepresearch.domain import ResourceUsage
 
+from .artifacts import (
+    _ensure_safe_directory,  # pyright: ignore[reportPrivateUsage]
+    _ensure_safe_file_path,  # pyright: ignore[reportPrivateUsage]
+    _is_link_or_reparse,  # pyright: ignore[reportPrivateUsage]
+    _release_advisory_lock,  # pyright: ignore[reportPrivateUsage]
+    _try_advisory_lock,  # pyright: ignore[reportPrivateUsage]
+    _UnsafeStoragePathError,  # pyright: ignore[reportPrivateUsage]
+)
+
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _ARTIFACT_ID_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 _SECRET_KEY_NAMES = frozenset(
@@ -42,6 +52,16 @@ _SECRET_KEY_NAMES = frozenset(
         "refreshtoken",
         "secret",
         "token",
+    }
+)
+_BENIGN_ACCOUNTING_KEYS = frozenset(
+    {
+        "cachedtokens",
+        "inputtokens",
+        "maxtokens",
+        "outputtokens",
+        "reasoningtokens",
+        "totaltokens",
     }
 )
 type _InternalJson = JsonValue | tuple[_InternalJson, ...]
@@ -132,11 +152,40 @@ def _normalized_secret_key(key: str) -> str:
     return re.sub(r"[^a-z0-9]", "", key.casefold())
 
 
+def _secret_key_words(key: str) -> tuple[str, ...]:
+    camel_split = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key)
+    return tuple(word.casefold() for word in re.findall(r"[A-Za-z0-9]+", camel_split))
+
+
+def _is_secret_key(key: str) -> bool:
+    compact = _normalized_secret_key(key)
+    if compact in _BENIGN_ACCOUNTING_KEYS:
+        return False
+    if compact in _SECRET_KEY_NAMES:
+        return True
+    words = _secret_key_words(key)
+    word_set = set(words)
+    if word_set & {
+        "authorization",
+        "bearer",
+        "cookie",
+        "credential",
+        "credentials",
+        "password",
+        "passwd",
+        "secret",
+    }:
+        return True
+    if "key" in word_set and word_set & {"api", "client", "private"}:
+        return True
+    return bool(word_set & {"token", "tokens"})
+
+
 def _reject_secrets(value: object) -> None:
     if isinstance(value, dict):
         mapping = cast("dict[object, object]", value)
         for key, item in mapping.items():
-            if isinstance(key, str) and _normalized_secret_key(key) in _SECRET_KEY_NAMES:
+            if isinstance(key, str) and _is_secret_key(key):
                 raise ValueError(f"secret-bearing metadata key is forbidden: {key}")
             _reject_secrets(item)
     elif isinstance(value, (list, tuple)):
@@ -155,6 +204,20 @@ def _require_optional_sha256(value: str) -> str:
     if value:
         _require_sha256(value)
     return value
+
+
+def _canonical_decimal(value: Decimal) -> Decimal:
+    if not value.is_finite():
+        raise ValueError("temperature must be finite")
+    if value.is_zero():
+        return Decimal(0)
+    parts = value.as_tuple()
+    digits = list(parts.digits)
+    exponent = int(parts.exponent)
+    while digits[-1] == 0:
+        digits.pop()
+        exponent += 1
+    return Decimal((parts.sign, tuple(digits), exponent))
 
 
 class _CacheModel(BaseModel):
@@ -183,6 +246,17 @@ class CacheEntry(_CacheModel):
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
 
     _valid_key_hash = field_validator("key_sha256")(_require_sha256)
+
+    @field_validator("usage", mode="before")
+    @classmethod
+    def revalidate_usage(cls, value: object) -> ResourceUsage:
+        payload = value.model_dump(round_trip=True) if isinstance(value, ResourceUsage) else value
+        usage = ResourceUsage.model_validate(payload)
+        if not math.isfinite(usage.wall_seconds):
+            raise ValueError("usage wall_seconds must be finite")
+        if usage.cost_usd is not None and not usage.cost_usd.is_finite():
+            raise ValueError("usage cost_usd must be finite")
+        return usage
 
     @field_validator("value_artifact_id")
     @classmethod
@@ -251,6 +325,13 @@ class FetchCacheKey(_CacheModel):
     fetch_policy: str
     accepted_content_types: tuple[str, ...]
 
+    @field_validator("canonical_url")
+    @classmethod
+    def reject_url_credentials(cls, value: AnyHttpUrl) -> AnyHttpUrl:
+        if value.username is not None or value.password is not None:
+            raise ValueError("canonical_url credentials/userinfo are forbidden in cache keys")
+        return value
+
 
 class ParseCacheKey(_CacheModel):
     operation: Literal["parse"] = "parse"
@@ -282,6 +363,7 @@ class ModelCacheKey(_CacheModel):
     _optional_hashes = field_validator("tool_schema_hash", "output_schema_hash")(
         _require_optional_sha256
     )
+    _canonical_temperature = field_validator("temperature")(_canonical_decimal)
 
 
 class EmbedCacheKey(_CacheModel):
@@ -321,21 +403,32 @@ def cache_key_sha256(key: CacheKey) -> str:
 def _key_lock(lock_path: Path, *, timeout_seconds: float = 10.0) -> Generator[None, None, None]:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + timeout_seconds
-    descriptor: int | None = None
-    while descriptor is None:
-        try:
-            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"timed out waiting for cache lock {lock_path.name}")
-            time.sleep(0.005)
+    if _is_link_or_reparse(lock_path):
+        raise _UnsafeStoragePathError("cache lock path is a symlink or reparse point")
+    descriptor = os.open(
+        lock_path,
+        os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    acquired = False
     try:
-        os.write(descriptor, str(os.getpid()).encode("ascii"))
-        os.fsync(descriptor)
+        if os.fstat(descriptor).st_size == 0:
+            os.write(descriptor, b"\0")
+            os.fsync(descriptor)
+        while not acquired:
+            acquired = _try_advisory_lock(descriptor)
+            if not acquired:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"timed out waiting for cache lock {lock_path.name}")
+                time.sleep(0.005)
         yield
     finally:
+        if acquired:
+            try:
+                _release_advisory_lock(descriptor)
+            except OSError:
+                pass
         os.close(descriptor)
-        lock_path.unlink(missing_ok=True)
 
 
 def _atomic_write_bytes(destination: Path, payload: bytes) -> None:
@@ -363,7 +456,13 @@ def _atomic_write_bytes(destination: Path, payload: bytes) -> None:
 class FileCache:
     def __init__(self, root: str | Path) -> None:
         self._root = Path(root).resolve() / "cache"
-        self._root.mkdir(parents=True, exist_ok=True)
+        configured_root = Path(root).resolve()
+        try:
+            configured_root.mkdir(parents=True, exist_ok=True)
+            _ensure_safe_directory(configured_root, self._root)
+        except _UnsafeStoragePathError as error:
+            raise CacheIntegrityError(str(error)) from error
+        self._configured_root = configured_root
 
     def _path(self, digest: str) -> Path:
         _require_sha256(digest)
@@ -372,6 +471,7 @@ class FileCache:
     def _read(self, digest: str) -> CacheEntry:
         path = self._path(digest)
         try:
+            _ensure_safe_file_path(self._configured_root, path)
             loaded: object = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(loaded, dict):
                 raise TypeError("cache envelope is not an object")
@@ -433,13 +533,20 @@ class FileCache:
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
-        with _key_lock(lock_path):
-            if path.exists():
-                existing = self._read(digest)
-                if existing != value:
-                    raise CacheConflictError("cache key already contains a different entry")
-                return existing
-            _atomic_write_bytes(path, payload)
+        try:
+            _ensure_safe_file_path(self._configured_root, path)
+            _ensure_safe_file_path(self._configured_root, lock_path)
+            with _key_lock(lock_path):
+                _ensure_safe_file_path(self._configured_root, path)
+                if path.exists():
+                    existing = self._read(digest)
+                    if existing != value:
+                        raise CacheConflictError("cache key already contains a different entry")
+                    return existing
+                _ensure_safe_file_path(self._configured_root, path)
+                _atomic_write_bytes(path, payload)
+        except _UnsafeStoragePathError as error:
+            raise CacheIntegrityError(str(error)) from error
         return value
 
 

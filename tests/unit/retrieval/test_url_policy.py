@@ -22,6 +22,19 @@ def test_canonical_url_idna_normalizes_host_and_preserves_repeated_query_values(
     assert canonical == "http://xn--bcher-kva.example/p?q=a+b&tag=a&tag=z"
 
 
+@pytest.mark.parametrize("escaped_byte", ["%FF", "%FE"])
+def test_canonical_url_rejects_invalid_utf8_query_escapes(escaped_byte: str) -> None:
+    with pytest.raises(URLSecurityError, match="query|UTF-8|syntax"):
+        canonicalize_url(f"https://example.com/?q={escaped_byte}")
+
+
+def test_canonical_url_preserves_repeated_and_blank_valid_query_pairs() -> None:
+    assert (
+        canonicalize_url("https://example.com/?b=&a=1&a=")
+        == "https://example.com/?a=&a=1&b="
+    )
+
+
 @pytest.mark.parametrize(
     "url",
     [

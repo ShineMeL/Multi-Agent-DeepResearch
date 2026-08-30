@@ -1,3 +1,4 @@
+import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -5,7 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from deepresearch.domain import EvidenceSpan, HtmlLocator, SourceDocument
+from deepresearch.domain import EvidenceSpan, HtmlLocator, PdfLocator, SourceDocument
+from deepresearch.providers import ParsedBlock, ParsedDocument
 from deepresearch.storage import EvidenceConflictError, EvidenceIntegrityError, LocalEvidenceStore
 
 
@@ -53,6 +55,73 @@ def _evidence(
     )
 
 
+def _parsed_document(
+    *,
+    text: str = "short text",
+    blocks: tuple[ParsedBlock, ...] | None = None,
+    canonical_url: str = "https://example.com/source",
+) -> ParsedDocument:
+    from deepresearch.retrieval import sha256_text
+
+    default_blocks = (
+        ParsedBlock(
+            block_id="block-1",
+            text=text,
+            locator=HtmlLocator(
+                paragraph_id="paragraph-1",
+                start_char=0,
+                end_char=len(text),
+            ),
+            text_hash=sha256_text(text),
+        ),
+    )
+    return ParsedDocument(
+        canonical_url=canonical_url,
+        title="Example",
+        authors=("Author",),
+        normalized_text=text,
+        blocks=blocks or default_blocks,
+        parser_id="parser",
+        parser_version="parser-1",
+        parsed_content_hash=sha256_text(text),
+    )
+
+
+def _pdf_evidence(
+    *,
+    source_id: str,
+    evidence_id: str,
+    page_index: int,
+    block_index: int,
+    excerpt: str,
+) -> EvidenceSpan:
+    from deepresearch.retrieval import sha256_text
+
+    return EvidenceSpan(
+        evidence_id=evidence_id,
+        source_id=source_id,
+        locator=PdfLocator(
+            page_index=page_index,
+            block_index=block_index,
+            start_char=0,
+            end_char=len(excerpt),
+        ),
+        excerpt=excerpt,
+        excerpt_hash=sha256_text(excerpt),
+        language="en",
+        information_need_ids=("need-1",),
+    )
+
+
+def _symlink_directory(link: Path, target: Path) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlinks are unavailable: {error}")
+
+
 def test_evidence_store_rejects_locator_hash_mismatch(tmp_path: Path) -> None:
     store = LocalEvidenceStore(tmp_path)
     source = _source()
@@ -73,12 +142,169 @@ def test_evidence_store_validates_source_parsed_hash_and_identity(tmp_path: Path
     assert store.get_source("../source") == source
     assert not (tmp_path.parent / "source").exists()
 
+    with pytest.raises(EvidenceIntegrityError, match="normalized"):
+        store.put_source(_source(text=" not normalized "), normalized_text=" not normalized ")
+
+
+def test_evidence_store_registers_only_matching_unique_parsed_structure(tmp_path: Path) -> None:
+    store = LocalEvidenceStore(tmp_path)
+    parsed = _parsed_document()
+
+    with pytest.raises(EvidenceIntegrityError, match="source"):
+        store.put_parsed_document("missing", parsed)
+
+    source = _source()
+    store.put_source(source, normalized_text="short text")
+    with pytest.raises(EvidenceIntegrityError, match="canonical_url"):
+        store.put_parsed_document(
+            source.source_id,
+            _parsed_document(canonical_url="https://other.example/source"),
+        )
+    with pytest.raises(EvidenceIntegrityError, match="parsed_content_hash"):
+        store.put_parsed_document(source.source_id, _parsed_document(text="different text"))
+
+    duplicate_html = _parsed_document(
+        blocks=(
+            parsed.blocks[0],
+            parsed.blocks[0].model_copy(update={"block_id": "block-2"}),
+        )
+    )
+    with pytest.raises(EvidenceIntegrityError, match="paragraph"):
+        store.put_parsed_document(source.source_id, duplicate_html)
+
+    assert store.put_parsed_document(source.source_id, parsed) == parsed
+    assert store.put_parsed_document(source.source_id, parsed) == parsed
+    with pytest.raises(EvidenceConflictError):
+        store.put_parsed_document(
+            source.source_id,
+            parsed.model_copy(update={"title": "Conflicting parsed title"}),
+        )
+
+
+def test_evidence_store_rejects_unknown_html_container(tmp_path: Path) -> None:
+    store = LocalEvidenceStore(tmp_path)
+    source = _source()
+    store.put_source(source, normalized_text="short text")
+    with pytest.raises(EvidenceIntegrityError, match="parsed"):
+        store.put_evidence(_evidence())
+    store.put_parsed_document(source.source_id, _parsed_document())
+    evidence = _evidence().model_copy(
+        update={
+            "locator": HtmlLocator(
+                paragraph_id="unknown-paragraph",
+                start_char=0,
+                end_char=5,
+            )
+        }
+    )
+
+    with pytest.raises(EvidenceIntegrityError, match="paragraph|container"):
+        store.put_evidence(evidence)
+
+
+def test_evidence_store_validates_non_first_pdf_block_local_offsets(tmp_path: Path) -> None:
+    from deepresearch.retrieval import sha256_text
+
+    text = "alpha omega"
+    source = _source(source_id="pdf-source", text=text)
+    blocks = (
+        ParsedBlock(
+            block_id="pdf-0",
+            text="alpha",
+            locator=PdfLocator(page_index=0, block_index=0, start_char=0, end_char=5),
+            text_hash=sha256_text("alpha"),
+        ),
+        ParsedBlock(
+            block_id="pdf-1",
+            text="omega",
+            locator=PdfLocator(page_index=0, block_index=1, start_char=0, end_char=5),
+            text_hash=sha256_text("omega"),
+        ),
+    )
+    parsed = _parsed_document(text=text, blocks=blocks)
+    store = LocalEvidenceStore(tmp_path)
+    store.put_source(source, normalized_text=text)
+    store.put_parsed_document(source.source_id, parsed)
+
+    valid = _pdf_evidence(
+        source_id=source.source_id,
+        evidence_id="pdf-evidence",
+        page_index=0,
+        block_index=1,
+        excerpt="omega",
+    )
+    assert store.put_evidence(valid) == valid
+
+    unknown = _pdf_evidence(
+        source_id=source.source_id,
+        evidence_id="unknown-pdf-evidence",
+        page_index=9,
+        block_index=9,
+        excerpt="alpha",
+    )
+    with pytest.raises(EvidenceIntegrityError, match="PDF|container|block"):
+        store.put_evidence(unknown)
+
+
+def test_evidence_store_rejects_duplicate_pdf_container_keys(tmp_path: Path) -> None:
+    from deepresearch.retrieval import sha256_text
+
+    source = _source(source_id="pdf-source", text="alpha omega")
+    first = ParsedBlock(
+        block_id="pdf-0",
+        text="alpha",
+        locator=PdfLocator(page_index=0, block_index=0, start_char=0, end_char=5),
+        text_hash=sha256_text("alpha"),
+    )
+    duplicate = ParsedBlock(
+        block_id="pdf-1",
+        text="omega",
+        locator=PdfLocator(page_index=0, block_index=0, start_char=0, end_char=5),
+        text_hash=sha256_text("omega"),
+    )
+    store = LocalEvidenceStore(tmp_path)
+    store.put_source(source, normalized_text="alpha omega")
+
+    with pytest.raises(EvidenceIntegrityError, match="PDF|container"):
+        store.put_parsed_document(
+            source.source_id,
+            _parsed_document(text="alpha omega", blocks=(first, duplicate)),
+        )
+
+
+@pytest.mark.parametrize("subdirectory", ["sources", "evidence", "parsed"])
+def test_evidence_store_rejects_symlinked_store_directory(
+    tmp_path: Path, subdirectory: str
+) -> None:
+    outside = tmp_path / "outside"
+    _symlink_directory(tmp_path / "root" / subdirectory, outside)
+
+    with pytest.raises(EvidenceIntegrityError, match="symlink|reparse|contain"):
+        LocalEvidenceStore(tmp_path / "root").put_source(
+            _source(), normalized_text="short text"
+        )
+    assert not list(outside.rglob("*.json"))
+
+
+def test_evidence_store_rejects_symlinked_source_shard_directory(tmp_path: Path) -> None:
+    source = _source()
+    digest = hashlib.sha256(source.source_id.encode("utf-8")).hexdigest()
+    store = LocalEvidenceStore(tmp_path / "root")
+    outside = tmp_path / "outside"
+    _symlink_directory(tmp_path / "root" / "sources" / digest[:2], outside)
+
+    with pytest.raises(EvidenceIntegrityError, match="symlink|reparse|contain"):
+        store.put_source(source, normalized_text="short text")
+    assert not list(outside.rglob("*.json"))
+
 
 def test_evidence_store_validates_source_existence_locator_excerpt_and_bounds(
     tmp_path: Path,
 ) -> None:
     store = LocalEvidenceStore(tmp_path)
-    store.put_source(_source(), normalized_text="short text")
+    source = _source()
+    store.put_source(source, normalized_text="short text")
+    store.put_parsed_document(source.source_id, _parsed_document())
 
     with pytest.raises(EvidenceIntegrityError, match="source"):
         store.put_evidence(_evidence(source_id="missing"))
@@ -94,6 +320,7 @@ def test_evidence_store_round_trips_full_source_payload_and_evidence(tmp_path: P
     evidence = _evidence()
 
     assert store.put_source(source, normalized_text="short text") == source
+    assert store.put_parsed_document(source.source_id, _parsed_document()) == _parsed_document()
     assert store.put_evidence(evidence) == evidence
     assert store.get_source(source.source_id) == source
     assert store.get_evidence(evidence.evidence_id) == evidence
@@ -107,6 +334,7 @@ def test_evidence_store_duplicate_ids_are_idempotent_but_conflicts_are_rejected(
     store = LocalEvidenceStore(tmp_path)
     source = _source()
     store.put_source(source, normalized_text="short text")
+    store.put_parsed_document(source.source_id, _parsed_document())
     evidence = _evidence()
     store.put_evidence(evidence)
 
@@ -127,13 +355,28 @@ def test_evidence_store_concurrent_writers_are_idempotent(tmp_path: Path) -> Non
 
     with ThreadPoolExecutor(max_workers=8) as executor:
         sources = tuple(executor.map(lambda _: store.put_source(source, normalized_text="short text"), range(16)))
+    store.put_parsed_document(source.source_id, _parsed_document())
     with ThreadPoolExecutor(max_workers=8) as executor:
         spans = tuple(executor.map(lambda _: store.put_evidence(evidence), range(16)))
 
     assert sources == (source,) * 16
     assert spans == (evidence,) * 16
     assert not list(tmp_path.rglob("*.tmp"))
-    assert not list(tmp_path.rglob("*.lock"))
+
+
+def test_evidence_store_ignores_preexisting_unlocked_lock_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source()
+    digest = hashlib.sha256(source.source_id.encode("utf-8")).hexdigest()
+    store = LocalEvidenceStore(tmp_path)
+    lock_path = tmp_path / "sources" / digest[:2] / f"{digest}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"stale owner")
+    ticks = iter((0.0, 11.0))
+    monkeypatch.setattr("deepresearch.storage.evidence_store.time.monotonic", lambda: next(ticks))
+
+    assert store.put_source(source, normalized_text="short text") == source
 
 
 def test_evidence_store_detects_persisted_record_corruption(tmp_path: Path) -> None:
@@ -148,3 +391,31 @@ def test_evidence_store_detects_persisted_record_corruption(tmp_path: Path) -> N
 
     with pytest.raises(EvidenceIntegrityError, match="corrupt"):
         store.get_source(source.source_id)
+
+
+def test_evidence_store_rejects_symlinked_parsed_and_evidence_shards(tmp_path: Path) -> None:
+    source = _source()
+    digest = hashlib.sha256(source.source_id.encode("utf-8")).hexdigest()
+    store = LocalEvidenceStore(tmp_path / "root")
+    store.put_source(source, normalized_text="short text")
+    outside_parsed = tmp_path / "outside-parsed"
+    _symlink_directory(tmp_path / "root" / "parsed" / digest[:2], outside_parsed)
+
+    with pytest.raises(EvidenceIntegrityError, match="symlink|reparse|contain"):
+        store.put_parsed_document(source.source_id, _parsed_document())
+    assert not list(outside_parsed.rglob("*.json"))
+
+    evidence_root = tmp_path / "evidence-root"
+    evidence_store = LocalEvidenceStore(evidence_root)
+    evidence_store.put_source(source, normalized_text="short text")
+    evidence_store.put_parsed_document(source.source_id, _parsed_document())
+    evidence = _evidence()
+    evidence_digest = hashlib.sha256(evidence.evidence_id.encode("utf-8")).hexdigest()
+    outside_evidence = tmp_path / "outside-evidence"
+    _symlink_directory(
+        evidence_root / "evidence" / evidence_digest[:2], outside_evidence
+    )
+
+    with pytest.raises(EvidenceIntegrityError, match="symlink|reparse|contain"):
+        evidence_store.put_evidence(evidence)
+    assert not list(outside_evidence.rglob("*.json"))
