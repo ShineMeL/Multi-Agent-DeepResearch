@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import time
@@ -6,7 +7,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from typing import NoReturn, TypeVar
+from typing import Any, NoReturn, TypeVar
 
 import pytest
 from pydantic import BaseModel, JsonValue, TypeAdapter
@@ -167,10 +168,12 @@ class FakeFetcher:
         self,
         *,
         final_url: str | None = None,
+        requested_url: str | None = None,
         headers: Mapping[str, str] | None = None,
     ) -> None:
         self.calls = 0
         self.final_url = final_url
+        self.requested_url = requested_url
         self.headers = headers
 
     async def fetch(self, url: str, *, deadline: float, cancellation_token: CancellationToken) -> RawDocument:
@@ -178,7 +181,7 @@ class FakeFetcher:
         cancellation_token.raise_if_cancelled()
         self.calls += 1
         return RawDocument(
-            requested_url=url,
+            requested_url=self.requested_url or url,
             final_url=self.final_url or url,
             status=200,
             headers=self.headers or {
@@ -207,6 +210,61 @@ class FakeEmbedder:
         cancellation_token.raise_if_cancelled()
         self.calls += 1
         return tuple((float(index), 1.0) for index, _ in enumerate(texts))
+
+
+class SlowFailureSearch(FakeSearch):
+    async def search(
+        self,
+        query: str,
+        limit: int,
+        filters: Mapping[str, JsonValue] | None,
+        *,
+        deadline: float,
+        cancellation_token: CancellationToken,
+    ) -> list[SearchHit]:
+        del query, limit, filters, deadline, cancellation_token
+        self.calls += 1
+        await asyncio.sleep(0.05)
+        raise ProviderError(
+            code="INVALID_REQUEST",
+            provider=self.provider_id,
+            operation="search",
+            public_message="synthetic delayed failure",
+            retryable=False,
+            usage=_usage(),
+        )
+
+
+class FailingStreamModel(FakeModel):
+    def __init__(self, *, delay: float = 0) -> None:
+        super().__init__()
+        self.delay = delay
+
+    def stream(
+        self,
+        request: ModelRequest,
+        *,
+        deadline: float,
+        cancellation_token: CancellationToken,
+    ) -> AsyncIterator[ModelStreamChunk]:
+        del request, deadline, cancellation_token
+        self.calls += 1
+
+        async def failure() -> AsyncIterator[ModelStreamChunk]:
+            if self.delay:
+                await asyncio.sleep(self.delay)
+            raise ProviderError(
+                code="INVALID_REQUEST",
+                provider=self.provider_id,
+                operation="model.stream",
+                public_message="synthetic stream failure",
+                retryable=False,
+                usage=_usage(),
+            )
+            if False:
+                yield ModelStreamChunk(index=0, text_delta="unreachable")
+
+        return failure()
 
 
 def _recording_model(
@@ -494,6 +552,8 @@ async def test_model_revision_is_required_persisted_and_changes_request_identity
         "https://example.com/redirect#api_key=TOP-SECRET",
         "https://example.com/redirect?%2561pi_key=TOP-SECRET",
         "https://example.com/redirect?AuTh%6FrIzAtIoN=TOP-SECRET",
+        "https://example.com/api_key/TOP-SECRET",
+        "https://example.com/path/sk-proj-ABC123",
     ),
 )
 async def test_recording_fetch_fails_closed_for_secret_final_url(
@@ -517,12 +577,43 @@ async def test_recording_fetch_fails_closed_for_secret_final_url(
 
 
 @pytest.mark.asyncio
+async def test_recording_fetch_fails_closed_for_secret_requested_url(
+    tmp_path: Path,
+) -> None:
+    writer = ReplayBundleWriter.create(
+        tmp_path / "secret-requested", run_id="secret-requested"
+    )
+    recorder = RecordingFetcher(
+        FakeFetcher(
+            requested_url="https://example.com/start?%2561PI_KEY=TOP-SECRET",
+            final_url="https://example.com/final",
+        ),
+        writer,
+    )
+
+    try:
+        with pytest.raises(ValueError) as error:
+            await recorder.fetch(
+                "https://example.com/start",
+                deadline=_deadline(),
+                cancellation_token=CancellationToken(),
+            )
+        assert "TOP-SECRET" not in str(error.value)
+        assert error.value.__cause__ is None
+        assert error.value.__context__ is None
+    finally:
+        await writer.abort()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("header", "value"),
     (
         ("etag", "Bearer TOP-SECRET"),
         ("content-language", "cookie%3DTOP-SECRET"),
         ("cache-control", "private, api%255fkey=TOP-SECRET"),
+        ("etag", "sk-proj-ABC123"),
+        ("content-language", "session_id=ABC123SECRET"),
     ),
 )
 async def test_recording_fetch_fails_closed_for_secrets_in_retained_headers(
@@ -557,7 +648,14 @@ async def test_recording_fetch_retains_safe_response_metadata(tmp_path: Path) ->
         "cache-control": "public, max-age=60",
     }
 
-    await RecordingFetcher(FakeFetcher(headers=headers), writer).fetch(
+    await RecordingFetcher(
+        FakeFetcher(
+            final_url="https://example.com/page#section",
+            requested_url="https://example.com/start#overview",
+            headers=headers,
+        ),
+        writer,
+    ).fetch(
         "https://example.com/start",
         deadline=_deadline(),
         cancellation_token=CancellationToken(),
@@ -566,6 +664,187 @@ async def test_recording_fetch_retains_safe_response_metadata(tmp_path: Path) ->
 
     record = json.loads((final_root / "documents.jsonl").read_text(encoding="utf-8"))
     assert record["outcome"]["response"]["headers"] == headers
+    assert record["outcome"]["response"]["final_url"].endswith("#section")
+    assert record["outcome"]["response"]["requested_url"].endswith("#overview")
+
+
+@pytest.mark.asyncio
+async def test_create_marker_failure_removes_exact_staging_and_allows_same_run_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final_root = tmp_path / "create-marker-failure"
+    original_write = recording_module._write_fsynced
+
+    def fail_marker(path: Path, payload: bytes) -> None:
+        if path.name == ".replay-writer-owner.json":
+            raise OSError("synthetic marker write failure")
+        original_write(path, payload)
+
+    monkeypatch.setattr(recording_module, "_write_fsynced", fail_marker)
+    with pytest.raises(OSError, match="marker"):
+        ReplayBundleWriter.create(final_root, run_id="same-run")
+    assert not list(tmp_path.glob(".create-marker-failure.staging.*"))
+
+    monkeypatch.undo()
+    replacement = ReplayBundleWriter.create(final_root, run_id="same-run")
+    await replacement.abort()
+
+
+@pytest.mark.asyncio
+async def test_create_cleanup_refuses_substituted_staging_but_releases_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final_root = tmp_path / "create-substitution"
+    substituted: Path | None = None
+
+    def substitute_staging(path: Path, payload: bytes) -> None:
+        nonlocal substituted
+        del payload
+        substituted = path.parent
+        substituted.rmdir()
+        substituted.mkdir()
+        (substituted / "sentinel.txt").write_text("not-owned", encoding="utf-8")
+        raise OSError("synthetic substituted marker failure")
+
+    monkeypatch.setattr(recording_module, "_write_fsynced", substitute_staging)
+    with pytest.raises(OSError, match="cleanup|marker|substitut"):
+        ReplayBundleWriter.create(final_root, run_id="same-run")
+    assert substituted is not None
+    assert (substituted / "sentinel.txt").read_text(encoding="utf-8") == "not-owned"
+
+    monkeypatch.undo()
+    (substituted / "sentinel.txt").unlink()
+    substituted.rmdir()
+    replacement = ReplayBundleWriter.create(final_root, run_id="same-run")
+    await replacement.abort()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_root_rmdir_failure_keeps_owned_tombstone_and_frees_staging_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final_root = tmp_path / "cleanup-root-failure"
+    writer = ReplayBundleWriter.create(final_root, run_id="same-run")
+    original_write = recording_module._write_fsynced
+    original_rmdir = Path.rmdir
+    failed = False
+
+    def fail_record_write(path: Path, payload: bytes) -> None:
+        if path.name.endswith(".jsonl"):
+            raise OSError("synthetic primary failure")
+        original_write(path, payload)
+
+    def fail_cleanup_root(path: Path) -> None:
+        nonlocal failed
+        if ".cleanup." in path.name and not failed:
+            failed = True
+            raise OSError("synthetic cleanup root failure")
+        original_rmdir(path)
+
+    monkeypatch.setattr(recording_module, "_write_fsynced", fail_record_write)
+    monkeypatch.setattr(Path, "rmdir", fail_cleanup_root)
+    with pytest.raises(OSError, match="cleanup"):
+        await writer.finalize()
+
+    assert not list(tmp_path.glob(".cleanup-root-failure.staging.*"))
+    tombstones = list(tmp_path.glob(".cleanup-root-failure.cleanup.*"))
+    assert len(tombstones) == 1
+    assert (tombstones[0] / ".replay-writer-owner.json").is_file()
+
+    monkeypatch.undo()
+    replacement = ReplayBundleWriter.create(final_root, run_id="same-run")
+    await replacement.abort()
+    await writer.abort()
+    await writer.abort()
+    assert not tombstones[0].exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ("unary", "stream"))
+async def test_recorded_failure_rechecks_cancellation_after_append(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    final_root = tmp_path / f"cancel-failure-{kind}"
+    writer = ReplayBundleWriter.create(final_root, run_id=f"cancel-failure-{kind}")
+    token = CancellationToken()
+    original_append = writer.append
+
+    async def cancel_after_append(**kwargs: Any) -> None:
+        await original_append(**kwargs)
+        token.cancel()
+
+    monkeypatch.setattr(writer, "append", cancel_after_append)
+    if kind == "unary":
+        call = RecordingSearchProvider(FakeSearch(), writer).search(
+            "failure", 1, None, deadline=_deadline(), cancellation_token=token
+        )
+    else:
+        stream = _recording_model(FailingStreamModel(), writer).stream(
+            _request(), deadline=_deadline(), cancellation_token=token
+        )
+        call = anext(stream)
+
+    with pytest.raises(OperationCancelled):
+        await call
+    await writer.finalize()
+
+    replay_token = CancellationToken()
+    bundle = ReplayBundle.load(final_root)
+    if kind == "unary":
+        replay_call = ReplaySearchProvider(bundle).search(
+            "failure", 1, None, deadline=_deadline(), cancellation_token=replay_token
+        )
+    else:
+        replay_stream = ReplayModelProvider(bundle).stream(
+            _request(), deadline=_deadline(), cancellation_token=replay_token
+        )
+        replay_call = anext(replay_stream)
+    with pytest.raises(ProviderError) as recorded:
+        await replay_call
+    assert recorded.value.code in {"RATE_LIMITED", "INVALID_REQUEST"}
+    assert recorded.value.usage == _usage()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ("unary", "stream"))
+async def test_recorded_failure_after_hard_deadline_surfaces_timeout_but_preserves_record(
+    tmp_path: Path, kind: str
+) -> None:
+    final_root = tmp_path / f"deadline-failure-{kind}"
+    writer = ReplayBundleWriter.create(final_root, run_id=f"deadline-failure-{kind}")
+    deadline = time.monotonic() + 0.02
+    token = CancellationToken()
+    if kind == "unary":
+        call = RecordingSearchProvider(SlowFailureSearch(), writer).search(
+            "delayed", 1, None, deadline=deadline, cancellation_token=token
+        )
+    else:
+        stream = _recording_model(FailingStreamModel(delay=0.05), writer).stream(
+            _request(), deadline=deadline, cancellation_token=token
+        )
+        call = anext(stream)
+
+    with pytest.raises(ProviderError) as live_error:
+        await call
+    assert live_error.value.code == "TIMEOUT"
+    await writer.finalize()
+
+    bundle = ReplayBundle.load(final_root)
+    if kind == "unary":
+        replay_call = ReplaySearchProvider(bundle).search(
+            "delayed", 1, None, deadline=_deadline(), cancellation_token=token
+        )
+    else:
+        replay_stream = ReplayModelProvider(bundle).stream(
+            _request(), deadline=_deadline(), cancellation_token=token
+        )
+        replay_call = anext(replay_stream)
+    with pytest.raises(ProviderError) as recorded:
+        await replay_call
+    assert recorded.value.code == "INVALID_REQUEST"
+    assert recorded.value.usage == _usage()
 
 
 @pytest.mark.asyncio

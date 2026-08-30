@@ -13,7 +13,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 from math import isfinite
 from pathlib import Path
 from typing import Any, TypeVar, cast
-from urllib.parse import parse_qsl, unquote, urlsplit
+from urllib.parse import unquote, urlsplit
 
 from pydantic import JsonValue
 
@@ -75,8 +75,36 @@ _INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _CREDENTIAL_WORD = re.compile(
     r"(?i)(?:^|[^a-z0-9])"
     r"(?:api[_ .-]?key|access[_ .-]?key|authorization|auth|bearer|cookie|"
-    r"credential|password|passwd|secret|access[_ .-]?token|token|key)"
+    r"credential|password|passwd|secret|private[_ .-]?key|"
+    r"session(?:[_ .-]?(?:id|token))?|access[_ .-]?token|token|key)"
     r"(?:$|[^a-z0-9])"
+)
+_OPAQUE_CREDENTIAL = re.compile(
+    r"(?i)(?:^|[^a-z0-9])(?:"
+    r"sk[-_](?:(?:proj|live|test)[-_])?[a-z0-9_-]{6,}|"
+    r"(?:gh[opsu]|github_pat)_[a-z0-9_]{6,}|"
+    r"xox[baprs]-[a-z0-9-]{6,}|"
+    r"akia[0-9a-z]{12,}|"
+    r"eyj[a-z0-9_-]{6,}\.[a-z0-9_-]{6,}\.[a-z0-9_-]{6,}"
+    r")(?:$|[^a-z0-9])"
+)
+_SECRET_PATH_NAMES = frozenset(
+    {
+        "accesskey",
+        "accesstoken",
+        "apikey",
+        "authorization",
+        "bearer",
+        "cookie",
+        "credential",
+        "password",
+        "passwd",
+        "privatekey",
+        "secret",
+        "sessionid",
+        "sessiontoken",
+        "token",
+    }
 )
 _RECORD_FILENAME: dict[ReplayOperation, str] = {
     "model.complete": "model_responses.jsonl",
@@ -96,6 +124,38 @@ def _is_link_or_reparse(path: Path) -> bool:
     except (AttributeError, FileNotFoundError, OSError):
         return False
     return bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _path_identity(path: Path) -> tuple[int, int]:
+    details = path.stat(follow_symlinks=False)
+    if not stat.S_ISDIR(details.st_mode):
+        raise ValueError("replay staging object must be a directory")
+    return (details.st_dev, details.st_ino)
+
+
+def _remove_exact_created_staging(
+    staging: Path,
+    *,
+    parent: Path,
+    expected_identity: tuple[int, int],
+    marker_name: str,
+) -> None:
+    """Remove only the exact directory object created by this create() call."""
+    if _is_link_or_reparse(staging):
+        raise ValueError("created replay staging was replaced by a link")
+    if staging.resolve(strict=True).parent != parent:
+        raise ValueError("created replay staging escaped its parent")
+    if _path_identity(staging) != expected_identity:
+        raise ValueError("created replay staging object was substituted")
+    children = tuple(staging.iterdir())
+    if any(
+        child.name != marker_name or _is_link_or_reparse(child) or child.is_dir()
+        for child in children
+    ):
+        raise ValueError("created replay staging contains an unexpected object")
+    for child in children:
+        child.unlink()
+    staging.rmdir()
 
 
 def _try_lock(descriptor: int) -> bool:
@@ -200,7 +260,7 @@ def _flush_windows_directory(path: Path) -> None:
             raise ctypes.WinError(ctypes.get_last_error())
 
 
-def _atomic_rename_noreplace(source: Path, destination: Path) -> None:
+def _atomic_rename_noreplace_impl(source: Path, destination: Path) -> None:
     """Atomically publish a directory and fail if destination already exists."""
     if os.name == "nt":
         os.rename(source, destination)
@@ -230,6 +290,16 @@ def _atomic_rename_noreplace(source: Path, destination: Path) -> None:
         raise OSError(error_number, os.strerror(error_number), destination)
 
 
+def _atomic_rename_noreplace(source: Path, destination: Path) -> None:
+    """Publication boundary kept separate for portable fault injection."""
+    _atomic_rename_noreplace_impl(source, destination)
+
+
+def _atomic_move_owned_staging(source: Path, destination: Path) -> None:
+    """Cleanup boundary kept separate from final publication."""
+    _atomic_rename_noreplace_impl(source, destination)
+
+
 def _redact_public_message(message: str) -> str:
     redacted = re.sub(r"(?i)\bbearer\s+[^\s,;]+", "Bearer [REDACTED]", message)
     redacted = re.sub(
@@ -255,33 +325,48 @@ def _bounded_unquote(value: str) -> str:
 
 def _contains_credential_shape(value: str) -> bool:
     decoded = _bounded_unquote(value).casefold()
-    return _CREDENTIAL_WORD.search(decoded) is not None
+    return (
+        _CREDENTIAL_WORD.search(decoded) is not None
+        or _OPAQUE_CREDENTIAL.search(decoded) is not None
+    )
 
 
-def _fetch_metadata_is_safe(final_url: str, headers: Mapping[str, str]) -> bool:
+def _url_metadata_is_safe(url: str) -> bool:
+    decoded_url = _bounded_unquote(url)
+    split = urlsplit(decoded_url)
+    if split.username is not None or split.password is not None:
+        return False
+    if _contains_credential_shape(split.query) or _contains_credential_shape(
+        split.fragment
+    ):
+        return False
+    for segment in split.path.split("/"):
+        compact = re.sub(r"[^a-z0-9]", "", segment.casefold())
+        if compact in _SECRET_PATH_NAMES or _OPAQUE_CREDENTIAL.search(segment):
+            return False
+    canonical_url = canonicalize_url(url)
+    FetchCacheKey.model_validate(
+        {
+            "snapshot_id": "replay-recorded-url",
+            "canonical_url": canonical_url,
+            "fetch_policy": "recorded-redirect",
+            "accepted_content_types": (),
+        }
+    )
+    return True
+
+
+def _fetch_metadata_is_safe(
+    requested_url: str, final_url: str, headers: Mapping[str, str]
+) -> bool:
     try:
-        decoded_url = _bounded_unquote(final_url)
-        for candidate in (final_url, decoded_url):
-            split = urlsplit(candidate)
-            if split.fragment or split.username is not None or split.password is not None:
-                return False
-            for query_key, query_value in parse_qsl(
-                split.query, keep_blank_values=True, strict_parsing=False
-            ):
-                if _contains_credential_shape(query_key) or _contains_credential_shape(
-                    query_value
-                ):
-                    return False
-        canonical_final_url = canonicalize_url(final_url)
-        FetchCacheKey.model_validate(
-            {
-                "snapshot_id": "replay-final-url",
-                "canonical_url": canonical_final_url,
-                "fetch_policy": "recorded-redirect",
-                "accepted_content_types": (),
-            }
+        return (
+            _url_metadata_is_safe(requested_url)
+            and _url_metadata_is_safe(final_url)
+            and not any(
+                _contains_credential_shape(value) for value in headers.values()
+            )
         )
-        return not any(_contains_credential_shape(value) for value in headers.values())
     except (TypeError, UnicodeError, ValueError):
         return False
 
@@ -292,15 +377,16 @@ def _safe_fetch_response(document: RawDocument) -> dict[str, JsonValue]:
         for key, value in document.headers.items()
         if key.casefold() in _SAFE_FETCH_HEADERS
     }
+    requested_url = str(document.requested_url)
     final_url = str(document.final_url)
-    if not _fetch_metadata_is_safe(final_url, headers):
+    if not _fetch_metadata_is_safe(requested_url, final_url, headers):
         raise ValueError("recorded fetch metadata violates credential-safe policy")
     return {
         "body_base64": base64.b64encode(document.body_bytes).decode("ascii"),
         "content_type": document.content_type,
         "final_url": final_url,
         "headers": cast("dict[str, JsonValue]", headers),
-        "requested_url": str(document.requested_url),
+        "requested_url": requested_url,
         "retrieved_at": document.retrieved_at.isoformat().replace("+00:00", "Z"),
         "status": document.status,
     }
@@ -325,12 +411,14 @@ class ReplayBundleWriter:
         final_root: Path,
         staging_root: Path,
         run_id: str,
+        staging_identity: tuple[int, int],
         lock_path: Path,
         lock_descriptor: int,
     ) -> None:
         self._final_root = final_root
         self._staging_root: Path | None = staging_root
         self._run_id = run_id
+        self._staging_identity = staging_identity
         self._lock_path = lock_path
         self._lock_descriptor: int | None = lock_descriptor
         self._records: dict[tuple[str, str, str, str | None, str], ReplayRecord] = {}
@@ -338,6 +426,7 @@ class ReplayBundleWriter:
         self._append_lock = asyncio.Lock()
         self._closed = False
         self._published = False
+        self._cleanup_tombstone: Path | None = None
 
     @classmethod
     def create(cls, final_root: Path, *, run_id: str) -> ReplayBundleWriter:
@@ -360,6 +449,8 @@ class ReplayBundleWriter:
             os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
             0o600,
         )
+        staging: Path | None = None
+        staging_identity: tuple[int, int] | None = None
         try:
             if os.fstat(descriptor).st_size == 0:
                 os.write(descriptor, b"\0")
@@ -370,6 +461,7 @@ class ReplayBundleWriter:
             if _is_link_or_reparse(staging):
                 raise ValueError("replay staging path must not be a symlink or reparse point")
             staging.mkdir(mode=0o700)
+            staging_identity = _path_identity(staging)
             marker = {
                 "final_name": requested_final.name,
                 "run_id": run_id,
@@ -378,16 +470,33 @@ class ReplayBundleWriter:
             _write_fsynced(staging / cls._MARKER_NAME, canonical_json_bytes(marker))
             _fsync_directory(staging)
         except Exception:
+            cleanup_error: Exception | None = None
+            if staging is not None and staging_identity is not None:
+                try:
+                    _remove_exact_created_staging(
+                        staging,
+                        parent=parent,
+                        expected_identity=staging_identity,
+                        marker_name=cls._MARKER_NAME,
+                    )
+                    _fsync_directory(parent)
+                except (OSError, RuntimeError, ValueError) as error:
+                    cleanup_error = error
             try:
                 _unlock(descriptor)
             except OSError:
                 pass
             os.close(descriptor)
+            if cleanup_error is not None:
+                raise OSError(
+                    "replay writer creation failed and staging cleanup failed"
+                ) from cleanup_error
             raise
         return cls(
             final_root=requested_final,
             staging_root=staging,
             run_id=run_id,
+            staging_identity=staging_identity,
             lock_path=lock_path,
             lock_descriptor=descriptor,
         )
@@ -565,7 +674,21 @@ class ReplayBundleWriter:
 
     def _remove_owned_staging(self) -> None:
         staging = self._validate_owned_staging()
+        if self._cleanup_tombstone is None:
+            device, inode = self._staging_identity
+            tombstone = self._final_root.parent / (
+                f".{self._final_root.name}.cleanup.{self._run_id}."
+                f"{device:x}.{inode:x}"
+            )
+            if _is_link_or_reparse(tombstone):
+                raise ValueError("replay cleanup tombstone is unsafe")
+            _atomic_move_owned_staging(staging, tombstone)
+            self._staging_root = tombstone
+            self._cleanup_tombstone = tombstone
+            _fsync_directory(self._final_root.parent)
+            staging = self._validate_owned_staging()
         marker_path = staging / self._MARKER_NAME
+        marker_payload = canonical_json_bytes(self._expected_marker())
         children = sorted(
             staging.rglob("*"), key=lambda item: len(item.parts), reverse=True
         )
@@ -580,8 +703,15 @@ class ReplayBundleWriter:
             else:
                 child.unlink()
         marker_path.unlink()
-        staging.rmdir()
+        try:
+            staging.rmdir()
+        except OSError:
+            _write_fsynced(marker_path, marker_payload)
+            _fsync_directory(staging)
+            _fsync_directory(staging.parent)
+            raise
         self._staging_root = None
+        _fsync_directory(staging.parent)
 
     def _validate_owned_staging(self) -> Path:
         staging = self._staging_root
@@ -590,18 +720,23 @@ class ReplayBundleWriter:
         parent = self._final_root.parent.resolve(strict=True)
         if _is_link_or_reparse(staging) or staging.resolve(strict=True).parent != parent:
             raise ValueError("replay staging directory is not an owned sibling")
+        if _path_identity(staging) != self._staging_identity:
+            raise ValueError("replay staging directory object was substituted")
         marker_path = staging / self._MARKER_NAME
         if _is_link_or_reparse(marker_path):
             raise ValueError("replay staging marker is unsafe")
         marker: object = json.loads(marker_path.read_text(encoding="utf-8"))
-        expected = {
+        expected = self._expected_marker()
+        if marker != expected:
+            raise ValueError("replay staging ownership marker does not match")
+        return staging
+
+    def _expected_marker(self) -> dict[str, str]:
+        return {
             "final_name": self._final_root.name,
             "run_id": self._run_id,
             "schema_version": REPLAY_BUNDLE_SCHEMA_VERSION,
         }
-        if marker != expected:
-            raise ValueError("replay staging ownership marker does not match")
-        return staging
 
     def _release_lock(self) -> None:
         descriptor = self._lock_descriptor
@@ -684,6 +819,12 @@ class _RecordingBase:
                 ),
                 usage=usage,
                 latency_ms=latency_ms,
+            )
+            self._checkpoint(
+                deadline=deadline,
+                cancellation_token=cancellation_token,
+                provider_id=key.provider_id,
+                operation=operation,
             )
             raise
         self._checkpoint(

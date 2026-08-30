@@ -555,6 +555,97 @@ def test_distinct_snapshot_identities_each_start_at_provider_attempt_one(
     assert [call.attempt for call in manifest.provider_calls[-2:]] == [1, 1]
 
 
+def _manifest_with_one_tool_execution(
+    base: RunManifest, calls: tuple[ProviderCallRecord, ...]
+) -> RunManifest:
+    execution = _tool_execution(
+        base.started_at,
+        attempt=1,
+        start_ms=0,
+        finish_ms=100,
+        search_calls=len(calls),
+    )
+    return _manifest_with_tool_history(
+        base, calls=calls, executions=(execution,)
+    )
+
+
+@pytest.mark.parametrize("history", ("reversed", "overlapping"))
+def test_provider_retry_attempts_are_chronological_and_non_overlapping(
+    pricing_snapshot: PricingSnapshot, history: str
+) -> None:
+    base = _manifest(pricing_snapshot)
+    started = base.started_at
+    if history == "reversed":
+        calls = (
+            _search_call(
+                started, request_sha256="a" * 64, attempt=1, offset_ms=70
+            ),
+            _search_call(
+                started, request_sha256="a" * 64, attempt=2, offset_ms=10
+            ),
+        )
+    else:
+        calls = (
+            _search_call(
+                started, request_sha256="a" * 64, attempt=1, offset_ms=10
+            ).model_copy(
+                update={
+                    "finished_at": started + timedelta(milliseconds=80),
+                    "latency_ms": 70,
+                }
+            ),
+            _search_call(
+                started, request_sha256="a" * 64, attempt=2, offset_ms=50
+            ),
+        )
+
+    with pytest.raises(ValidationError, match="chronological|overlap|attempt"):
+        _manifest_with_one_tool_execution(base, calls)
+
+
+def test_identical_fresh_provider_invocations_can_each_start_at_attempt_one(
+    pricing_snapshot: PricingSnapshot,
+) -> None:
+    base = _manifest(pricing_snapshot)
+    started = base.started_at
+    calls = (
+        _search_call(started, request_sha256="a" * 64, attempt=1, offset_ms=10),
+        _search_call(started, request_sha256="a" * 64, attempt=1, offset_ms=30),
+    )
+
+    manifest = _manifest_with_one_tool_execution(base, calls)
+
+    assert [call.attempt for call in manifest.provider_calls[-2:]] == [1, 1]
+
+
+@pytest.mark.parametrize(
+    "attempts",
+    (
+        (2,),
+        (1, 3),
+        (1, 2, 2),
+        (1, 1, 2, 2),
+    ),
+)
+def test_provider_invocation_sequences_reject_gaps_and_ambiguous_interleaving(
+    pricing_snapshot: PricingSnapshot, attempts: tuple[int, ...]
+) -> None:
+    base = _manifest(pricing_snapshot)
+    calls = tuple(
+        _search_call(
+            base.started_at,
+            request_sha256="a" * 64,
+            attempt=attempt,
+            offset_ms=10 + index * 20,
+        )
+        for index, attempt in enumerate(attempts)
+    )
+
+    with pytest.raises(ValidationError, match="attempt|invocation|ambiguous"):
+        _manifest_with_one_tool_execution(base, calls)
+
+
 def test_node_executions_must_be_inside_the_run_envelope(
     pricing_snapshot: PricingSnapshot,
 ) -> None:

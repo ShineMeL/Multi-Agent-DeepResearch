@@ -793,16 +793,32 @@ class RunManifest(_ManifestModel):
     def _validate_contiguous_attempts(
         self, containing_executions: tuple[int, ...]
     ) -> None:
-        call_attempts: defaultdict[tuple[int, bytes], list[int]] = defaultdict(list)
+        call_groups: defaultdict[
+            tuple[int, bytes], list[ProviderCallRecord]
+        ] = defaultdict(list)
         for execution_index, call in zip(
             containing_executions, self.provider_calls, strict=True
         ):
-            call_attempts[
+            call_groups[
                 (execution_index, self._provider_call_identity(call))
-            ].append(call.attempt)
-        for attempts in call_attempts.values():
-            if attempts != list(range(1, len(attempts) + 1)):
-                raise ValueError("provider call attempts must be ordered and contiguous")
+            ].append(call)
+        for calls in call_groups.values():
+            previous: ProviderCallRecord | None = None
+            expected_attempt = 1
+            for call in calls:
+                if previous is not None and previous.finished_at > call.started_at:
+                    raise ValueError(
+                        "provider calls must be chronological and non-overlapping"
+                    )
+                if call.attempt == 1:
+                    expected_attempt = 2
+                elif call.attempt == expected_attempt:
+                    expected_attempt += 1
+                else:
+                    raise ValueError(
+                        "provider invocation attempts must start at one and be contiguous"
+                    )
+                previous = call
 
     @staticmethod
     def _aggregate_usage(
