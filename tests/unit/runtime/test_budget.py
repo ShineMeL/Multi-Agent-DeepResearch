@@ -407,3 +407,25 @@ def test_accountant_rejects_invalid_or_unknown_chargeable_seed_usage(
 
     with pytest.raises(ValueError, match="finite|non-negative|known cost"):
         BudgetAccountant(budget)
+
+
+def test_accountant_rejects_finite_seed_wall_times_that_overflow_in_aggregate() -> None:
+    huge = usage(tokens=1, wall_seconds=1e308, cost="0")
+    budget = RunBudget.preset("low").model_copy(
+        update={"used_by_node": {node: huge for node in NODES}}
+    )
+
+    with pytest.raises(ValueError, match="aggregate|finite|wall"):
+        BudgetAccountant(budget)
+
+
+def test_accountant_accepts_finite_seed_usage_that_already_exhausts_a_limit() -> None:
+    historical = usage(tokens=1, wall_seconds=100.0, cost="0")
+    budget = RunBudget.preset("low").model_copy(
+        update={"used_by_node": {node: historical for node in NODES}}
+    )
+
+    snapshot = BudgetAccountant(budget).snapshot()
+
+    assert snapshot.used_wall_seconds == 500.0
+    assert "wall_seconds" in snapshot.exhausted

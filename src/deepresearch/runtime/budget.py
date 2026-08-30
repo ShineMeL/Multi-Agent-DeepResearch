@@ -189,6 +189,15 @@ class BudgetAccountant:
                     raise ValueError(f"seeded {node} usage must have known cost")
                 seeded = seeded.model_copy(update={"cost_usd": Decimal(0)})
             used_by_node[node] = seeded
+        try:
+            self._snapshot_locked(
+                used_by_node=used_by_node,
+                last_observed_usage=zero,
+            )
+        except ValueError as error:
+            raise ValueError(
+                "aggregate seeded budget usage must be finite and valid"
+            ) from error
         self._used_by_node = used_by_node
         self._last_observed_usage = zero
 
