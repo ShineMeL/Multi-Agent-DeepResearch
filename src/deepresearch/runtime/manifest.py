@@ -8,6 +8,7 @@ from collections import defaultdict
 from collections.abc import Mapping
 from datetime import datetime
 from decimal import ROUND_HALF_EVEN, Decimal
+from itertools import pairwise
 from typing import Annotated, Any, Literal, Never, Self, cast, override
 
 from pydantic import (
@@ -690,8 +691,9 @@ class RunManifest(_ManifestModel):
         )
         if self.model_ids != expected_models:
             raise ValueError("model_ids must equal model call model IDs in first-use order")
-        self._validate_contiguous_attempts()
-        self._validate_usage_reconciliation()
+        containing_executions = self._validate_execution_history()
+        self._validate_contiguous_attempts(containing_executions)
+        self._validate_usage_reconciliation(containing_executions)
         self._validate_pricing()
         self._validate_budget_limits()
         parsed_ids = {record.artifact_id for record in self.parsed_artifacts}
@@ -718,18 +720,85 @@ class RunManifest(_ManifestModel):
             raise ValueError("blank manifest_sha256 requires RunManifest.create")
         return self
 
-    def _validate_contiguous_attempts(self) -> None:
-        node_attempts: defaultdict[str, list[int]] = defaultdict(list)
-        for execution in self.node_executions:
-            node_attempts[execution.node].append(execution.attempt)
-        for attempts in node_attempts.values():
+    def _validate_execution_history(self) -> tuple[int, ...]:
+        """Validate ordered executions and resolve calls using half-open starts.
+
+        Execution histories are ordered, non-overlapping intervals. A call may end at
+        an execution's closed finish, but its start must be strictly before that
+        finish. Consequently, a zero-duration call on a touching boundary belongs to
+        the later ``[started_at, finished_at)`` execution only.
+        """
+        executions_by_node: defaultdict[str, list[tuple[int, NodeExecutionRecord]]] = (
+            defaultdict(list)
+        )
+        for index, execution in enumerate(self.node_executions):
+            if not (
+                self.started_at <= execution.started_at
+                and execution.finished_at <= self.finished_at
+            ):
+                raise ValueError("node execution must be inside the run envelope")
+            executions_by_node[execution.node].append((index, execution))
+
+        for executions in executions_by_node.values():
+            attempts = [execution.attempt for _, execution in executions]
             if attempts != list(range(1, len(attempts) + 1)):
                 raise ValueError("node execution attempts must be ordered and contiguous")
+            for (_, previous), (_, current) in pairwise(executions):
+                if previous.finished_at > current.started_at:
+                    raise ValueError(
+                        "node execution attempts must be chronological and non-overlapping"
+                    )
 
-        call_attempts: defaultdict[tuple[str, str, str, str], list[int]] = defaultdict(list)
+        containing_executions: list[int] = []
         for call in self.provider_calls:
+            containing = [
+                index
+                for index, execution in enumerate(self.node_executions)
+                if execution.node == call.node
+                and execution.started_at <= call.started_at
+                and call.started_at < execution.finished_at
+                and call.finished_at <= execution.finished_at
+            ]
+            if len(containing) != 1:
+                raise ValueError(
+                    "provider call must have exactly one containing node execution"
+                )
+            containing_executions.append(containing[0])
+        return tuple(containing_executions)
+
+    @staticmethod
+    def _provider_call_identity(call: ProviderCallRecord) -> bytes:
+        """Return the canonical, result-affecting invocation/cache identity."""
+        fields = {
+            "operation",
+            "provider_id",
+            "endpoint_type",
+            "model_id",
+            "model_revision",
+            "request_sha256",
+            "snapshot_id",
+            "normalized_query",
+            "locale",
+            "complete_parameters",
+            "time_policy",
+            "prompt_version",
+            "system_prompt_hash",
+            "tool_schema_hash",
+            "output_schema_hash",
+            "temperature",
+            "seed",
+        }
+        return _canonical_bytes(call.model_dump(mode="json", include=fields))
+
+    def _validate_contiguous_attempts(
+        self, containing_executions: tuple[int, ...]
+    ) -> None:
+        call_attempts: defaultdict[tuple[int, bytes], list[int]] = defaultdict(list)
+        for execution_index, call in zip(
+            containing_executions, self.provider_calls, strict=True
+        ):
             call_attempts[
-                (call.node, call.operation, call.provider_id, call.request_sha256)
+                (execution_index, self._provider_call_identity(call))
             ].append(call.attempt)
         for attempts in call_attempts.values():
             if attempts != list(range(1, len(attempts) + 1)):
@@ -764,26 +833,19 @@ class RunManifest(_ManifestModel):
             charged += call.estimated_cost_usd
         return charged.quantize(CostCalculator.QUANTUM, rounding=ROUND_HALF_EVEN)
 
-    def _validate_usage_reconciliation(self) -> None:
+    def _validate_usage_reconciliation(
+        self, containing_executions: tuple[int, ...]
+    ) -> None:
         """Reconcile calls into executions, nodes, then the run without summing wall time."""
         additive = (
             "input_tokens", "output_tokens", "reasoning_tokens", "cached_tokens",
             "total_tokens", "search_calls", "pages", "retries",
         )
         calls_by_execution: defaultdict[int, list[ProviderCallRecord]] = defaultdict(list)
-        for call in self.provider_calls:
-            containing = [
-                index
-                for index, execution in enumerate(self.node_executions)
-                if execution.node == call.node
-                and execution.started_at <= call.started_at
-                and call.finished_at <= execution.finished_at
-            ]
-            if len(containing) != 1:
-                raise ValueError(
-                    "provider call must have exactly one containing node execution"
-                )
-            calls_by_execution[containing[0]].append(call)
+        for execution_index, call in zip(
+            containing_executions, self.provider_calls, strict=True
+        ):
+            calls_by_execution[execution_index].append(call)
         for index, calls in calls_by_execution.items():
             execution = self.node_executions[index]
             for field in additive:

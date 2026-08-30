@@ -458,6 +458,179 @@ def test_provider_attempts_are_per_request_and_link_by_containing_execution(
     assert [call.attempt for call in manifest.provider_calls[1:]] == [1, 1, 1, 2, 1, 1]
 
 
+def _manifest_with_tool_history(
+    base: RunManifest,
+    *,
+    calls: tuple[ProviderCallRecord, ...],
+    executions: tuple[NodeExecutionRecord, ...],
+) -> RunManifest:
+    search_calls = sum(item.usage.search_calls for item in executions)
+    pages = sum(item.usage.pages for item in executions)
+    tool_usage = ResourceUsage.zero(cost_known=True).model_copy(
+        update={
+            "search_calls": search_calls,
+            "pages": pages,
+            "wall_seconds": max(item.usage.wall_seconds for item in executions),
+        }
+    )
+    run_usage = base.usage.model_copy(
+        update={
+            "search_calls": search_calls,
+            "pages": pages,
+            "wall_seconds": 1.0,
+        }
+    )
+    return RunManifest.create(
+        {
+            **base.model_dump(),
+            "provider_calls": (*base.provider_calls, *calls),
+            "node_executions": (*base.node_executions, *executions),
+            "usage_by_node": {**base.usage_by_node, "Tool": tool_usage},
+            "usage": run_usage,
+        }
+    )
+
+
+def _tool_execution(
+    started: datetime,
+    *,
+    attempt: int,
+    start_ms: int,
+    finish_ms: int,
+    search_calls: int = 1,
+) -> NodeExecutionRecord:
+    return NodeExecutionRecord(
+        node="Tool",
+        attempt=attempt,
+        started_at=started + timedelta(milliseconds=start_ms),
+        finished_at=started + timedelta(milliseconds=finish_ms),
+        latency_ms=finish_ms - start_ms,
+        status="completed",
+        input_artifact_ids=(),
+        output_artifact_ids=(),
+        usage=ResourceUsage.zero().model_copy(
+            update={"search_calls": search_calls, "wall_seconds": 0.05}
+        ),
+    )
+
+
+def test_provider_attempts_reset_for_each_containing_node_execution(
+    pricing_snapshot: PricingSnapshot,
+) -> None:
+    base = _manifest(pricing_snapshot)
+    started = base.started_at
+    executions = (
+        _tool_execution(started, attempt=1, start_ms=0, finish_ms=50),
+        _tool_execution(started, attempt=2, start_ms=50, finish_ms=100),
+    )
+    first = _search_call(started, request_sha256="a" * 64, offset_ms=10)
+    second = _search_call(started, request_sha256="a" * 64, offset_ms=60)
+
+    manifest = _manifest_with_tool_history(
+        base, calls=(first, second), executions=executions
+    )
+
+    assert [call.attempt for call in manifest.provider_calls[-2:]] == [1, 1]
+
+
+def test_distinct_snapshot_identities_each_start_at_provider_attempt_one(
+    pricing_snapshot: PricingSnapshot,
+) -> None:
+    base = _manifest(pricing_snapshot)
+    started = base.started_at
+    execution = _tool_execution(
+        started, attempt=1, start_ms=0, finish_ms=100, search_calls=2
+    )
+    first = _search_call(started, request_sha256="a" * 64, offset_ms=10).model_copy(
+        update={"snapshot_id": "snapshot-one"}
+    )
+    second = _search_call(started, request_sha256="a" * 64, offset_ms=30).model_copy(
+        update={"snapshot_id": "snapshot-two"}
+    )
+
+    manifest = _manifest_with_tool_history(
+        base, calls=(first, second), executions=(execution,)
+    )
+
+    assert [call.attempt for call in manifest.provider_calls[-2:]] == [1, 1]
+
+
+def test_node_executions_must_be_inside_the_run_envelope(
+    pricing_snapshot: PricingSnapshot,
+) -> None:
+    base = _manifest(pricing_snapshot)
+    shifted_start = base.started_at - timedelta(days=1)
+    shifted_call = base.provider_calls[0].model_copy(
+        update={
+            "started_at": shifted_start,
+            "finished_at": shifted_start + timedelta(milliseconds=100),
+        }
+    )
+    shifted_execution = base.node_executions[0].model_copy(
+        update={
+            "started_at": shifted_start,
+            "finished_at": shifted_start + timedelta(milliseconds=100),
+        }
+    )
+
+    with pytest.raises(ValidationError, match="run envelope|execution"):
+        RunManifest.create(
+            {
+                **base.model_dump(),
+                "provider_calls": (shifted_call,),
+                "node_executions": (shifted_execution,),
+            }
+        )
+
+
+def test_same_node_attempt_intervals_must_not_overlap(
+    pricing_snapshot: PricingSnapshot,
+) -> None:
+    base = _manifest(pricing_snapshot)
+    started = base.started_at
+    executions = (
+        _tool_execution(
+            started, attempt=1, start_ms=0, finish_ms=100, search_calls=0
+        ),
+        _tool_execution(
+            started, attempt=2, start_ms=50, finish_ms=150, search_calls=0
+        ),
+    )
+
+    with pytest.raises(ValidationError, match="overlap|chronological"):
+        _manifest_with_tool_history(base, calls=(), executions=executions)
+
+
+def test_touching_node_attempts_use_half_open_call_containment(
+    pricing_snapshot: PricingSnapshot,
+) -> None:
+    base = _manifest(pricing_snapshot)
+    started = base.started_at
+    executions = (
+        _tool_execution(
+            started, attempt=1, start_ms=0, finish_ms=50, search_calls=0
+        ),
+        _tool_execution(
+            started, attempt=2, start_ms=50, finish_ms=100, search_calls=0
+        ),
+    )
+    boundary = started + timedelta(milliseconds=50)
+    call = _search_call(started, request_sha256="a" * 64, offset_ms=50).model_copy(
+        update={
+            "started_at": boundary,
+            "finished_at": boundary,
+            "latency_ms": 0,
+            "usage": ResourceUsage.zero(cost_known=True),
+        }
+    )
+
+    manifest = _manifest_with_tool_history(
+        base, calls=(call,), executions=executions
+    )
+
+    assert manifest.provider_calls[-1].started_at == executions[1].started_at
+
+
 @pytest.mark.parametrize("ambiguous", (False, True))
 def test_provider_call_requires_exactly_one_containing_node_execution(
     pricing_snapshot: PricingSnapshot, ambiguous: bool

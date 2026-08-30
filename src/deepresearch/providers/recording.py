@@ -10,8 +10,10 @@ import stat
 import sys
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from math import isfinite
 from pathlib import Path
 from typing import Any, TypeVar, cast
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from pydantic import JsonValue
 
@@ -68,6 +70,13 @@ _SAFE_FETCH_HEADERS = frozenset(
         "etag",
         "last-modified",
     }
+)
+_INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+_CREDENTIAL_WORD = re.compile(
+    r"(?i)(?:^|[^a-z0-9])"
+    r"(?:api[_ .-]?key|access[_ .-]?key|authorization|auth|bearer|cookie|"
+    r"credential|password|passwd|secret|access[_ .-]?token|token|key)"
+    r"(?:$|[^a-z0-9])"
 )
 _RECORD_FILENAME: dict[ReplayOperation, str] = {
     "model.complete": "model_responses.jsonl",
@@ -232,16 +241,37 @@ def _redact_public_message(message: str) -> str:
     return redacted
 
 
-def _safe_fetch_response(document: RawDocument) -> dict[str, JsonValue]:
-    headers = {
-        key.casefold(): value
-        for key, value in document.headers.items()
-        if key.casefold() in _SAFE_FETCH_HEADERS
-    }
-    final_url = ""
-    final_url_is_safe = True
+def _bounded_unquote(value: str) -> str:
+    current = value
+    for _ in range(6):
+        if _INVALID_PERCENT_ESCAPE.search(current):
+            raise ValueError("metadata encoding is invalid")
+        decoded = unquote(current, encoding="utf-8", errors="strict")
+        if decoded == current:
+            return current
+        current = decoded
+    raise ValueError("metadata encoding exceeds the safety bound")
+
+
+def _contains_credential_shape(value: str) -> bool:
+    decoded = _bounded_unquote(value).casefold()
+    return _CREDENTIAL_WORD.search(decoded) is not None
+
+
+def _fetch_metadata_is_safe(final_url: str, headers: Mapping[str, str]) -> bool:
     try:
-        final_url = str(document.final_url)
+        decoded_url = _bounded_unquote(final_url)
+        for candidate in (final_url, decoded_url):
+            split = urlsplit(candidate)
+            if split.fragment or split.username is not None or split.password is not None:
+                return False
+            for query_key, query_value in parse_qsl(
+                split.query, keep_blank_values=True, strict_parsing=False
+            ):
+                if _contains_credential_shape(query_key) or _contains_credential_shape(
+                    query_value
+                ):
+                    return False
         canonical_final_url = canonicalize_url(final_url)
         FetchCacheKey.model_validate(
             {
@@ -251,10 +281,20 @@ def _safe_fetch_response(document: RawDocument) -> dict[str, JsonValue]:
                 "accepted_content_types": (),
             }
         )
-    except (TypeError, ValueError):
-        final_url_is_safe = False
-    if not final_url_is_safe:
-        raise ValueError("final_url violates credential-safe URL policy")
+        return not any(_contains_credential_shape(value) for value in headers.values())
+    except (TypeError, UnicodeError, ValueError):
+        return False
+
+
+def _safe_fetch_response(document: RawDocument) -> dict[str, JsonValue]:
+    headers = {
+        key.casefold(): value
+        for key, value in document.headers.items()
+        if key.casefold() in _SAFE_FETCH_HEADERS
+    }
+    final_url = str(document.final_url)
+    if not _fetch_metadata_is_safe(final_url, headers):
+        raise ValueError("recorded fetch metadata violates credential-safe policy")
     return {
         "body_base64": base64.b64encode(document.body_bytes).decode("ascii"),
         "content_type": document.content_type,
@@ -421,91 +461,127 @@ class ReplayBundleWriter:
         async with self._append_lock:
             if self._closed or self._staging_root is None:
                 raise RuntimeError("replay writer is closed")
-            staging = self._validate_owned_staging()
-            if self._final_root.exists():
-                raise FileExistsError(self._final_root)
-
-            grouped: dict[str, list[ReplayRecord]] = {
-                filename: [] for filename in _RECORD_FILENAME.values()
-            }
-            for record in self._records.values():
-                grouped[_RECORD_FILENAME[record.key.operation]].append(record)
-            for records in grouped.values():
-                records.sort(key=lambda item: canonical_json_bytes(item.key.model_dump(mode="json")))
-
-            for filename in sorted(grouped):
-                lines = [canonical_json_bytes(item.model_dump(mode="json")) for item in grouped[filename]]
-                payload = b"" if not lines else b"\n".join(lines) + b"\n"
-                _write_fsynced(staging / filename, payload)
-            snapshot = {
-                "providers": {
-                    key: value.model_dump(mode="json")
-                    for key, value in sorted(self._providers.items())
-                },
-                "run_id": self._run_id,
-                "schema_version": REPLAY_BUNDLE_SCHEMA_VERSION,
-            }
-            _write_fsynced(staging / "snapshot.json", canonical_json_bytes(snapshot) + b"\n")
-            hashes = {
-                filename: hashlib.sha256((staging / filename).read_bytes()).hexdigest()
-                for filename in REPLAY_FILES
-            }
-            counts = {operation: 0 for operation in REPLAY_OPERATIONS}
-            for record in self._records.values():
-                counts[record.key.operation] += 1
-            manifest = {
-                "file_sha256": hashes,
-                "record_count_by_operation": counts,
-                "schema_version": REPLAY_MANIFEST_SCHEMA_VERSION,
-            }
-            _write_fsynced(staging / "manifest.sha256", canonical_json_bytes(manifest) + b"\n")
-            _fsync_directory(staging)
-            ReplayBundle.load(staging)
-            self._validate_owned_staging()
-            if self._final_root.exists():
-                raise FileExistsError(self._final_root)
-            _atomic_rename_noreplace(staging, self._final_root)
-            self._staging_root = None
-            self._published = True
             try:
-                published_marker = self._final_root / self._MARKER_NAME
-                if _is_link_or_reparse(published_marker):
-                    raise ValueError("published replay marker is unsafe")
-                published_marker.unlink()
-                _fsync_directory(self._final_root)
-                _fsync_directory(self._final_root.parent)
-            except Exception as error:
-                raise OSError(
-                    "replay bundle was published but durability finalization failed"
-                ) from error
-            finally:
-                self._closed = True
-                self._release_lock()
-            return self._final_root
+                staging = self._validate_owned_staging()
+                if self._final_root.exists():
+                    raise FileExistsError(self._final_root)
+
+                grouped: dict[str, list[ReplayRecord]] = {
+                    filename: [] for filename in _RECORD_FILENAME.values()
+                }
+                for record in self._records.values():
+                    grouped[_RECORD_FILENAME[record.key.operation]].append(record)
+                for records in grouped.values():
+                    records.sort(
+                        key=lambda item: canonical_json_bytes(
+                            item.key.model_dump(mode="json")
+                        )
+                    )
+
+                for filename in sorted(grouped):
+                    lines = [
+                        canonical_json_bytes(item.model_dump(mode="json"))
+                        for item in grouped[filename]
+                    ]
+                    payload = b"" if not lines else b"\n".join(lines) + b"\n"
+                    _write_fsynced(staging / filename, payload)
+                snapshot = {
+                    "providers": {
+                        key: value.model_dump(mode="json")
+                        for key, value in sorted(self._providers.items())
+                    },
+                    "run_id": self._run_id,
+                    "schema_version": REPLAY_BUNDLE_SCHEMA_VERSION,
+                }
+                _write_fsynced(
+                    staging / "snapshot.json", canonical_json_bytes(snapshot) + b"\n"
+                )
+                hashes = {
+                    filename: hashlib.sha256(
+                        (staging / filename).read_bytes()
+                    ).hexdigest()
+                    for filename in REPLAY_FILES
+                }
+                counts = {operation: 0 for operation in REPLAY_OPERATIONS}
+                for record in self._records.values():
+                    counts[record.key.operation] += 1
+                manifest = {
+                    "file_sha256": hashes,
+                    "record_count_by_operation": counts,
+                    "schema_version": REPLAY_MANIFEST_SCHEMA_VERSION,
+                }
+                _write_fsynced(
+                    staging / "manifest.sha256",
+                    canonical_json_bytes(manifest) + b"\n",
+                )
+                _fsync_directory(staging)
+                ReplayBundle.load(staging)
+                self._validate_owned_staging()
+                if self._final_root.exists():
+                    raise FileExistsError(self._final_root)
+                _atomic_rename_noreplace(staging, self._final_root)
+                self._staging_root = None
+                self._published = True
+                try:
+                    published_marker = self._final_root / self._MARKER_NAME
+                    if _is_link_or_reparse(published_marker):
+                        raise ValueError("published replay marker is unsafe")
+                    published_marker.unlink()
+                    _fsync_directory(self._final_root)
+                    _fsync_directory(self._final_root.parent)
+                except (OSError, RuntimeError, ValueError) as error:
+                    raise OSError(
+                        "replay bundle was published but durability finalization failed"
+                    ) from error
+                finally:
+                    self._closed = True
+                    self._release_lock()
+                return self._final_root
+            except Exception:
+                if self._published:
+                    raise
+                cleanup_error: Exception | None = None
+                try:
+                    self._remove_owned_staging()
+                except (OSError, RuntimeError, ValueError) as error:
+                    cleanup_error = error
+                finally:
+                    self._closed = True
+                    self._release_lock()
+                if cleanup_error is not None:
+                    raise OSError(
+                        "replay finalization failed and staging cleanup failed"
+                    ) from cleanup_error
+                raise
 
     async def abort(self) -> None:
         async with self._append_lock:
             try:
                 if not self._published and self._staging_root is not None:
-                    staging = self._validate_owned_staging()
-                    children = sorted(
-                        staging.rglob("*"), key=lambda item: len(item.parts), reverse=True
-                    )
-                    for child in children:
-                        if _is_link_or_reparse(child):
-                            raise ValueError(
-                                "owned staging contains a symlink or reparse point"
-                            )
-                    for child in children:
-                        if child.is_dir():
-                            child.rmdir()
-                        else:
-                            child.unlink()
-                    staging.rmdir()
-                    self._staging_root = None
+                    self._remove_owned_staging()
             finally:
                 self._closed = True
                 self._release_lock()
+
+    def _remove_owned_staging(self) -> None:
+        staging = self._validate_owned_staging()
+        marker_path = staging / self._MARKER_NAME
+        children = sorted(
+            staging.rglob("*"), key=lambda item: len(item.parts), reverse=True
+        )
+        for child in children:
+            if _is_link_or_reparse(child):
+                raise ValueError("owned staging contains a symlink or reparse point")
+        for child in children:
+            if child == marker_path:
+                continue
+            if child.is_dir():
+                child.rmdir()
+            else:
+                child.unlink()
+        marker_path.unlink()
+        staging.rmdir()
+        self._staging_root = None
 
     def _validate_owned_staging(self) -> Path:
         staging = self._staging_root
@@ -552,6 +628,26 @@ class _RecordingBase:
             ),
         )
 
+    @staticmethod
+    def _checkpoint(
+        *,
+        deadline: float,
+        cancellation_token: CancellationToken,
+        provider_id: str,
+        operation: str,
+    ) -> None:
+        if not isfinite(deadline):
+            raise ValueError("deadline must be finite")
+        cancellation_token.raise_if_cancelled()
+        if time.monotonic() >= deadline:
+            raise ProviderError(
+                code="TIMEOUT",
+                provider=provider_id,
+                operation=operation,
+                public_message="provider call deadline exceeded",
+                retryable=True,
+            )
+
     async def _record_call(
         self,
         *,
@@ -564,7 +660,12 @@ class _RecordingBase:
         encode: Callable[[T], JsonValue],
         usage_of: Callable[[T, int], ResourceUsage],
     ) -> T:
-        cancellation_token.raise_if_cancelled()
+        self._checkpoint(
+            deadline=deadline,
+            cancellation_token=cancellation_token,
+            provider_id=key.provider_id,
+            operation=operation,
+        )
         started = time.monotonic()
         try:
             result = await self._executor.call(
@@ -585,6 +686,12 @@ class _RecordingBase:
                 latency_ms=latency_ms,
             )
             raise
+        self._checkpoint(
+            deadline=deadline,
+            cancellation_token=cancellation_token,
+            provider_id=key.provider_id,
+            operation=operation,
+        )
         latency_ms = max(0, round((time.monotonic() - started) * 1000))
         await self._writer.append(
             key=key,
@@ -592,7 +699,12 @@ class _RecordingBase:
             usage=usage_of(result, latency_ms),
             latency_ms=latency_ms,
         )
-        cancellation_token.raise_if_cancelled()
+        self._checkpoint(
+            deadline=deadline,
+            cancellation_token=cancellation_token,
+            provider_id=key.provider_id,
+            operation=operation,
+        )
         return result
 
 
@@ -683,12 +795,27 @@ class RecordingModelProvider(_RecordingBase):
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[ModelStreamChunk]:
         async def collect(call_deadline: float) -> tuple[ModelStreamChunk, ...]:
+            self._checkpoint(
+                deadline=call_deadline,
+                cancellation_token=cancellation_token,
+                provider_id=self.provider_id,
+                operation="model.stream",
+            )
             stream = self._delegate.stream(
                 request,
                 deadline=call_deadline,
                 cancellation_token=cancellation_token,
             )
-            return validate_model_stream(tuple([chunk async for chunk in stream]))
+            chunks: list[ModelStreamChunk] = []
+            async for chunk in stream:
+                self._checkpoint(
+                    deadline=call_deadline,
+                    cancellation_token=cancellation_token,
+                    provider_id=self.provider_id,
+                    operation="model.stream",
+                )
+                chunks.append(chunk)
+            return validate_model_stream(tuple(chunks))
 
         async def recorded_stream() -> AsyncIterator[ModelStreamChunk]:
             key = _key(
@@ -710,7 +837,12 @@ class RecordingModelProvider(_RecordingBase):
                 usage_of=lambda result, _: cast("ResourceUsage", result[-1].final_usage),
             )
             for chunk in chunks:
-                cancellation_token.raise_if_cancelled()
+                self._checkpoint(
+                    deadline=deadline,
+                    cancellation_token=cancellation_token,
+                    provider_id=self.provider_id,
+                    operation="model.stream",
+                )
                 yield chunk
 
         return recorded_stream()
