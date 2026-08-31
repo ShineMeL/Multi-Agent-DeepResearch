@@ -71,7 +71,19 @@ def _strict_json(value: str) -> object:
     def reject_constant(_value: str) -> None:
         raise ValueError("non-finite JSON number")
 
-    return json.loads(value, parse_constant=reject_constant)
+    def reject_duplicate_names(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON object name")
+            result[key] = item
+        return result
+
+    return json.loads(
+        value,
+        parse_constant=reject_constant,
+        object_pairs_hook=reject_duplicate_names,
+    )
 
 
 def _attach_snapshot(
@@ -102,30 +114,41 @@ def _bounded_json_snapshot(value: object) -> tuple[bool, JsonValue | None]:
                 "tuple[Iterator[object], object, JsonValue, int]", payload
             )
             try:
-                if kind == "mapping":
-                    key = next(iterator)
-                    if not isinstance(key, str):
-                        return False, None
-                    string_chars += len(key)
-                    if string_chars > _MAX_JSON_STRING_CHARS:
-                        return False, None
-                    try:
-                        key.encode("utf-8")
-                    except UnicodeEncodeError:
-                        return False, None
-                    snapshot_mapping = cast("dict[str, JsonValue]", snapshot)
-                    if key in snapshot_mapping:
-                        return False, None
-                    child = cast("Mapping[object, object]", source)[key]
-                    child_destination: object = snapshot_mapping
-                    child_key: object | None = key
-                else:
-                    child = next(iterator)
-                    child_destination = snapshot
-                    child_key = None
+                next_item = next(iterator)
             except StopIteration:
                 active_containers.remove(container_id)
                 continue
+            except (MemoryError, OSError, AssertionError):
+                raise
+            except Exception:  # noqa: BLE001 - ordinary candidate iterator fault
+                return False, None
+            if kind == "mapping":
+                key = next_item
+                if not isinstance(key, str):
+                    return False, None
+                plain_key = str.__str__(key)
+                string_chars += len(plain_key)
+                if string_chars > _MAX_JSON_STRING_CHARS:
+                    return False, None
+                try:
+                    plain_key.encode("utf-8")
+                except UnicodeEncodeError:
+                    return False, None
+                snapshot_mapping = cast("dict[str, JsonValue]", snapshot)
+                if plain_key in snapshot_mapping:
+                    return False, None
+                try:
+                    child = cast("Mapping[object, object]", source)[key]
+                except (MemoryError, OSError, AssertionError):
+                    raise
+                except Exception:  # noqa: BLE001 - ordinary candidate lookup fault
+                    return False, None
+                child_destination: object = snapshot_mapping
+                child_key: object | None = plain_key
+            else:
+                child = next_item
+                child_destination = snapshot
+                child_key = None
             stack.append((kind, payload, depth, destination, destination_key))
             stack.append(
                 ("value", child, depth + 1, child_destination, child_key)
@@ -138,22 +161,27 @@ def _bounded_json_snapshot(value: object) -> tuple[bool, JsonValue | None]:
             return False, None
 
         if isinstance(item, str):
-            string_chars += len(item)
+            plain_item = str.__str__(item)
+            string_chars += len(plain_item)
             if string_chars > _MAX_JSON_STRING_CHARS:
                 return False, None
             try:
-                item.encode("utf-8")
+                plain_item.encode("utf-8")
             except UnicodeEncodeError:
                 return False, None
+            _attach_snapshot(destination, destination_key, plain_item)
+            continue
+        if item is None or isinstance(item, bool):
             _attach_snapshot(destination, destination_key, item)
             continue
-        if item is None or isinstance(item, (bool, int)):
-            _attach_snapshot(destination, destination_key, item)
+        if isinstance(item, int):
+            _attach_snapshot(destination, destination_key, int.__int__(item))
             continue
         if isinstance(item, float):
-            if not math.isfinite(item):
+            plain_float = float.__float__(item)
+            if not math.isfinite(plain_float):
                 return False, None
-            _attach_snapshot(destination, destination_key, item)
+            _attach_snapshot(destination, destination_key, plain_float)
             continue
         if isinstance(item, Mapping):
             mapping = cast("Mapping[object, object]", item)
@@ -163,10 +191,16 @@ def _bounded_json_snapshot(value: object) -> tuple[bool, JsonValue | None]:
             active_containers.add(identity)
             snapshot_mapping: dict[str, JsonValue] = {}
             _attach_snapshot(destination, destination_key, snapshot_mapping)
+            try:
+                iterator = iter(mapping)
+            except (MemoryError, OSError, AssertionError):
+                raise
+            except Exception:  # noqa: BLE001 - ordinary candidate iterator fault
+                return False, None
             stack.append(
                 (
                     "mapping",
-                    (iter(mapping), mapping, snapshot_mapping, identity),
+                    (iterator, mapping, snapshot_mapping, identity),
                     depth,
                     destination,
                     destination_key,
@@ -181,10 +215,16 @@ def _bounded_json_snapshot(value: object) -> tuple[bool, JsonValue | None]:
             active_containers.add(identity)
             snapshot_sequence: list[JsonValue] = []
             _attach_snapshot(destination, destination_key, snapshot_sequence)
+            try:
+                iterator = iter(sequence)
+            except (MemoryError, OSError, AssertionError):
+                raise
+            except Exception:  # noqa: BLE001 - ordinary candidate iterator fault
+                return False, None
             stack.append(
                 (
                     "sequence",
-                    (iter(sequence), sequence, snapshot_sequence, identity),
+                    (iterator, sequence, snapshot_sequence, identity),
                     depth,
                     destination,
                     destination_key,

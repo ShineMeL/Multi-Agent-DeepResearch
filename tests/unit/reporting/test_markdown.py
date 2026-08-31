@@ -555,3 +555,31 @@ def test_metadata_entities_remain_literal_after_commonmark_rendering(
     assert "&amp;#91;E-missing&amp;#93;" in rendered
     assert sequence in rendered
     assert "https://example.com/report?a=1&amp;b=2" in rendered
+
+
+def test_canonical_url_entities_remain_literal_without_changing_query_separators(
+    tmp_path: Path,
+) -> None:
+    store = LocalEvidenceStore(tmp_path)
+    add_evidence(
+        store,
+        evidence_id="E-known",
+        source_id="source-known",
+        url=(
+            "https://example.com/&lbrack;E-missing&rbrack;/report"
+            "?b=2&a=1"
+        ),
+    )
+
+    report = MarkdownReportWriter(store).finalize_report(
+        "Supported [E-known].",
+        selected_evidence_ids=("E-known",),
+    )
+    rendered = MarkdownIt("commonmark").render(report)
+
+    assert r"/\&lbrack;E-missing\&rbrack;/report?a=1&b=2" in report
+    assert "https://example.com/[E-missing]/report" not in rendered
+    assert (
+        "https://example.com/&amp;lbrack;E-missing&amp;rbrack;/report"
+        "?a=1&amp;b=2"
+    ) in rendered

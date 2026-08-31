@@ -24,6 +24,9 @@ _AMBIGUOUS_HTML_CITATION = re.compile(
     re.IGNORECASE,
 )
 _MARKDOWN_SPECIAL = re.compile(r"([&\\`*_{\[\]}<>#!|~])")
+_ENTITY_INTRODUCER = re.compile(
+    r"&(?=(?:#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6}|[A-Za-z][A-Za-z0-9]{0,31});)"
+)
 _STOP_REASONS = frozenset({"SUFFICIENT", "PLATEAU", "BUDGET_EXHAUSTED", "BLOCKED"})
 _HIDDEN_HTML_TAGS = frozenset({"code", "pre", "script", "style"})
 _BIDI_CONTROLS = frozenset(
@@ -335,6 +338,13 @@ def _markdown_safe_single_line(text: str) -> str:
     return _MARKDOWN_SPECIAL.sub(r"\\\1", single_line)
 
 
+def _markdown_safe_url(url: str) -> str:
+    return _ENTITY_INTRODUCER.sub(
+        lambda match: f"\\{match.group(0)}",
+        url,
+    )
+
+
 class MarkdownReportWriter:
     def __init__(
         self,
@@ -473,7 +483,8 @@ class MarkdownReportWriter:
             source = self.evidence_store.get_source(evidence.source_id)
             safe_url = canonicalize_url(str(source.canonical_url))
             safe_title = _markdown_safe_single_line(source.title)
-            references.append(f"- [{evidence_id}] {safe_title} — {safe_url}")
+            display_url = _markdown_safe_url(safe_url)
+            references.append(f"- [{evidence_id}] {safe_title} — {display_url}")
         sections.append("\n".join(references))
         return "\n\n".join(sections)
 

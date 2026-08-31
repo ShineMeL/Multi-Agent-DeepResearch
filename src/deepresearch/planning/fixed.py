@@ -186,13 +186,6 @@ def _request_token_upper_bound(request: ModelRequest) -> int:
     return _MODEL_REQUEST_FIXED_BYTES + prompt_bytes + request.max_output_tokens
 
 
-def _request_exceeds_budget(request: ModelRequest, remaining: int) -> bool:
-    try:
-        return _request_token_upper_bound(request) > remaining
-    except UnicodeEncodeError:
-        return True
-
-
 def _ensure_request_within_budget(
     request: ModelRequest,
     *,
@@ -223,9 +216,20 @@ def _repair_candidate(raw: str) -> JsonValue | None:
     if len(raw) > _MAX_REPAIR_CANDIDATE_CHARS:
         return None
     try:
+        def reject_duplicate_names(
+            pairs: list[tuple[str, object]],
+        ) -> dict[str, object]:
+            result: dict[str, object] = {}
+            for key, item in pairs:
+                if key in result:
+                    raise ValueError("duplicate JSON object name")
+                result[key] = item
+            return result
+
         parsed: object = json.loads(
             raw,
             parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
+            object_pairs_hook=reject_duplicate_names,
         )
     except (RecursionError, ValueError):
         return None
@@ -287,7 +291,26 @@ class FixedPlanner:
         self._model_tokens_reserved = 0
         self._token_lock = Lock()
 
-    def _reserve_request(self, request: ModelRequest) -> int:
+    def _token_budget_error(self) -> ProviderError:
+        return ProviderError(
+            code="INVALID_REQUEST",
+            provider=self.model.provider_id,
+            operation="model",
+            public_message="model request exceeds remaining token budget",
+            retryable=False,
+        )
+
+    def _remaining_model_tokens(self) -> int:
+        with self._token_lock:
+            return max(
+                0,
+                self.budget.max_total_tokens
+                - self._initial_model_tokens
+                - self._model_tokens_used
+                - self._model_tokens_reserved,
+            )
+
+    def _reserve_request(self, request: ModelRequest) -> int | None:
         try:
             reservation = _request_token_upper_bound(request)
         except UnicodeEncodeError:
@@ -306,21 +329,21 @@ class FixedPlanner:
                 - self._model_tokens_reserved
             )
             if reservation > remaining:
-                raise ProviderError(
-                    code="INVALID_REQUEST",
-                    provider=self.model.provider_id,
-                    operation="model",
-                    public_message="model request exceeds remaining token budget",
-                    retryable=False,
-                )
+                return None
             self._model_tokens_reserved += reservation
         return reservation
 
-    def _settle_request(self, reservation: int, actual_tokens: int | None) -> None:
+    def _settle_request(self, reservation: int, actual_tokens: int | None) -> bool:
         with self._token_lock:
             self._model_tokens_reserved -= reservation
             if actual_tokens is not None:
                 self._model_tokens_used += actual_tokens
+            return (
+                self._initial_model_tokens
+                + self._model_tokens_used
+                + self._model_tokens_reserved
+                <= self.budget.max_total_tokens
+            )
 
     def _plan_request(self, request: ResearchRequest) -> ModelRequest:
         raw = request.model_dump(mode="json")
@@ -346,8 +369,12 @@ class FixedPlanner:
         )
         return model_request
 
-    def _repair_request(self, raw: str, report: PlanValidationReport) -> ModelRequest:
-        remaining = _remaining_token_budget(self.budget)
+    def _repair_requests(
+        self,
+        raw: str,
+        report: PlanValidationReport,
+    ) -> tuple[ModelRequest, ModelRequest | None]:
+        remaining = self._remaining_model_tokens()
         rejected = (
             None
             if len(raw) > remaining or len(raw.encode("utf-8")) > remaining
@@ -379,15 +406,9 @@ class FixedPlanner:
                 ),
             )
 
-        model_request = build(bounded)
-        if bounded is not None and _request_exceeds_budget(model_request, remaining):
-            model_request = build(None)
-        _ensure_request_within_budget(
-            model_request,
-            budget=self.budget,
-            provider=self.model.provider_id,
-        )
-        return model_request
+        if bounded is None:
+            return build(None), None
+        return build(bounded), build(None)
 
     async def _generate_candidate(
         self,
@@ -395,6 +416,7 @@ class FixedPlanner:
         *,
         deadline: Deadline,
         cancellation_token: CancellationToken,
+        local_capacity_fallback: ModelRequest | None = None,
     ) -> tuple[str, str]:
         _check_call_boundary(
             provider=self.model.provider_id,
@@ -402,6 +424,11 @@ class FixedPlanner:
             cancellation_token=cancellation_token,
         )
         reservation = self._reserve_request(request)
+        if reservation is None and local_capacity_fallback is not None:
+            request = local_capacity_fallback
+            reservation = self._reserve_request(request)
+        if reservation is None:
+            raise self._token_budget_error()
         try:
             _check_call_boundary(
                 provider=self.model.provider_id,
@@ -426,7 +453,7 @@ class FixedPlanner:
         except BaseException:
             self._settle_request(reservation, None)
             raise
-        self._settle_request(reservation, result.usage.total_tokens)
+        publishable = self._settle_request(reservation, result.usage.total_tokens)
         _check_call_boundary(
             provider=self.model.provider_id,
             deadline=deadline,
@@ -449,6 +476,8 @@ class FixedPlanner:
             cancellation_token=cancellation_token,
         )
         ref = self.artifact_store.put_bytes(data, media_type=_CANDIDATE_MEDIA_TYPE)
+        if not publishable:
+            raise self._token_budget_error()
         return raw, ref.artifact_id
 
     async def create_plan(
@@ -488,11 +517,12 @@ class FixedPlanner:
             deadline=deadline,
             cancellation_token=cancellation_token,
         )
-        repair_request = self._repair_request(raw, report)
+        repair_request, null_repair_fallback = self._repair_requests(raw, report)
         repaired_raw, repaired_artifact_id = await self._generate_candidate(
             repair_request,
             deadline=deadline,
             cancellation_token=cancellation_token,
+            local_capacity_fallback=null_repair_fallback,
         )
         repaired = self.validator.validate_candidate(
             repaired_raw,
@@ -615,6 +645,8 @@ class FixedPlanner:
                 cancellation_token=cancellation_token,
             )
             reservation = self._reserve_request(request)
+            if reservation is None:
+                raise self._token_budget_error()
             try:
                 _check_call_boundary(
                     provider=self.model.provider_id,
@@ -640,12 +672,17 @@ class FixedPlanner:
             except BaseException:
                 self._settle_request(reservation, None)
                 raise
-            self._settle_request(reservation, result.usage.total_tokens)
+            publishable = self._settle_request(
+                reservation,
+                result.usage.total_tokens,
+            )
             _check_call_boundary(
                 provider=self.model.provider_id,
                 deadline=deadline,
                 cancellation_token=cancellation_token,
             )
+            if not publishable:
+                raise self._token_budget_error()
             output = result.output
             queries: list[str] = []
             seen: set[str] = set()

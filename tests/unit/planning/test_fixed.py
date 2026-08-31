@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -98,7 +98,7 @@ class FakeModel:
 
     def __init__(
         self,
-        complete_outputs: list[str],
+        complete_outputs: Sequence[str | Exception],
         *,
         query_outputs: list[object] | None = None,
         on_complete: Callable[[], None] | None = None,
@@ -106,7 +106,7 @@ class FakeModel:
         complete_usages: list[ResourceUsage] | None = None,
         query_usages: list[ResourceUsage] | None = None,
     ) -> None:
-        self.complete_outputs = complete_outputs
+        self.complete_outputs = list(complete_outputs)
         self.query_outputs = query_outputs or [["planner optimization"]]
         self.on_complete = on_complete
         self.on_structured = on_structured
@@ -128,6 +128,8 @@ class FakeModel:
         self.complete_calls += 1
         self.complete_requests.append(request)
         output = self.complete_outputs.pop(0)
+        if isinstance(output, Exception):
+            raise output
         if self.on_complete is not None:
             self.on_complete()
         return ModelResult[str](
@@ -211,6 +213,7 @@ class ConcurrentQueryModel(FakeModel):
     def __init__(self, *, usage: ResourceUsage | None = None) -> None:
         super().__init__([], query_outputs=[])
         self.started = asyncio.Event()
+        self.all_started = asyncio.Event()
         self.release = asyncio.Event()
         self.usage = usage or ResourceUsage.zero()
 
@@ -226,6 +229,8 @@ class ConcurrentQueryModel(FakeModel):
         self.structured_calls += 1
         self.structured_requests.append(request)
         self.started.set()
+        if self.structured_calls == 2:
+            self.all_started.set()
         await self.release.wait()
         return StructuredModelResult[Any](
             output=output_schema.model_validate({"queries": ["concurrent"]}),
@@ -234,6 +239,48 @@ class ConcurrentQueryModel(FakeModel):
             model_id="fake-model",
             raw_response_artifact_id="sha256:" + "4" * 64,
             output_schema_hash="5" * 64,
+        )
+
+
+class MixedConcurrentQueryModel(FakeModel):
+    def __init__(self, *, success_usage: ResourceUsage) -> None:
+        super().__init__([], query_outputs=[])
+        self.success_usage = success_usage
+        self.success_started = asyncio.Event()
+        self.failure_started = asyncio.Event()
+        self.release_success = asyncio.Event()
+        self.release_failure = asyncio.Event()
+
+    async def structured(
+        self,
+        request: ModelRequest,
+        output_schema: type[Any],
+        *,
+        deadline: float,
+        cancellation_token: CancellationToken,
+    ) -> StructuredModelResult[Any]:
+        del deadline, cancellation_token
+        self.structured_calls += 1
+        self.structured_requests.append(request)
+        if self.structured_calls == 1:
+            self.success_started.set()
+            await self.release_success.wait()
+            return StructuredModelResult[Any](
+                output=output_schema.model_validate({"queries": ["overrun"]}),
+                usage=self.success_usage,
+                provider_id=self.provider_id,
+                model_id="fake-model",
+                raw_response_artifact_id="sha256:" + "6" * 64,
+                output_schema_hash="7" * 64,
+            )
+        self.failure_started.set()
+        await self.release_failure.wait()
+        raise ProviderError(
+            code="NETWORK",
+            provider=self.provider_id,
+            operation="structured",
+            public_message="failure without usage",
+            retryable=True,
         )
 
 
@@ -410,6 +457,41 @@ async def test_repair_prompt_contains_only_canonical_json_and_stable_codes(
     assert repair_payload == {
         "candidate": {"a": 2, "z": 1},
         "error_codes": ["INVALID_SCHEMA"],
+        "instruction": "Return one corrected ResearchPlan JSON object.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_duplicate_json_names_keep_exact_artifact_and_repair_with_null(
+    tmp_path: Path,
+) -> None:
+    raw = plan_json().replace(
+        '"plan_id":"plan-1"',
+        '"plan_id":"first","plan_id":"plan-1"',
+        1,
+    )
+    model = FakeModel([raw, plan_json()])
+    store = LocalArtifactStore(tmp_path)
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=store,
+        budget=RunBudget.preset("medium"),
+    )
+
+    plan = await planner.create_plan(
+        research_request(),
+        deadline=future_deadline(),
+        cancellation_token=CancellationToken(),
+    )
+
+    repair_payload = json.loads(model.complete_requests[1].messages[-1].content)
+    artifact_id = "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    assert plan.plan_id == "plan-1"
+    assert model.complete_calls == 2
+    assert store.get_bytes(artifact_id) == raw.encode("utf-8")
+    assert repair_payload == {
+        "candidate": None,
+        "error_codes": ["MALFORMED_JSON"],
         "instruction": "Return one corrected ResearchPlan JSON object.",
     }
 
@@ -845,6 +927,68 @@ async def test_boundary_expansion_uses_null_for_an_over_budget_repair_candidate(
 
 
 @pytest.mark.asyncio
+async def test_repair_candidate_fallback_uses_current_local_token_ledger(
+    tmp_path: Path,
+) -> None:
+    rejected = json.dumps("y" * 1_500)
+    model = FakeModel(
+        [rejected, plan_json()],
+        complete_usages=[model_usage(30_000), ResourceUsage.zero()],
+    )
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=LocalArtifactStore(tmp_path),
+        budget=RunBudget.preset("medium"),
+        content_boundary=lambda text: (
+            "x" * 30_000
+            if text == "Compare planner optimization methods."
+            else text
+        ),
+    )
+
+    plan = await planner.create_plan(
+        research_request(),
+        deadline=future_deadline(),
+        cancellation_token=CancellationToken(),
+    )
+
+    repair_payload = json.loads(model.complete_requests[1].messages[-1].content)
+    assert plan.plan_id == "plan-1"
+    assert model.complete_calls == 2
+    assert repair_payload["candidate"] is None
+    assert repair_payload["error_codes"] == ["INVALID_SCHEMA"]
+
+
+@pytest.mark.asyncio
+async def test_provider_invalid_request_during_repair_does_not_trigger_null_retry(
+    tmp_path: Path,
+) -> None:
+    provider_failure = ProviderError(
+        code="INVALID_REQUEST",
+        provider="fake-provider",
+        operation="complete",
+        public_message="provider rejected repair",
+        retryable=False,
+    )
+    model = FakeModel([json.dumps({"invalid": "candidate"}), provider_failure, plan_json()])
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=LocalArtifactStore(tmp_path),
+        budget=RunBudget.preset("medium"),
+    )
+
+    with pytest.raises(ProviderError, match="provider rejected repair") as error:
+        await planner.create_plan(
+            research_request(),
+            deadline=future_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+
+    assert error.value.code == "INVALID_REQUEST"
+    assert model.complete_calls == 2
+
+
+@pytest.mark.asyncio
 async def test_non_utf8_boundary_output_is_rejected_before_prompt_publication(
     tmp_path: Path,
 ) -> None:
@@ -997,12 +1141,13 @@ async def test_usage_larger_than_reservation_is_fully_charged(tmp_path: Path) ->
     )
     plan = ResearchPlan.model_validate_json(plan_json())
 
-    assert await planner.queries_for(
-        plan.subquestions[0],
-        plan_id="plan-a",
-        deadline=future_deadline(),
-        cancellation_token=CancellationToken(),
-    ) == ("first",)
+    with pytest.raises(ProviderError) as overrun_error:
+        await planner.queries_for(
+            plan.subquestions[0],
+            plan_id="plan-a",
+            deadline=future_deadline(),
+            cancellation_token=CancellationToken(),
+        )
     with pytest.raises(ProviderError):
         await planner.queries_for(
             plan.subquestions[0],
@@ -1011,7 +1156,138 @@ async def test_usage_larger_than_reservation_is_fully_charged(tmp_path: Path) ->
             cancellation_token=CancellationToken(),
         )
 
+    assert overrun_error.value.code == "INVALID_REQUEST"
     assert model.structured_calls == 1
+    assert vars(planner)["_model_tokens_used"] == 4_500
+    assert vars(planner)["_query_cache"] == {}
+
+
+@pytest.mark.asyncio
+async def test_over_budget_valid_plan_is_audited_but_not_returned(
+    tmp_path: Path,
+) -> None:
+    raw = plan_json()
+    model = FakeModel([raw], complete_usages=[model_usage(21_000)])
+    store = LocalArtifactStore(tmp_path)
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=store,
+        budget=RunBudget.preset("low"),
+    )
+
+    with pytest.raises(ProviderError) as error:
+        await planner.create_plan(
+            research_request(),
+            deadline=future_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+
+    artifact_id = "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    assert error.value.code == "INVALID_REQUEST"
+    assert model.complete_calls == 1
+    assert store.get_bytes(artifact_id) == raw.encode("utf-8")
+    assert vars(planner)["_model_tokens_used"] == 21_000
+
+
+@pytest.mark.asyncio
+async def test_concurrent_usage_overruns_are_charged_without_publishing_results(
+    tmp_path: Path,
+) -> None:
+    model = ConcurrentQueryModel(usage=model_usage(4_000))
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=LocalArtifactStore(tmp_path),
+        budget=RunBudget.preset("medium").model_copy(
+            update={"max_total_tokens": 6_100}
+        ),
+    )
+    plan = ResearchPlan.model_validate_json(plan_json())
+    tasks = tuple(
+        asyncio.create_task(
+            planner.queries_for(
+                plan.subquestions[0],
+                plan_id=plan_id,
+                deadline=future_deadline(),
+                cancellation_token=CancellationToken(),
+            )
+        )
+        for plan_id in ("plan-a", "plan-b")
+    )
+    await asyncio.wait_for(model.all_started.wait(), timeout=0.3)
+    model.release.set()
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert all(
+        isinstance(result, ProviderError) and result.code == "INVALID_REQUEST"
+        for result in results
+    )
+    assert vars(planner)["_model_tokens_used"] == 8_000
+    assert vars(planner)["_model_tokens_reserved"] == 0
+    assert vars(planner)["_query_cache"] == {}
+    with pytest.raises(ProviderError) as later_error:
+        await planner.queries_for(
+            plan.subquestions[0],
+            plan_id="plan-c",
+            deadline=future_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+    assert later_error.value.code == "INVALID_REQUEST"
+    assert model.structured_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_overrun_cannot_publish_while_an_inflight_reservation_later_fails(
+    tmp_path: Path,
+) -> None:
+    model = MixedConcurrentQueryModel(success_usage=model_usage(4_000))
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=LocalArtifactStore(tmp_path),
+        budget=RunBudget.preset("medium").model_copy(
+            update={"max_total_tokens": 6_100}
+        ),
+    )
+    plan = ResearchPlan.model_validate_json(plan_json())
+    success = asyncio.create_task(
+        planner.queries_for(
+            plan.subquestions[0],
+            plan_id="plan-success",
+            deadline=future_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+    )
+    await asyncio.wait_for(model.success_started.wait(), timeout=0.3)
+    failure = asyncio.create_task(
+        planner.queries_for(
+            plan.subquestions[0],
+            plan_id="plan-failure",
+            deadline=future_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+    )
+    await asyncio.wait_for(model.failure_started.wait(), timeout=0.3)
+    model.release_success.set()
+    success_result = (await asyncio.gather(success, return_exceptions=True))[0]
+    model.release_failure.set()
+    failure_result = (await asyncio.gather(failure, return_exceptions=True))[0]
+
+    assert isinstance(success_result, ProviderError)
+    assert success_result.code == "INVALID_REQUEST"
+    assert isinstance(failure_result, ProviderError)
+    assert failure_result.code == "NETWORK"
+    assert failure_result.usage is None
+    assert vars(planner)["_model_tokens_used"] == 4_000
+    assert vars(planner)["_model_tokens_reserved"] == 0
+    assert vars(planner)["_query_cache"] == {}
+    with pytest.raises(ProviderError):
+        await planner.queries_for(
+            plan.subquestions[0],
+            plan_id="plan-later",
+            deadline=future_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+    assert model.structured_calls == 2
 
 
 @pytest.mark.asyncio

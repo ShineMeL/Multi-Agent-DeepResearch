@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator, Mapping
 from copy import deepcopy
 from datetime import date
 
@@ -671,3 +672,98 @@ def test_equivalent_str_and_bytes_candidates_share_the_utf8_byte_limit() -> None
 
     assert len(raw) < 1_000_000 < len(encoded)
     assert text_report.error_codes == bytes_report.error_codes == ("MALFORMED_JSON",)
+
+
+@pytest.mark.parametrize("as_bytes", [False, True], ids=("text", "bytes"))
+def test_textual_json_rejects_duplicate_object_names_before_dict_construction(
+    as_bytes: bool,
+) -> None:
+    raw = json.dumps(valid_candidate(), separators=(",", ":"))
+    duplicate = raw.replace(
+        '"plan_id":"plan-1"',
+        '"plan_id":"first","plan_id":"plan-1"',
+        1,
+    )
+    candidate: str | bytes = duplicate.encode("utf-8") if as_bytes else duplicate
+
+    report = PlanValidator().validate_candidate(
+        candidate,
+        request=research_request(),
+        budget=RunBudget.preset("medium"),
+        candidate_artifact_id="sha256:" + "b" * 64,
+    )
+
+    assert report.valid is False
+    assert report.candidate is None
+    assert report.error_codes == ("MALFORMED_JSON",)
+    assert report.candidate_artifact_id == "sha256:" + "b" * 64
+
+
+@pytest.mark.parametrize(
+    "lookup_fault",
+    [
+        StopIteration("synthetic advertised-key termination"),
+        RuntimeError("synthetic mapping lookup fault"),
+    ],
+    ids=("stop-iteration", "ordinary-runtime-fault"),
+)
+def test_snapshot_rejects_mapping_lookup_faults_without_truncating(
+    lookup_fault: Exception,
+) -> None:
+    class FaultingLookupMapping(Mapping[str, object]):
+        def __init__(self, values: dict[str, object]) -> None:
+            self._items = values
+
+        def __iter__(self) -> Iterator[str]:
+            return iter((*self._items, "advertised-key"))
+
+        def __len__(self) -> int:
+            return len(self._items) + 1
+
+        def __getitem__(self, key: str) -> object:
+            if key == "advertised-key":
+                raise lookup_fault
+            return self._items[key]
+
+    report = PlanValidator().validate_candidate(
+        FaultingLookupMapping(valid_candidate()),
+        request=None,
+        budget=None,
+    )
+
+    assert report.valid is False
+    assert report.candidate is None
+    assert report.error_codes == ("INVALID_SCHEMA",)
+
+
+def test_snapshot_materializes_exact_builtin_json_scalar_types() -> None:
+    class CallerString(str):
+        def strip(self, *args: object, **kwargs: object) -> str:
+            del args, kwargs
+            raise KeyError("snapshot retained caller string")
+
+    class CallerInt(int):
+        pass
+
+    class CallerFloat(float):
+        pass
+
+    candidate = valid_candidate()
+    candidate["subquestions"][0]["question"] = CallerString(  # type: ignore[index]
+        "Which planner optimization methods are documented?"
+    )
+    candidate["subquestions"][0]["importance"] = CallerFloat(0.8)  # type: ignore[index]
+    candidate["subquestions"][0]["evidence_requirements"][  # type: ignore[index]
+        "min_independent_sources"
+    ] = CallerInt(1)
+
+    report = PlanValidator().validate_candidate(candidate, request=None, budget=None)
+
+    assert report.valid is True
+    assert report.candidate is not None
+    subquestion = report.candidate.subquestions[0]
+    assert type(subquestion.question) is str
+    assert type(subquestion.importance) is float
+    assert type(subquestion.evidence_requirements.min_independent_sources) is int
+    assert type(subquestion.evidence_requirements.must_include_primary) is bool
+    assert subquestion.evidence_requirements.freshness is None
