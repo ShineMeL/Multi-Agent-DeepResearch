@@ -285,9 +285,11 @@ class BudgetAccountant:
                 getattr(restored, field) < getattr(original, field)
                 for field in additive_fields
             ) or (
-                budget_value.max_cost_usd is not None
-                and (restored.cost_usd or Decimal(0))
-                < (original.cost_usd or Decimal(0))
+                original.cost_usd is not None
+                and (
+                    restored.cost_usd is None
+                    or restored.cost_usd < original.cost_usd
+                )
             ):
                 raise ValueError("budget snapshot rewinds configured seed history")
         seeded_budget = budget_value.model_copy(

@@ -553,6 +553,34 @@ def test_from_snapshot_preserves_unknown_cost_mode_and_observation_exactly() -> 
     assert restored.snapshot().last_observed_usage.cost_usd is None
 
 
+@pytest.mark.parametrize("rewound_cost", ["0.10", None])
+def test_from_snapshot_rejects_cost_disabled_seed_cost_rewind(
+    rewound_cost: str | None,
+) -> None:
+    preset = RunBudget.preset("low")
+    budget = preset.model_copy(
+        update={
+            "max_cost_usd": None,
+            "used_by_node": {
+                **preset.used_by_node,
+                "Tool": usage(tokens=3, cost="0.25"),
+            },
+        }
+    )
+    rewound_budget = budget.model_copy(
+        update={
+            "used_by_node": {
+                **budget.used_by_node,
+                "Tool": usage(tokens=3, cost=rewound_cost),
+            }
+        }
+    )
+    rewound = BudgetAccountant(rewound_budget).snapshot()
+
+    with pytest.raises(ValueError, match="seed|history|rewind"):
+        BudgetAccountant.from_snapshot(budget, rewound)
+
+
 def test_from_snapshot_does_not_restore_reservation_objects_or_indexes() -> None:
     budget = RunBudget.preset("low")
     original = BudgetAccountant(budget, run_scope="same")
