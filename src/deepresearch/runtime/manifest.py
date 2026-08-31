@@ -815,20 +815,12 @@ class RunManifest(_ManifestModel):
                     raise ValueError(
                         "provider calls must be chronological and non-overlapping"
                     )
-                if call.attempt == 1:
-                    expected_attempt = 2
-                elif call.attempt == expected_attempt:
-                    expected_attempt += 1
-                else:
+                if call.attempt != expected_attempt:
                     raise ValueError(
                         "provider invocation attempts must start at one and be contiguous"
                     )
-                derived_retry = int(call.attempt > 1)
-                if call.usage.retries != derived_retry:
-                    raise ValueError(
-                        "provider call retry usage does not match invocation history"
-                    )
-                retries_by_execution[execution_index] += derived_retry
+                expected_attempt += 1
+                retries_by_execution[execution_index] += call.usage.retries
                 previous = call
         return tuple(retries_by_execution)
 
