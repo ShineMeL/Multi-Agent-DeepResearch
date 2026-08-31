@@ -930,7 +930,7 @@ async def test_boundary_expansion_uses_null_for_an_over_budget_repair_candidate(
 async def test_repair_candidate_fallback_uses_current_local_token_ledger(
     tmp_path: Path,
 ) -> None:
-    rejected = json.dumps("y" * 1_500)
+    rejected = json.dumps("y" * 15_000)
     model = FakeModel(
         [rejected, plan_json()],
         complete_usages=[model_usage(30_000), ResourceUsage.zero()],
@@ -938,7 +938,9 @@ async def test_repair_candidate_fallback_uses_current_local_token_ledger(
     planner = FixedPlanner(
         model=model,
         artifact_store=LocalArtifactStore(tmp_path),
-        budget=RunBudget.preset("medium"),
+        budget=RunBudget.preset("medium").model_copy(
+            update={"max_total_tokens": 50_000}
+        ),
         content_boundary=lambda text: (
             "x" * 30_000
             if text == "Compare planner optimization methods."
@@ -1187,6 +1189,38 @@ async def test_over_budget_valid_plan_is_audited_but_not_returned(
     assert model.complete_calls == 1
     assert store.get_bytes(artifact_id) == raw.encode("utf-8")
     assert vars(planner)["_model_tokens_used"] == 21_000
+
+
+@pytest.mark.asyncio
+async def test_settled_planner_usage_is_included_once_before_plan_publication(
+    tmp_path: Path,
+) -> None:
+    raw = plan_json()
+    model = FakeModel([raw], complete_usages=[model_usage(11_000)])
+    original_budget = RunBudget.preset("low")
+    original_usage = dict(original_budget.used_by_node)
+    original_usage["Planner"] = model_usage(1_000)
+    budget = original_budget.model_copy(update={"used_by_node": original_usage})
+    store = LocalArtifactStore(tmp_path)
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=store,
+        budget=budget,
+    )
+
+    with pytest.raises(ProviderError) as error:
+        await planner.create_plan(
+            research_request(),
+            deadline=future_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+
+    artifact_id = "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    assert error.value.code == "INVALID_REQUEST"
+    assert model.complete_calls == 1
+    assert store.get_bytes(artifact_id) == raw.encode("utf-8")
+    assert budget.used_by_node["Planner"].total_tokens == 1_000
+    assert vars(planner)["_model_tokens_used"] == 11_000
 
 
 @pytest.mark.asyncio

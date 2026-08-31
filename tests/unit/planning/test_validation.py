@@ -661,6 +661,42 @@ def test_plan_validator_propagates_system_and_programmer_faults(
         PlanValidator().validate_candidate(candidate, request=None, budget=None)
 
 
+@pytest.mark.parametrize(
+    "fault_site",
+    ("iterator-creation", "iterator-advance", "mapping-lookup"),
+)
+def test_plan_validator_propagates_system_error_from_mapping_traversal(
+    fault_site: str,
+) -> None:
+    class FaultingIterator(Iterator[str]):
+        def __next__(self) -> str:
+            raise SystemError("synthetic mapping traversal fault")
+
+    class FaultingMapping(Mapping[str, object]):
+        def __iter__(self) -> Iterator[str]:
+            if fault_site == "iterator-creation":
+                raise SystemError("synthetic mapping traversal fault")
+            if fault_site == "iterator-advance":
+                return FaultingIterator()
+            return iter(("advertised-key",))
+
+        def __len__(self) -> int:
+            return 1
+
+        def __getitem__(self, key: str) -> object:
+            del key
+            if fault_site == "mapping-lookup":
+                raise SystemError("synthetic mapping traversal fault")
+            raise AssertionError("lookup is unreachable at this fault site")
+
+    with pytest.raises(SystemError, match="synthetic mapping traversal fault"):
+        PlanValidator().validate_candidate(
+            FaultingMapping(),
+            request=None,
+            budget=None,
+        )
+
+
 def test_equivalent_str_and_bytes_candidates_share_the_utf8_byte_limit() -> None:
     raw = json.dumps("界" * 350_000, ensure_ascii=False)
     encoded = raw.encode("utf-8")

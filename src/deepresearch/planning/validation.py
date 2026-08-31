@@ -118,7 +118,7 @@ def _bounded_json_snapshot(value: object) -> tuple[bool, JsonValue | None]:
             except StopIteration:
                 active_containers.remove(container_id)
                 continue
-            except (MemoryError, OSError, AssertionError):
+            except (MemoryError, OSError, AssertionError, SystemError):
                 raise
             except Exception:  # noqa: BLE001 - ordinary candidate iterator fault
                 return False, None
@@ -139,7 +139,7 @@ def _bounded_json_snapshot(value: object) -> tuple[bool, JsonValue | None]:
                     return False, None
                 try:
                     child = cast("Mapping[object, object]", source)[key]
-                except (MemoryError, OSError, AssertionError):
+                except (MemoryError, OSError, AssertionError, SystemError):
                     raise
                 except Exception:  # noqa: BLE001 - ordinary candidate lookup fault
                     return False, None
@@ -193,7 +193,7 @@ def _bounded_json_snapshot(value: object) -> tuple[bool, JsonValue | None]:
             _attach_snapshot(destination, destination_key, snapshot_mapping)
             try:
                 iterator = iter(mapping)
-            except (MemoryError, OSError, AssertionError):
+            except (MemoryError, OSError, AssertionError, SystemError):
                 raise
             except Exception:  # noqa: BLE001 - ordinary candidate iterator fault
                 return False, None
@@ -217,7 +217,7 @@ def _bounded_json_snapshot(value: object) -> tuple[bool, JsonValue | None]:
             _attach_snapshot(destination, destination_key, snapshot_sequence)
             try:
                 iterator = iter(sequence)
-            except (MemoryError, OSError, AssertionError):
+            except (MemoryError, OSError, AssertionError, SystemError):
                 raise
             except Exception:  # noqa: BLE001 - ordinary candidate iterator fault
                 return False, None

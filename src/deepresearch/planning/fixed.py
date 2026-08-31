@@ -12,7 +12,13 @@ from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
-from deepresearch.domain import ResearchPlan, ResearchRequest, RunBudget, SubQuestion
+from deepresearch.domain import (
+    ResearchPlan,
+    ResearchRequest,
+    ResourceUsage,
+    RunBudget,
+    SubQuestion,
+)
 from deepresearch.providers import (
     Deadline,
     ModelMessage,
@@ -345,6 +351,19 @@ class FixedPlanner:
                 <= self.budget.max_total_tokens
             )
 
+    def _effective_budget(self) -> RunBudget:
+        with self._token_lock:
+            local_tokens = self._model_tokens_used
+        used_by_node = dict(self.budget.used_by_node)
+        planner_usage = used_by_node.get("Planner", ResourceUsage.zero())
+        used_by_node["Planner"] = planner_usage.model_copy(
+            update={
+                "input_tokens": planner_usage.input_tokens + local_tokens,
+                "total_tokens": planner_usage.total_tokens + local_tokens,
+            }
+        )
+        return self.budget.model_copy(update={"used_by_node": used_by_node})
+
     def _plan_request(self, request: ResearchRequest) -> ModelRequest:
         raw = request.model_dump(mode="json")
         payload = {
@@ -501,7 +520,7 @@ class FixedPlanner:
         report = self.validator.validate_candidate(
             raw,
             request=request,
-            budget=self.budget,
+            budget=self._effective_budget(),
             candidate_artifact_id=artifact_id,
         )
         if report.valid and report.candidate is not None:
@@ -527,7 +546,7 @@ class FixedPlanner:
         repaired = self.validator.validate_candidate(
             repaired_raw,
             request=request,
-            budget=self.budget,
+            budget=self._effective_budget(),
             candidate_artifact_id=repaired_artifact_id,
         )
         if not repaired.valid or repaired.candidate is None:
