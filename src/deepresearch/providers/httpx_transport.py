@@ -234,6 +234,7 @@ class PinnedPeerTransport:
             headers={"accept": "text/html, application/pdf"},
         )
         response: httpx.Response | None = None
+        failure: ProviderError | None = None
         try:
             response = await await_with_controls(
                 response_context.__aenter__(),
@@ -257,6 +258,30 @@ class PinnedPeerTransport:
             )
             response.extensions["peer_ip"] = peer_ip
             yield response
+        except httpcore.TimeoutException:
+            failure = ProviderError(
+                code="TIMEOUT",
+                provider=provider_id,
+                operation=operation,
+                public_message="fetch network operation timed out",
+                retryable=True,
+            )
+        except httpcore.ProtocolError:
+            failure = ProviderError(
+                code="INVALID_RESPONSE",
+                provider=provider_id,
+                operation=operation,
+                public_message="fetch peer returned invalid HTTP framing",
+                retryable=False,
+            )
+        except (httpcore.NetworkError, OSError):
+            failure = ProviderError(
+                code="NETWORK",
+                provider=provider_id,
+                operation=operation,
+                public_message="fetch network operation failed",
+                retryable=True,
+            )
         finally:
             if response is not None:
                 with contextlib.suppress(Exception):
@@ -265,6 +290,13 @@ class PinnedPeerTransport:
                 await response_context.__aexit__(None, None, None)
             with contextlib.suppress(Exception):
                 await client.aclose()
+        if failure is not None:
+            try:
+                raise failure from None
+            except ProviderError:
+                failure.__cause__ = None
+                failure.__context__ = None
+                raise
 
 
 __all__ = ["PinnedPeerTransport"]

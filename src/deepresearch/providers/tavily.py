@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Mapping
 from math import isfinite
 from typing import cast
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import httpx
 from pydantic import JsonValue, SecretStr, ValidationError
@@ -16,11 +17,52 @@ from deepresearch.providers import (
     ProviderCallPolicy,
     ProviderError,
     ProviderErrorCode,
+    ProviderUsageResult,
     SearchHit,
 )
+from deepresearch.retrieval import URLSecurityError, canonicalize_url
 from deepresearch.runtime import CancellationToken
 
 from .httpx_transport import await_with_controls, checkpoint
+
+_RESULT_CREDENTIAL_ASSIGNMENT = re.compile(
+    r"(?i)(?<![a-z0-9])(?:api[_ .-]?key|access[_ .-]?key|authorization|auth|"
+    r"bearer|cookie|credential|password|passwd|secret|private[_ .-]?key|"
+    r"session(?:[_ .-]?(?:id|token))?|access[_ .-]?token|token)"
+    r"(?![a-z0-9])\s*(?:=|:)\s*[^\s&,;/#]+"
+)
+_RESULT_OPAQUE_CREDENTIAL = re.compile(
+    r"(?i)(?:^|[^a-z0-9])(?:sk[-_](?:(?:proj|live|test)[-_])?[a-z0-9_-]{6,}|"
+    r"(?:gh[opsu]|github_pat)_[a-z0-9_]{6,}|xox[baprs]-[a-z0-9-]{6,})"
+    r"(?:$|[^a-z0-9])"
+)
+
+
+def _bounded_decode(value: str) -> str:
+    current = value
+    for _ in range(6):
+        decoded = unquote(current, encoding="utf-8", errors="strict")
+        if decoded == current:
+            return current
+        current = decoded
+    raise ValueError("search result URL encoding exceeds the safety bound")
+
+
+def _result_url_is_safe(url: str) -> bool:
+    try:
+        canonicalize_url(url)
+        split = urlsplit(url)
+        decoded = "\n".join(
+            _bounded_decode(part) for part in (split.path, split.query, split.fragment)
+        )
+    except (TypeError, UnicodeError, ValueError, URLSecurityError):
+        return False
+    return (
+        split.username is None
+        and split.password is None
+        and _RESULT_CREDENTIAL_ASSIGNMENT.search(decoded) is None
+        and _RESULT_OPAQUE_CREDENTIAL.search(decoded) is None
+    )
 
 
 def _search_usage(*, retries: int = 0, wall_seconds: float = 0) -> ResourceUsage:
@@ -59,7 +101,6 @@ class TavilySearchProvider:
             trust_env=False,
         )
         self._owns_client = client is None
-        self.last_usage: ResourceUsage | None = None
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(provider_id={self.provider_id!r})"
@@ -217,6 +258,8 @@ class TavilySearchProvider:
                 snippet = raw_mapping.get("content")
                 if not all(isinstance(item, str) for item in (url, title, snippet)):
                     raise TypeError
+                if not _result_url_is_safe(cast("str", url)):
+                    raise ValueError
                 metadata: dict[str, JsonValue] = {}
                 score = raw_mapping.get("score")
                 if score is not None:
@@ -260,17 +303,31 @@ class TavilySearchProvider:
         deadline: float,
         cancellation_token: CancellationToken,
     ) -> list[SearchHit]:
+        return (
+            await self.search_with_usage(
+                query,
+                limit,
+                filters,
+                deadline=deadline,
+                cancellation_token=cancellation_token,
+            )
+        ).value
+
+    async def search_with_usage(
+        self,
+        query: str,
+        limit: int,
+        filters: Mapping[str, JsonValue] | None,
+        *,
+        deadline: float,
+        cancellation_token: CancellationToken,
+    ) -> ProviderUsageResult[list[SearchHit]]:
         checkpoint(
             deadline=deadline,
             cancellation_token=cancellation_token,
             provider_id=self.provider_id,
             operation="search",
         )
-        before = len(self._executor.attempts)
-        started = time.monotonic()
-        caught: ProviderError | None = None
-        result: list[SearchHit] | None = None
-
         async def invoke(call_deadline: float) -> list[SearchHit]:
             return await self._search_once(
                 query,
@@ -280,33 +337,27 @@ class TavilySearchProvider:
                 cancellation_token=cancellation_token,
             )
 
-        try:
-            result = await self._executor.call(
-                "search", invoke, remaining_deadline=deadline
-            )
-        except ProviderError as error:
-            caught = error
-        attempts = self._executor.attempts[before:]
-        retries = sum(attempt.attempt_index > 0 for attempt in attempts)
-        usage = _search_usage(
-            retries=retries,
-            wall_seconds=max(0, time.monotonic() - started),
+        outcome = await self._executor.call_with_trace(
+            "search", invoke, remaining_deadline=deadline
         )
-        self.last_usage = usage
-        if caught is not None:
+        usage = _search_usage(
+            retries=outcome.trace.retries,
+            wall_seconds=outcome.trace.wall_seconds,
+        )
+        if outcome.error is not None:
             failure = ProviderError(
-                code=caught.code,
+                code=outcome.error.code,
                 provider=self.provider_id,
                 operation="search",
-                public_message=caught.public_message,
-                retryable=caught.retryable,
-                retry_after=caught.retry_after,
+                public_message=outcome.error.public_message,
+                retryable=outcome.error.retryable,
+                retry_after=outcome.error.retry_after,
                 usage=usage,
             )
-            raise failure
-        if result is None:
+            raise failure from None
+        if outcome.result is None:
             raise RuntimeError("search executor returned no result")
-        return result
+        return ProviderUsageResult(value=outcome.result, usage=usage)
 
 
 __all__ = ["TavilySearchProvider"]

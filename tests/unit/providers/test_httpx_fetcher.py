@@ -87,6 +87,22 @@ class SequenceTransport:
             await response.aclose()
 
 
+class ProtocolFailureTransport:
+    @asynccontextmanager
+    async def stream(
+        self,
+        url: str,
+        *,
+        pinned_ip: str,
+        deadline: float,
+        cancellation_token: CancellationToken,
+    ) -> AsyncIterator[httpx.Response]:
+        del url, pinned_ip, deadline, cancellation_token
+        raise httpcore.RemoteProtocolError("TOP-SECRET malformed peer bytes")
+        if False:
+            yield httpx.Response(200)
+
+
 def _resolver(
     values: Mapping[str, tuple[str, ...]],
 ) -> Callable[[str, int], Awaitable[tuple[ipaddress.IPv4Address, ...]]]:
@@ -119,17 +135,16 @@ class RecordingHostSlot:
 
 
 class RecordingNetworkStream(httpcore.AsyncMockStream):
-    def __init__(self) -> None:
-        super().__init__(
-            [
-                (
-                    b"HTTP/1.1 200 OK\r\n"
-                    b"Content-Type: text/html\r\n"
-                    b"Content-Length: 2\r\n"
-                    b"Connection: close\r\n\r\nOK"
-                )
-            ]
-        )
+    def __init__(
+        self,
+        response_bytes: bytes = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/html\r\n"
+            b"Content-Length: 2\r\n"
+            b"Connection: close\r\n\r\nOK"
+        ),
+    ) -> None:
+        super().__init__([response_bytes])
         self.writes: list[bytes] = []
         self.server_hostname: str | None = None
 
@@ -195,6 +210,42 @@ async def test_pinned_transport_preserves_host_and_tls_sni_while_pinning_tcp(
     assert stream.server_hostname == "public.test"
     assert b"Host: public.test" in request_bytes
     assert b"127.0.0.1:9" not in request_bytes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response_bytes",
+    (
+        b"HTTP/1.1 INVALID\r\nContent-Length: 0\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nMalformed Header\r\n\r\n",
+        (
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\nNOT-A-CHUNK\r\n"
+        ),
+    ),
+)
+async def test_pinned_transport_maps_malformed_http_framing_to_typed_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    response_bytes: bytes,
+) -> None:
+    stream = RecordingNetworkStream(response_bytes)
+    monkeypatch.setattr(
+        httpcore, "AnyIOBackend", lambda: RecordingNetworkBackend(stream)
+    )
+
+    with pytest.raises(ProviderError) as error:
+        async with PinnedPeerTransport().stream(
+            "https://public.test/article",
+            pinned_ip="93.184.216.34",
+            deadline=_deadline(),
+            cancellation_token=CancellationToken(),
+        ) as response:
+            await response.aread()
+
+    assert error.value.code == "INVALID_RESPONSE"
+    assert "INVALID" not in error.value.public_message
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
 
 
 @pytest.mark.asyncio
@@ -343,6 +394,26 @@ async def test_fetcher_maps_dns_failure_to_typed_network_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fetcher_maps_raw_protocol_failure_to_sanitized_invalid_response() -> None:
+    fetcher = HttpxFetcher(
+        transport=ProtocolFailureTransport(),  # type: ignore[arg-type]
+        resolver=_resolver({"public.test": ("93.184.216.34",)}),
+    )
+
+    with pytest.raises(ProviderError) as error:
+        await fetcher.fetch(
+            "https://public.test/article",
+            deadline=_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+
+    assert error.value.code == "INVALID_RESPONSE"
+    assert "TOP-SECRET" not in str(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+
+
+@pytest.mark.asyncio
 async def test_redirect_reacquires_host_slot_for_each_hostname() -> None:
     transport = SequenceTransport(
         ResponseSpec(
@@ -425,13 +496,15 @@ async def test_fetcher_accepts_body_at_exact_limit_and_closes_response() -> None
         max_body_bytes=5,
     )
 
-    document = await fetcher.fetch(
+    outcome = await fetcher.fetch_with_usage(
         "https://public.test/article",
         deadline=_deadline(),
         cancellation_token=CancellationToken(),
     )
 
-    assert document.body_bytes == b"12345"
+    assert outcome.value.body_bytes == b"12345"
+    assert outcome.usage.pages == 1
+    assert outcome.usage.retries == 0
     assert transport.streams[0].closed is True
 
 

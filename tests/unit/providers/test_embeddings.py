@@ -1,13 +1,16 @@
 import json
+import os
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
 
+from deepresearch.providers import embeddings as embeddings_module
 from deepresearch.providers.embeddings import (
     DeterministicHashTextEmbedder,
     EmbeddingModelFile,
@@ -229,6 +232,159 @@ def test_fetch_and_lock_replace_recovers_corrupt_existing_lock(tmp_path: Path) -
 
     assert EmbeddingModelLock.load(lock_path) == lock
     assert lock.verify(model_root) is None
+
+
+def test_fetch_and_lock_first_install_removes_root_when_lock_publish_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    revision = "6" * 40
+    model_root = tmp_path / "embedding"
+    lock_path = tmp_path / "embedding.lock.json"
+    original_replace = os.replace
+
+    def fail_staged_lock_publish(source: Path | str, destination: Path | str) -> None:
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if source_path.name.startswith(".embedding.lock.json.staging."):
+            raise OSError("synthetic lock publish failure")
+        original_replace(source_path, destination_path)
+
+    monkeypatch.setattr(os, "replace", fail_staged_lock_publish)
+
+    with pytest.raises(OSError, match="lock publish"):
+        fetch_and_lock(
+            model_id="synthetic/model",
+            revision=revision,
+            model_root=model_root,
+            lock_path=lock_path,
+            revision_resolver=lambda model_id, requested: requested,
+            snapshot_downloader=lambda model_id, requested, destination: (
+                destination / "config.json"
+            ).write_bytes(SYNTHETIC_CONFIG),
+        )
+
+    assert not model_root.exists()
+    assert not lock_path.exists()
+    assert not list(tmp_path.glob(".*.staging.*"))
+
+
+@pytest.mark.parametrize("cleanup_target", ("root", "lock"))
+def test_fetch_and_lock_backup_cleanup_failure_keeps_committed_new_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_target: str,
+) -> None:
+    model_root = tmp_path / "embedding"
+    lock_path = tmp_path / "embedding.lock.json"
+
+    def download_old(model_id: str, revision: str, destination: Path) -> None:
+        del model_id, revision
+        (destination / "config.json").write_bytes(b'{"version":"old"}\n')
+
+    def download_new(model_id: str, revision: str, destination: Path) -> None:
+        del model_id, revision
+        (destination / "config.json").write_bytes(b'{"version":"new"}\n')
+
+    fetch_and_lock(
+        model_id="synthetic/model",
+        revision="7" * 40,
+        model_root=model_root,
+        lock_path=lock_path,
+        revision_resolver=lambda model_id, requested: requested,
+        snapshot_downloader=download_old,
+    )
+    original_remove_tree = embeddings_module._remove_owned_tree
+    original_unlink = Path.unlink
+
+    def fail_root_backup_cleanup(root: Path, *, parent: Path) -> None:
+        if cleanup_target == "root" and ".embedding.backup." in root.name:
+            raise OSError("synthetic root backup cleanup failure")
+        original_remove_tree(root, parent=parent)
+
+    def fail_lock_backup_cleanup(path: Path, missing_ok: bool = False) -> None:
+        if cleanup_target == "lock" and ".embedding.lock.json.backup." in path.name:
+            raise OSError("synthetic lock backup cleanup failure")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(embeddings_module, "_remove_owned_tree", fail_root_backup_cleanup)
+    monkeypatch.setattr(Path, "unlink", fail_lock_backup_cleanup)
+
+    with pytest.raises(OSError, match="cleanup"):
+        fetch_and_lock(
+            model_id="synthetic/model",
+            revision="8" * 40,
+            model_root=model_root,
+            lock_path=lock_path,
+            replace=True,
+            revision_resolver=lambda model_id, requested: requested,
+            snapshot_downloader=download_new,
+        )
+
+    committed_lock = EmbeddingModelLock.load(lock_path)
+    assert committed_lock.revision == "8" * 40
+    assert committed_lock.verify(model_root) is None
+    assert (model_root / "config.json").read_bytes() == b'{"version":"new"}\n'
+
+
+@pytest.mark.parametrize("publish_target", ("root", "lock"))
+def test_fetch_and_lock_replacement_precommit_failure_restores_old_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    publish_target: str,
+) -> None:
+    model_root = tmp_path / "embedding"
+    lock_path = tmp_path / "embedding.lock.json"
+
+    def download(content: bytes) -> Callable[[str, str, Path], None]:
+        def write(model_id: str, revision: str, destination: Path) -> None:
+            del model_id, revision
+            (destination / "config.json").write_bytes(content)
+
+        return write
+
+    old_lock = fetch_and_lock(
+        model_id="synthetic/model",
+        revision="9" * 40,
+        model_root=model_root,
+        lock_path=lock_path,
+        revision_resolver=lambda model_id, requested: requested,
+        snapshot_downloader=download(b'{"version":"old"}\n'),
+    )
+    original_replace = os.replace
+
+    def fail_selected_publish(source: Path | str, destination: Path | str) -> None:
+        source_path = Path(source)
+        destination_path = Path(destination)
+        is_root_publish = (
+            destination_path == model_root
+            and source_path.name.startswith(".embedding.staging.")
+        )
+        is_lock_publish = (
+            destination_path == lock_path
+            and source_path.name.startswith(".embedding.lock.json.staging.")
+        )
+        if (publish_target == "root" and is_root_publish) or (
+            publish_target == "lock" and is_lock_publish
+        ):
+            raise OSError(f"synthetic {publish_target} publish failure")
+        original_replace(source_path, destination_path)
+
+    monkeypatch.setattr(os, "replace", fail_selected_publish)
+
+    with pytest.raises(OSError, match="publish failure"):
+        fetch_and_lock(
+            model_id="synthetic/model",
+            revision="a" * 40,
+            model_root=model_root,
+            lock_path=lock_path,
+            replace=True,
+            revision_resolver=lambda model_id, requested: requested,
+            snapshot_downloader=download(b'{"version":"new"}\n'),
+        )
+
+    assert EmbeddingModelLock.load(lock_path) == old_lock
+    assert old_lock.verify(model_root) is None
+    assert (model_root / "config.json").read_bytes() == b'{"version":"old"}\n'
 
 
 def test_production_embedding_lock_pins_official_snapshot_without_model_bytes() -> None:

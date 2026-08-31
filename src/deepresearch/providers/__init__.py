@@ -1,6 +1,22 @@
 from .errors import ProviderError, ProviderErrorCode
-from .protocols import Fetcher, ModelProvider, Parser, Reranker, SearchProvider, TextEmbedder
-from .resilience import ProviderCallAttempt, ProviderCallExecutor, ProviderCallPolicy
+from .protocols import (
+    Fetcher,
+    ModelProvider,
+    Parser,
+    ProviderUsageResult,
+    Reranker,
+    SearchProvider,
+    TextEmbedder,
+    UsageReportingFetcher,
+    UsageReportingSearchProvider,
+)
+from .resilience import (
+    ProviderCallAttempt,
+    ProviderCallExecutor,
+    ProviderCallPolicy,
+    ProviderInvocationOutcome,
+    ProviderInvocationTrace,
+)
 from .types import (
     Deadline,
     ModelMessage,
@@ -33,6 +49,9 @@ __all__ = [
     "ProviderCallPolicy",
     "ProviderError",
     "ProviderErrorCode",
+    "ProviderInvocationOutcome",
+    "ProviderInvocationTrace",
+    "ProviderUsageResult",
     "RawDocument",
     "Reranker",
     "SearchHit",
@@ -40,6 +59,8 @@ __all__ = [
     "StructuredModelResult",
     "TextEmbedder",
     "ToolCall",
+    "UsageReportingFetcher",
+    "UsageReportingSearchProvider",
     "validate_embeddings",
     "validate_model_stream",
 ]

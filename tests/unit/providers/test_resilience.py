@@ -1,3 +1,5 @@
+import asyncio
+import time
 from random import Random
 
 import pytest
@@ -299,3 +301,71 @@ async def test_final_jittered_delay_is_capped_by_policy_maximum() -> None:
 
     assert await executor.call("fetch", call, remaining_deadline=100.0) == "ok"
     assert sleeper.delays == [4.0]
+
+
+@pytest.mark.asyncio
+async def test_invocation_trace_is_scoped_to_one_overlapping_call() -> None:
+    policy = ProviderCallPolicy(
+        default_timeout_seconds=ProviderCallPolicy.defaults().default_timeout_seconds,
+        max_retries=1,
+        base_delay_seconds=0,
+        max_delay_seconds=0,
+        jitter_ratio=0,
+    )
+    executor = ProviderCallExecutor(policy=policy)
+    retry_attempts = 0
+    retry_started = asyncio.Event()
+
+    async def retrying(deadline: float) -> str:
+        nonlocal retry_attempts
+        del deadline
+        retry_attempts += 1
+        if retry_attempts == 1:
+            raise provider_error("NETWORK", retryable=True)
+        retry_started.set()
+        return "retried"
+
+    async def clean(deadline: float) -> str:
+        del deadline
+        await retry_started.wait()
+        return "clean"
+
+    retried, untouched = await asyncio.gather(
+        executor.call_with_trace(
+            "search", retrying, remaining_deadline=time.monotonic() + 10
+        ),
+        executor.call_with_trace(
+            "search", clean, remaining_deadline=time.monotonic() + 10
+        ),
+    )
+
+    assert retried.result == "retried"
+    assert retried.error is None
+    assert retried.trace.retries == 1
+    assert [attempt.attempt_index for attempt in retried.trace.attempts] == [0, 1]
+    assert untouched.result == "clean"
+    assert untouched.error is None
+    assert untouched.trace.retries == 0
+    assert [attempt.attempt_index for attempt in untouched.trace.attempts] == [0]
+    assert len(executor.attempts) == 3
+
+
+@pytest.mark.asyncio
+async def test_call_with_trace_returns_failure_without_changing_call_behavior() -> None:
+    executor = ProviderCallExecutor(policy=ProviderCallPolicy.defaults())
+    failure = SequenceCall([provider_error("AUTHENTICATION", retryable=False)])
+
+    outcome = await executor.call_with_trace(
+        "model", failure, remaining_deadline=time.monotonic() + 10
+    )
+
+    assert outcome.result is None
+    assert outcome.error is not None
+    assert outcome.error.code == "AUTHENTICATION"
+    assert outcome.trace.retries == 0
+    with pytest.raises(ProviderError, match="authentication"):
+        await executor.call(
+            "model",
+            SequenceCall([provider_error("AUTHENTICATION", retryable=False)]),
+            remaining_deadline=time.monotonic() + 10,
+        )

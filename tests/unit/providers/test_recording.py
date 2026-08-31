@@ -20,6 +20,7 @@ from deepresearch.providers import (
     ModelResult,
     ModelStreamChunk,
     ProviderError,
+    ProviderUsageResult,
     RawDocument,
     SearchHit,
     StructuredModelResult,
@@ -188,6 +189,52 @@ class MessageFailureSearch(FakeSearch):
         )
 
 
+class ChainedMessageFailureSearch(MessageFailureSearch):
+    async def search(
+        self,
+        query: str,
+        limit: int,
+        filters: Mapping[str, JsonValue] | None,
+        *,
+        deadline: float,
+        cancellation_token: CancellationToken,
+    ) -> list[SearchHit]:
+        del query, limit, filters, deadline
+        cancellation_token.raise_if_cancelled()
+        self.calls += 1
+        try:
+            raise RuntimeError("TOP-SECRET internal cause")
+        except RuntimeError as cause:
+            raise ProviderError(
+                code="INVALID_RESPONSE",
+                provider=self.provider_id,
+                operation="search",
+                public_message=self.public_message,
+                retryable=False,
+                usage=_usage(),
+            ) from cause
+
+
+class SearchHitProvider(FakeSearch):
+    def __init__(self, hit: SearchHit) -> None:
+        super().__init__()
+        self.hit = hit
+
+    async def search(
+        self,
+        query: str,
+        limit: int,
+        filters: Mapping[str, JsonValue] | None,
+        *,
+        deadline: float,
+        cancellation_token: CancellationToken,
+    ) -> list[SearchHit]:
+        del query, filters, deadline
+        cancellation_token.raise_if_cancelled()
+        self.calls += 1
+        return [self.hit][:limit]
+
+
 class FakeFetcher:
     provider_id = "record-fetch"
 
@@ -220,6 +267,50 @@ class FakeFetcher:
             content_type="text/plain",
             body_bytes=b"evidence",
             retrieved_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+
+class UsageSearch(FakeSearch):
+    async def search_with_usage(
+        self,
+        query: str,
+        limit: int,
+        filters: Mapping[str, JsonValue] | None,
+        *,
+        deadline: float,
+        cancellation_token: CancellationToken,
+    ) -> ProviderUsageResult[list[SearchHit]]:
+        value = await self.search(
+            query,
+            limit,
+            filters,
+            deadline=deadline,
+            cancellation_token=cancellation_token,
+        )
+        return ProviderUsageResult(
+            value=value,
+            usage=ResourceUsage.zero().model_copy(
+                update={"search_calls": 1, "retries": 1, "wall_seconds": 0.25}
+            ),
+        )
+
+
+class UsageFetcher(FakeFetcher):
+    async def fetch_with_usage(
+        self,
+        url: str,
+        *,
+        deadline: float,
+        cancellation_token: CancellationToken,
+    ) -> ProviderUsageResult[RawDocument]:
+        value = await self.fetch(
+            url, deadline=deadline, cancellation_token=cancellation_token
+        )
+        return ProviderUsageResult(
+            value=value,
+            usage=ResourceUsage.zero().model_copy(
+                update={"pages": 1, "retries": 1, "wall_seconds": 0.5}
+            ),
         )
 
 
@@ -374,6 +465,56 @@ async def test_recorded_model_search_fetch_and_embed_replay_without_delegates(tm
     assert replay_fetch == fetch_result.model_copy(update={"headers": {"content-type": "text/plain"}})
     assert replay_embed == embed_result
     assert sum(provider.live_calls for provider in (ReplayModelProvider(bundle), ReplaySearchProvider(bundle), ReplayFetcher(bundle), ReplayTextEmbedder(bundle))) == 0
+
+
+@pytest.mark.asyncio
+async def test_recording_preserves_authoritative_search_and_fetch_retry_usage(
+    tmp_path: Path,
+) -> None:
+    final_root = tmp_path / "usage-bundle"
+    writer = ReplayBundleWriter.create(final_root, run_id="usage-run")
+    token = CancellationToken()
+
+    search_result = await RecordingSearchProvider(UsageSearch(), writer).search(
+        "usage",
+        1,
+        None,
+        deadline=_deadline(),
+        cancellation_token=token,
+    )
+    fetch_result = await RecordingFetcher(UsageFetcher(), writer).fetch(
+        "https://example.com/usage",
+        deadline=_deadline(),
+        cancellation_token=token,
+    )
+    await writer.finalize()
+
+    search_line = json.loads(
+        (final_root / "search.jsonl").read_text(encoding="utf-8")
+    )
+    fetch_line = json.loads(
+        (final_root / "documents.jsonl").read_text(encoding="utf-8")
+    )
+    assert search_line["usage"]["retries"] == 1
+    assert search_line["usage"]["search_calls"] == 1
+    assert fetch_line["usage"]["retries"] == 1
+    assert fetch_line["usage"]["pages"] == 1
+
+    bundle = ReplayBundle.load(final_root)
+    replay_search = ReplaySearchProvider(bundle)
+    replay_fetch = ReplayFetcher(bundle)
+    assert await replay_search.search(
+        "usage", 1, None, deadline=_deadline(), cancellation_token=token
+    ) == search_result
+    assert await replay_fetch.fetch(
+        "https://example.com/usage",
+        deadline=_deadline(),
+        cancellation_token=token,
+    ) == fetch_result.model_copy(update={"headers": {"content-type": "text/plain"}})
+    assert replay_search.last_usage is not None
+    assert replay_search.last_usage.retries == 1
+    assert replay_fetch.last_usage is not None
+    assert replay_fetch.last_usage.retries == 1
 
 
 @pytest.mark.asyncio
@@ -779,6 +920,114 @@ async def test_finalized_bundle_allows_benign_security_words(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "unsafe_url",
+    (
+        "https://user:PASS@example.com/result",
+        "https://example.com/result?api_key=TOP-SECRET",
+        "https://example.com/api%255fkey%253dTOP-SECRET",
+    ),
+)
+async def test_finalized_search_rejects_credential_bearing_hit_url(
+    tmp_path: Path, unsafe_url: str
+) -> None:
+    final_root = tmp_path / f"unsafe-search-url-{len(list(tmp_path.iterdir()))}"
+    writer = ReplayBundleWriter.create(final_root, run_id="unsafe-search-url")
+    recorder = RecordingSearchProvider(
+        SearchHitProvider(
+            SearchHit(url=unsafe_url, title="unsafe", snippet="unsafe", rank=1)
+        ),
+        writer,
+    )
+
+    with pytest.raises(ValueError, match="credential"):
+        await recorder.search(
+            "unsafe",
+            1,
+            None,
+            deadline=_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+    await writer.finalize()
+
+    finalized = (final_root / "search.jsonl").read_bytes()
+    assert finalized == b""
+    assert b"top-secret" not in finalized.lower()
+    assert b"user:pass" not in finalized.lower()
+
+
+@pytest.mark.asyncio
+async def test_finalized_search_rejects_credential_bearing_hit_metadata(
+    tmp_path: Path,
+) -> None:
+    final_root = tmp_path / "unsafe-search-metadata"
+    writer = ReplayBundleWriter.create(final_root, run_id="unsafe-search-metadata")
+    recorder = RecordingSearchProvider(
+        SearchHitProvider(
+            SearchHit(
+                url="https://example.com/result",
+                title="unsafe",
+                snippet="unsafe",
+                rank=1,
+                provider_metadata={
+                    "nested": {"api%255fkey": "TOP-SECRET"},
+                },
+            )
+        ),
+        writer,
+    )
+
+    with pytest.raises(ValueError, match="credential"):
+        await recorder.search(
+            "unsafe",
+            1,
+            None,
+            deadline=_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+    await writer.finalize()
+
+    finalized = (final_root / "search.jsonl").read_bytes()
+    assert finalized == b""
+    assert b"top-secret" not in finalized.lower()
+
+
+@pytest.mark.asyncio
+async def test_finalized_search_allows_benign_security_words_in_hit_metadata(
+    tmp_path: Path,
+) -> None:
+    final_root = tmp_path / "benign-search-metadata"
+    writer = ReplayBundleWriter.create(final_root, run_id="benign-search-metadata")
+    benign_url = (
+        "https://example.com/docs/token/usage"
+        "?topic=authorization#token-guidance"
+    )
+    hit = SearchHit(
+        url=benign_url,
+        title="Authorization guide",
+        snippet="Token usage documentation",
+        rank=1,
+        provider_metadata={"topic": "authorization", "document": "token usage"},
+    )
+
+    result = await RecordingSearchProvider(
+        SearchHitProvider(hit), writer
+    ).search(
+        "benign",
+        1,
+        None,
+        deadline=_deadline(),
+        cancellation_token=CancellationToken(),
+    )
+    await writer.finalize()
+
+    finalized = (final_root / "search.jsonl").read_bytes()
+    assert result == [hit]
+    assert benign_url.encode() in finalized
+    assert b'"topic":"authorization"' in finalized
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "public_message",
     (
         "upstream rejected sk-proj-ABC123 at https://user:PASS@example.com",
@@ -790,9 +1039,11 @@ async def test_finalized_failure_redacts_encoded_opaque_and_userinfo_credentials
 ) -> None:
     final_root = tmp_path / f"credential-message-{len(list(tmp_path.iterdir()))}"
     writer = ReplayBundleWriter.create(final_root, run_id="credential-message")
-    recorder = RecordingSearchProvider(MessageFailureSearch(public_message), writer)
+    recorder = RecordingSearchProvider(
+        ChainedMessageFailureSearch(public_message), writer
+    )
 
-    with pytest.raises(ProviderError):
+    with pytest.raises(ProviderError) as live_error:
         await recorder.search(
             "credential-message",
             1,
@@ -808,6 +1059,10 @@ async def test_finalized_failure_redacts_encoded_opaque_and_userinfo_credentials
     assert b"sk-proj-abc123" not in finalized.lower()
     assert b"user:pass" not in finalized.lower()
     assert record["outcome"]["public_message"] == "[REDACTED]"
+    assert live_error.value.public_message == "[REDACTED]"
+    assert live_error.value.usage == _usage()
+    assert live_error.value.__cause__ is None
+    assert live_error.value.__context__ is None
 
     replay = ReplaySearchProvider(ReplayBundle.load(final_root))
     with pytest.raises(ProviderError) as replay_error:
@@ -820,6 +1075,11 @@ async def test_finalized_failure_redacts_encoded_opaque_and_userinfo_credentials
         )
     assert replay_error.value.__cause__ is None
     assert replay_error.value.__context__ is None
+    assert replay_error.value.public_message == live_error.value.public_message
+    assert replay_error.value.code == live_error.value.code
+    assert replay_error.value.retryable == live_error.value.retryable
+    assert replay_error.value.retry_after == live_error.value.retry_after
+    assert replay_error.value.usage == live_error.value.usage
 
 
 @pytest.mark.asyncio
@@ -969,6 +1229,88 @@ async def test_abort_repairs_owned_missing_tombstone_marker_and_retries_cleanup(
 
 
 @pytest.mark.asyncio
+async def test_repaired_tombstone_never_recursively_deletes_post_write_competitor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final_root = tmp_path / "post-write-competitor"
+    writer, tombstone = await _leave_owned_tombstone_without_marker(
+        final_root, monkeypatch
+    )
+    monkeypatch.undo()
+    original_write = recording_module._write_fsynced
+    sentinel = tombstone / "unowned.txt"
+
+    def inject_after_marker_write(path: Path, payload: bytes) -> None:
+        original_write(path, payload)
+        if path.parent == tombstone and path.name == ".replay-writer-owner.json":
+            sentinel.write_text("unowned", encoding="utf-8")
+
+    monkeypatch.setattr(recording_module, "_write_fsynced", inject_after_marker_write)
+
+    with pytest.raises(ValueError, match="contents|changed|owned"):
+        await writer.abort()
+
+    assert sentinel.read_text(encoding="utf-8") == "unowned"
+    assert tombstone.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_repaired_tombstone_rejects_pre_write_competitor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final_root = tmp_path / "pre-write-competitor"
+    writer, tombstone = await _leave_owned_tombstone_without_marker(
+        final_root, monkeypatch
+    )
+    monkeypatch.undo()
+    original_write = recording_module._write_fsynced
+    sentinel = tombstone / "unowned.txt"
+
+    def inject_before_marker_write(path: Path, payload: bytes) -> None:
+        if path.parent == tombstone and path.name == ".replay-writer-owner.json":
+            sentinel.write_text("unowned", encoding="utf-8")
+        original_write(path, payload)
+
+    monkeypatch.setattr(recording_module, "_write_fsynced", inject_before_marker_write)
+
+    with pytest.raises(ValueError, match="contents|changed|owned"):
+        await writer.abort()
+
+    assert sentinel.read_text(encoding="utf-8") == "unowned"
+
+
+@pytest.mark.asyncio
+async def test_repaired_tombstone_rmdir_fails_closed_on_late_competitor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final_root = tmp_path / "before-rmdir-competitor"
+    writer, tombstone = await _leave_owned_tombstone_without_marker(
+        final_root, monkeypatch
+    )
+    monkeypatch.undo()
+    original_rmdir = Path.rmdir
+    sentinel = tombstone / "unowned.txt"
+    injected = False
+
+    def inject_before_rmdir(path: Path) -> None:
+        nonlocal injected
+        if path == tombstone and not injected:
+            injected = True
+            sentinel.write_text("unowned", encoding="utf-8")
+        original_rmdir(path)
+
+    monkeypatch.setattr(Path, "rmdir", inject_before_rmdir)
+
+    with pytest.raises(OSError):
+        await writer.abort()
+    with pytest.raises(ValueError, match="contents|owned"):
+        await writer.abort()
+
+    assert sentinel.read_text(encoding="utf-8") == "unowned"
+    assert tombstone.is_dir()
+
+
+@pytest.mark.asyncio
 async def test_abort_never_repairs_or_deletes_substituted_cleanup_tombstone(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -982,8 +1324,9 @@ async def test_abort_never_repairs_or_deletes_substituted_cleanup_tombstone(
     sentinel = tombstone / "sentinel.txt"
     sentinel.write_text("not-owned", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="substitut|owned"):
-        await writer.abort()
+    for _ in range(2):
+        with pytest.raises(ValueError, match="substitut|owned"):
+            await writer.abort()
 
     assert sentinel.read_text(encoding="utf-8") == "not-owned"
 
@@ -1033,8 +1376,10 @@ async def test_recorded_failure_rechecks_cancellation_after_append(
         )
         call = anext(stream)
 
-    with pytest.raises(OperationCancelled):
+    with pytest.raises(OperationCancelled) as cancelled:
         await call
+    assert cancelled.value.__cause__ is None
+    assert cancelled.value.__context__ is None
     await writer.finalize()
 
     replay_token = CancellationToken()
@@ -1052,6 +1397,8 @@ async def test_recorded_failure_rechecks_cancellation_after_append(
         await replay_call
     assert recorded.value.code in {"RATE_LIMITED", "INVALID_REQUEST"}
     assert recorded.value.usage == _usage()
+    assert recorded.value.__cause__ is None
+    assert recorded.value.__context__ is None
 
 
 @pytest.mark.asyncio
@@ -1076,6 +1423,8 @@ async def test_recorded_failure_after_hard_deadline_surfaces_timeout_but_preserv
     with pytest.raises(ProviderError) as live_error:
         await call
     assert live_error.value.code == "TIMEOUT"
+    assert live_error.value.__cause__ is None
+    assert live_error.value.__context__ is None
     await writer.finalize()
 
     bundle = ReplayBundle.load(final_root)
@@ -1092,6 +1441,8 @@ async def test_recorded_failure_after_hard_deadline_surfaces_timeout_but_preserv
         await replay_call
     assert recorded.value.code == "INVALID_REQUEST"
     assert recorded.value.usage == _usage()
+    assert recorded.value.__cause__ is None
+    assert recorded.value.__context__ is None
 
 
 @pytest.mark.asyncio

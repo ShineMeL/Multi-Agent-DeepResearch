@@ -301,41 +301,61 @@ class OpenAICompatibleModelProvider:
             if not isinstance(choice, dict):
                 raise TypeError
             choice_mapping = cast("dict[str, object]", choice)
+            if choice_mapping.get("index") != 0:
+                raise ValueError
+            finish_reason = choice_mapping.get("finish_reason")
+            if not isinstance(finish_reason, str) or not finish_reason.strip():
+                raise TypeError
             if not isinstance(choice_mapping.get("message"), dict):
                 raise TypeError
             message = cast("dict[str, object]", choice_mapping["message"])
+            if message.get("role") != "assistant":
+                raise ValueError
             value = message.get("content")
-            if value is None:
-                content = ""
-            elif isinstance(value, str):
-                content = value
-            else:
+            if value is not None and not isinstance(value, str):
                 raise TypeError
             raw_tool_calls = message.get("tool_calls", [])
             if not isinstance(raw_tool_calls, list):
                 raise TypeError
+            seen_tool_ids: set[str] = set()
             for raw_call in cast("list[object]", raw_tool_calls):
                 if not isinstance(raw_call, dict):
                     raise TypeError
                 raw_call_mapping = cast("dict[str, object]", raw_call)
+                if raw_call_mapping.get("type") != "function":
+                    raise ValueError
                 if not isinstance(raw_call_mapping.get("function"), dict):
                     raise TypeError
                 function = cast("dict[str, object]", raw_call_mapping["function"])
                 arguments = function.get("arguments")
                 parsed_arguments = json.loads(arguments) if isinstance(arguments, str) else None
+                tool_id = raw_call_mapping.get("id")
+                function_name = function.get("name")
                 if (
-                    not isinstance(raw_call_mapping.get("id"), str)
-                    or not isinstance(function.get("name"), str)
+                    not isinstance(tool_id, str)
+                    or not tool_id.strip()
+                    or tool_id in seen_tool_ids
+                    or not isinstance(function_name, str)
+                    or not function_name.strip()
                     or not isinstance(parsed_arguments, dict)
                 ):
                     raise TypeError
+                seen_tool_ids.add(tool_id)
                 tool_calls.append(
                     ToolCall(
-                        tool_call_id=cast("str", raw_call_mapping["id"]),
-                        name=cast("str", function["name"]),
+                        tool_call_id=tool_id,
+                        name=function_name,
                         arguments=cast("dict[str, JsonValue]", parsed_arguments),
                     )
                 )
+            if tool_calls:
+                if finish_reason != "tool_calls":
+                    raise ValueError
+                content = "" if value is None else value
+            else:
+                if finish_reason == "tool_calls" or not isinstance(value, str):
+                    raise ValueError
+                content = value
         except (KeyError, TypeError, ValueError, json.JSONDecodeError, ValidationError):
             invalid = True
         if invalid or content is None:
@@ -363,38 +383,30 @@ class OpenAICompatibleModelProvider:
             provider_id=self.provider_id,
             operation=operation,
         )
-        before = len(self._executor.attempts)
-        started = time.monotonic()
-        caught: ProviderError | None = None
-        result: R | None = None
-        try:
-            result = await self._executor.call(
-                "model",
-                invoke,
-                remaining_deadline=deadline,
-            )
-        except ProviderError as error:
-            caught = error
-        attempts = self._executor.attempts[before:]
-        retries = sum(attempt.attempt_index > 0 for attempt in attempts)
-        elapsed = max(0, time.monotonic() - started)
-        if caught is not None:
-            usage = caught.usage or _zero_usage()
+        outcome = await self._executor.call_with_trace(
+            "model",
+            invoke,
+            remaining_deadline=deadline,
+        )
+        retries = outcome.trace.retries
+        elapsed = outcome.trace.wall_seconds
+        if outcome.error is not None:
+            usage = outcome.error.usage or _zero_usage()
             failure = ProviderError(
-                code=caught.code,
+                code=outcome.error.code,
                 provider=self.provider_id,
                 operation=operation,
-                public_message=caught.public_message,
-                retryable=caught.retryable,
-                retry_after=caught.retry_after,
+                public_message=outcome.error.public_message,
+                retryable=outcome.error.retryable,
+                retry_after=outcome.error.retry_after,
                 usage=usage.model_copy(
                     update={"retries": retries, "wall_seconds": elapsed}
                 ),
             )
-            raise failure
-        if result is None:
+            raise failure from None
+        if outcome.result is None:
             raise RuntimeError("provider executor returned no result")
-        return result, retries, elapsed
+        return outcome.result, retries, elapsed
 
     async def complete(
         self,
@@ -533,7 +545,26 @@ class OpenAICompatibleModelProvider:
         chunks: list[ModelStreamChunk] = []
         final_usage: ResourceUsage | None = None
         finish_reason: str | None = None
+        finished = False
+        terminal_usage_seen = False
+        done_seen = False
+        choice_event_seen = False
+        role_seen = False
+        current_tool_index = -1
+        tool_call_seen = False
+        tool_call_ids: set[str] = set()
         failure: ProviderError | None = None
+
+        def invalid_stream(message: str) -> ProviderError:
+            return ProviderError(
+                code="INVALID_RESPONSE",
+                provider=self.provider_id,
+                operation=operation,
+                public_message=message,
+                retryable=False,
+                usage=final_usage or _zero_usage(),
+            )
+
         try:
             response = await await_with_controls(
                 response_context.__aenter__(),
@@ -561,103 +592,127 @@ class OpenAICompatibleModelProvider:
                 if not line or line.startswith(":"):
                     continue
                 if not line.startswith("data:"):
-                    raise ProviderError(
-                        code="INVALID_RESPONSE",
-                        provider=self.provider_id,
-                        operation=operation,
-                        public_message="model stream used invalid SSE framing",
-                        retryable=False,
-                    )
+                    raise invalid_stream("model stream used invalid SSE framing")
                 data = line[5:].strip()
                 if data == "[DONE]":
-                    break
+                    if done_seen or not finished or not terminal_usage_seen:
+                        raise invalid_stream("model stream terminal order was invalid")
+                    done_seen = True
+                    continue
+                if done_seen:
+                    raise invalid_stream("model stream contained data after completion")
                 decoded: object | None = None
                 try:
                     decoded = json.loads(data)
                 except json.JSONDecodeError:
                     decoded = None
                 if not isinstance(decoded, dict):
-                    raise ProviderError(
-                        code="INVALID_RESPONSE",
-                        provider=self.provider_id,
-                        operation=operation,
-                        public_message="model stream contained invalid JSON",
-                        retryable=False,
-                    )
+                    raise invalid_stream("model stream contained invalid JSON")
                 decoded_mapping = cast("dict[str, object]", decoded)
-                if "usage" in decoded_mapping:
+                choices_value = decoded_mapping.get("choices")
+                if not isinstance(choices_value, list):
+                    raise invalid_stream("model stream choices were invalid")
+                choices = cast("list[object]", choices_value)
+                if not choices:
+                    if terminal_usage_seen or not finished or "usage" not in decoded_mapping:
+                        raise invalid_stream("model stream terminal usage order was invalid")
                     try:
                         final_usage = _usage(decoded_mapping["usage"])
                     except (TypeError, ValueError, ValidationError):
-                        raise ProviderError(
-                            code="INVALID_RESPONSE",
-                            provider=self.provider_id,
-                            operation=operation,
-                            public_message="model stream contained invalid usage",
-                            retryable=False,
-                        ) from None
-                choices_value = decoded_mapping.get("choices", [])
-                if not isinstance(choices_value, list):
-                    raise ProviderError(
-                        code="INVALID_RESPONSE",
-                        provider=self.provider_id,
-                        operation=operation,
-                        public_message="model stream choices were invalid",
-                        retryable=False,
-                    )
-                for choice in cast("list[object]", choices_value):
-                    if not isinstance(choice, dict):
-                        raise ProviderError(
-                            code="INVALID_RESPONSE",
-                            provider=self.provider_id,
-                            operation=operation,
-                            public_message="model stream delta was invalid",
-                            retryable=False,
-                        )
-                    choice_mapping = cast("dict[str, object]", choice)
-                    if not isinstance(choice_mapping.get("delta", {}), dict):
-                        raise ProviderError(
-                            code="INVALID_RESPONSE",
-                            provider=self.provider_id,
-                            operation=operation,
-                            public_message="model stream delta was invalid",
-                            retryable=False,
-                        )
-                    delta = cast(
-                        "dict[str, object]", choice_mapping.get("delta", {})
-                    )
-                    text_delta = delta.get("content", "")
-                    if text_delta is None:
-                        text_delta = ""
-                    if not isinstance(text_delta, str):
-                        raise ProviderError(
-                            code="INVALID_RESPONSE",
-                            provider=self.provider_id,
-                            operation=operation,
-                            public_message="model stream text delta was invalid",
-                            retryable=False,
-                        )
-                    tool_delta = delta.get("tool_calls")
-                    if tool_delta is not None and not isinstance(tool_delta, (dict, list)):
-                        raise ProviderError(
-                            code="INVALID_RESPONSE",
-                            provider=self.provider_id,
-                            operation=operation,
-                            public_message="model stream tool delta was invalid",
-                            retryable=False,
-                        )
-                    raw_finish = choice_mapping.get("finish_reason")
-                    if raw_finish is not None:
-                        if not isinstance(raw_finish, str):
-                            raise ProviderError(
-                                code="INVALID_RESPONSE",
-                                provider=self.provider_id,
-                                operation=operation,
-                                public_message="model stream finish reason was invalid",
-                                retryable=False,
-                            )
-                        finish_reason = raw_finish
-                    if text_delta or tool_delta is not None:
+                        raise invalid_stream("model stream contained invalid usage") from None
+                    terminal_usage_seen = True
+                    continue
+                if terminal_usage_seen or finished or "usage" in decoded_mapping:
+                    raise invalid_stream("model stream choice order was invalid")
+                if len(choices) != 1 or not isinstance(choices[0], dict):
+                    raise invalid_stream("model stream must contain exactly one choice")
+                choice_mapping = cast("dict[str, object]", choices[0])
+                choice_index = choice_mapping.get("index")
+                if (
+                    not isinstance(choice_index, int)
+                    or isinstance(choice_index, bool)
+                    or choice_index != 0
+                ):
+                    raise invalid_stream("model stream choice index was invalid")
+                delta_value = choice_mapping.get("delta")
+                if not isinstance(delta_value, dict):
+                    raise invalid_stream("model stream delta was invalid")
+                delta = cast("dict[str, object]", delta_value)
+                if not set(delta).issubset({"role", "content", "tool_calls"}):
+                    raise invalid_stream("model stream delta contained unknown fields")
+                role = delta.get("role")
+                if role is not None:
+                    if role != "assistant" or role_seen or choice_event_seen:
+                        raise invalid_stream("model stream assistant role was invalid")
+                    role_seen = True
+                text_delta = delta.get("content", "")
+                if text_delta is None:
+                    text_delta = ""
+                if not isinstance(text_delta, str):
+                    raise invalid_stream("model stream text delta was invalid")
+                tool_delta: list[object] | None = None
+                if "tool_calls" in delta:
+                    raw_tools = delta["tool_calls"]
+                    if not isinstance(raw_tools, list) or not raw_tools:
+                        raise invalid_stream("model stream tool delta was invalid")
+                    tool_delta = cast("list[object]", raw_tools)
+                    for raw_tool in tool_delta:
+                        if not isinstance(raw_tool, dict):
+                            raise invalid_stream("model stream tool delta was invalid")
+                        tool = cast("dict[str, object]", raw_tool)
+                        if not set(tool).issubset({"index", "id", "type", "function"}):
+                            raise invalid_stream("model stream tool delta was invalid")
+                        tool_index = tool.get("index")
+                        if (
+                            not isinstance(tool_index, int)
+                            or isinstance(tool_index, bool)
+                            or tool_index < current_tool_index
+                            or tool_index > current_tool_index + 1
+                        ):
+                            raise invalid_stream("model stream tool index was out of order")
+                        function_value = tool.get("function")
+                        if not isinstance(function_value, dict):
+                            raise invalid_stream("model stream tool function was invalid")
+                        function = cast("dict[str, object]", function_value)
+                        if not set(function).issubset({"name", "arguments"}):
+                            raise invalid_stream("model stream tool function was invalid")
+                        arguments = function.get("arguments")
+                        if not isinstance(arguments, str):
+                            raise invalid_stream("model stream tool arguments were invalid")
+                        if tool_index == current_tool_index + 1:
+                            tool_id = tool.get("id")
+                            tool_type = tool.get("type")
+                            tool_name = function.get("name")
+                            if (
+                                not isinstance(tool_id, str)
+                                or not tool_id.strip()
+                                or tool_id in tool_call_ids
+                                or tool_type != "function"
+                                or not isinstance(tool_name, str)
+                                or not tool_name.strip()
+                            ):
+                                raise invalid_stream("model stream tool identity was invalid")
+                            tool_call_ids.add(tool_id)
+                            current_tool_index = tool_index
+                        elif (
+                            "id" in tool
+                            or "type" in tool
+                            or "name" in function
+                        ):
+                            raise invalid_stream("model stream tool fragment was duplicated")
+                        tool_call_seen = True
+                raw_finish = choice_mapping.get("finish_reason")
+                if raw_finish is not None:
+                    if not isinstance(raw_finish, str) or not raw_finish.strip():
+                        raise invalid_stream("model stream finish reason was invalid")
+                    if (raw_finish == "tool_calls") != tool_call_seen:
+                        raise invalid_stream("model stream finish reason was inconsistent")
+                    finish_reason = raw_finish
+                    finished = True
+                if not delta and raw_finish is None:
+                    raise invalid_stream("model stream contained an empty nonterminal delta")
+                if text_delta or tool_delta is not None:
+                    try:
                         chunks.append(
                             ModelStreamChunk(
                                 index=len(chunks),
@@ -669,6 +724,9 @@ class OpenAICompatibleModelProvider:
                                 ),
                             )
                         )
+                    except ValidationError:
+                        raise invalid_stream("model stream delta was invalid") from None
+                choice_event_seen = True
         except httpx.TimeoutException:
             failure = ProviderError(
                 code="TIMEOUT",
@@ -692,23 +750,22 @@ class OpenAICompatibleModelProvider:
             with contextlib.suppress(Exception):
                 await response_context.__aexit__(None, None, None)
         if failure is not None:
-            raise failure
-        if final_usage is None:
-            raise ProviderError(
-                code="INVALID_RESPONSE",
-                provider=self.provider_id,
-                operation=operation,
-                public_message="model stream ended without terminal usage",
-                retryable=False,
+            raise failure from None
+        if not done_seen or not finished or not terminal_usage_seen or final_usage is None:
+            raise invalid_stream("model stream ended before its required terminal events")
+        if finish_reason is None:
+            raise RuntimeError("validated stream finish reason is unavailable")
+        try:
+            chunks.append(
+                ModelStreamChunk(
+                    index=len(chunks),
+                    finish_reason=finish_reason,
+                    final_usage=final_usage,
+                )
             )
-        chunks.append(
-            ModelStreamChunk(
-                index=len(chunks),
-                finish_reason=finish_reason or "stop",
-                final_usage=final_usage,
-            )
-        )
-        return validate_model_stream(chunks)
+            return validate_model_stream(chunks)
+        except (TypeError, ValueError, ValidationError):
+            raise invalid_stream("model stream output was invalid") from None
 
     def stream(
         self,

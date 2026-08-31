@@ -28,11 +28,15 @@ from deepresearch.providers import (
     ProviderCallExecutor,
     ProviderCallPolicy,
     ProviderError,
+    ProviderErrorCode,
+    ProviderUsageResult,
     RawDocument,
     SearchHit,
     SearchProvider,
     StructuredModelResult,
     TextEmbedder,
+    UsageReportingFetcher,
+    UsageReportingSearchProvider,
     validate_model_stream,
 )
 from deepresearch.retrieval import canonicalize_url
@@ -399,6 +403,52 @@ def _fetch_metadata_is_safe(
         return False
 
 
+def _json_metadata_is_safe(value: object) -> bool:
+    if isinstance(value, str):
+        if _contains_credential_shape(value):
+            return False
+        for match in _EMBEDDED_URL.finditer(_bounded_unquote(value)):
+            if not _url_metadata_is_safe(match.group().rstrip(".,;)")):
+                return False
+        return True
+    if isinstance(value, Mapping):
+        for raw_name, item in cast("Mapping[object, object]", value).items():
+            if not isinstance(raw_name, str):
+                return False
+            name = re.sub(r"[^a-z0-9]", "", _bounded_unquote(raw_name).casefold())
+            nonempty = item not in (None, "", (), [], {})
+            if name in _SECRET_PATH_NAMES and nonempty:
+                return False
+            if not _json_metadata_is_safe(item):
+                return False
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(
+            _json_metadata_is_safe(item)
+            for item in cast("Sequence[object]", value)
+        )
+    return value is None or isinstance(value, (bool, int, float))
+
+
+def _safe_search_response(hits: Sequence[SearchHit]) -> list[JsonValue]:
+    response: list[JsonValue] = []
+    for hit in hits:
+        url = str(hit.url)
+        try:
+            safe = (
+                _url_metadata_is_safe(url)
+                and _redact_public_message(hit.title) == hit.title
+                and _redact_public_message(hit.snippet) == hit.snippet
+                and _json_metadata_is_safe(hit.provider_metadata)
+            )
+        except (TypeError, UnicodeError, ValueError):
+            safe = False
+        if not safe:
+            raise ValueError("recorded search metadata violates credential-safe policy")
+        response.append(cast("JsonValue", hit.model_dump(mode="json")))
+    return response
+
+
 def _safe_fetch_response(document: RawDocument) -> dict[str, JsonValue]:
     headers = {
         key.casefold(): value
@@ -701,7 +751,10 @@ class ReplayBundleWriter:
                 self._release_lock()
 
     def _remove_owned_staging(self) -> None:
-        self._repair_missing_cleanup_marker()
+        repaired_marker = self._repair_missing_cleanup_marker()
+        if repaired_marker:
+            self._remove_repaired_cleanup_tombstone()
+            return
         staging = self._validate_owned_staging()
         if self._cleanup_tombstone is None:
             device, inode = self._staging_identity
@@ -742,14 +795,52 @@ class ReplayBundleWriter:
         self._staging_root = None
         _fsync_directory(staging.parent)
 
-    def _repair_missing_cleanup_marker(self) -> None:
+    def _remove_repaired_cleanup_tombstone(self) -> None:
         staging = self._staging_root
         tombstone = self._cleanup_tombstone
         if staging is None or tombstone is None:
-            return
+            raise RuntimeError("repaired replay cleanup tombstone is unavailable")
+        marker_path = staging / self._MARKER_NAME
+        self._validate_repaired_tombstone(staging, marker_path, marker_required=True)
+        marker_path.unlink()
+        self._validate_repaired_tombstone(staging, marker_path, marker_required=False)
+        staging.rmdir()
+        self._staging_root = None
+        _fsync_directory(staging.parent)
+
+    def _validate_repaired_tombstone(
+        self, staging: Path, marker_path: Path, *, marker_required: bool
+    ) -> None:
+        parent = self._final_root.parent.resolve(strict=True)
+        device, inode = self._staging_identity
+        expected_tombstone = parent / (
+            f".{self._final_root.name}.cleanup.{self._run_id}."
+            f"{device:x}.{inode:x}"
+        )
+        if (
+            staging != self._cleanup_tombstone
+            or staging != expected_tombstone
+            or _is_link_or_reparse(staging)
+            or staging.resolve(strict=True) != expected_tombstone
+            or _path_identity(staging) != self._staging_identity
+            or _is_link_or_reparse(marker_path)
+        ):
+            raise ValueError("repaired replay cleanup tombstone changed identity")
+        entries = tuple(staging.iterdir())
+        expected_entries = (marker_path,) if marker_required else ()
+        if entries != expected_entries:
+            raise ValueError("repaired replay cleanup tombstone contains unowned contents")
+        if marker_required:
+            self._validate_owned_staging()
+
+    def _repair_missing_cleanup_marker(self) -> bool:
+        staging = self._staging_root
+        tombstone = self._cleanup_tombstone
+        if staging is None or tombstone is None:
+            return False
         marker_path = staging / self._MARKER_NAME
         if marker_path.exists():
-            return
+            return False
         parent = self._final_root.parent.resolve(strict=True)
         device, inode = self._staging_identity
         expected_tombstone = parent / (
@@ -783,8 +874,12 @@ class ReplayBundleWriter:
             or _is_link_or_reparse(marker_path)
         ):
             raise ValueError("replay cleanup tombstone changed during marker repair")
+        if tuple(staging.iterdir()) != (marker_path,):
+            raise ValueError("replay cleanup tombstone contains unowned contents")
+        self._validate_owned_staging()
         _fsync_directory(staging)
         _fsync_directory(parent)
+        return True
 
     def _validate_owned_staging(self) -> Path:
         staging = self._staging_root
@@ -875,6 +970,10 @@ class _RecordingBase:
             operation=operation,
         )
         started = time.monotonic()
+        failure_fields: tuple[
+            ProviderErrorCode, str, bool, float | None, ResourceUsage
+        ] | None = None
+        result: T | None = None
         try:
             result = await self._executor.call(
                 cast("Any", executor_operation), invoke, remaining_deadline=deadline
@@ -882,24 +981,45 @@ class _RecordingBase:
         except ProviderError as error:
             latency_ms = max(0, round((time.monotonic() - started) * 1000))
             usage = error.usage or _operation_usage(operation, latency_ms)
+            redacted_message = _redact_public_message(error.public_message)
             await self._writer.append(
                 key=key,
                 outcome=ReplayFailure(
                     code=error.code,
-                    public_message=_redact_public_message(error.public_message),
+                    public_message=redacted_message,
                     retryable=error.retryable,
                     retry_after=error.retry_after,
                 ),
                 usage=usage,
                 latency_ms=latency_ms,
             )
+            failure_fields = (
+                error.code,
+                redacted_message,
+                error.retryable,
+                error.retry_after,
+                usage,
+            )
+        if failure_fields is not None:
             self._checkpoint(
                 deadline=deadline,
                 cancellation_token=cancellation_token,
                 provider_id=key.provider_id,
                 operation=operation,
             )
-            raise
+            code, public_message, retryable, retry_after, usage = failure_fields
+            failure = ProviderError(
+                code=code,
+                provider=key.provider_id,
+                operation=operation,
+                public_message=public_message,
+                retryable=retryable,
+                retry_after=retry_after,
+                usage=usage,
+            )
+            raise failure from None
+        if result is None:
+            raise RuntimeError("recorded provider returned no result")
         self._checkpoint(
             deadline=deadline,
             cancellation_token=cancellation_token,
@@ -1080,6 +1200,36 @@ class RecordingSearchProvider(_RecordingBase):
     ) -> list[SearchHit]:
         payload = search_request_payload(query, limit, filters)
         key = _key("search", self.provider_id, payload)
+        if isinstance(self._delegate, UsageReportingSearchProvider):
+            delegate = self._delegate
+
+            async def invoke_with_usage(
+                call_deadline: float,
+            ) -> ProviderUsageResult[list[SearchHit]]:
+                return await delegate.search_with_usage(
+                    query,
+                    limit,
+                    filters,
+                    deadline=call_deadline,
+                    cancellation_token=cancellation_token,
+                )
+
+            def encode_with_usage(
+                result: ProviderUsageResult[list[SearchHit]],
+            ) -> JsonValue:
+                return cast("JsonValue", _safe_search_response(result.value))
+
+            envelope: ProviderUsageResult[list[SearchHit]] = await self._record_call(
+                operation="search",
+                executor_operation="search",
+                key=key,
+                deadline=deadline,
+                cancellation_token=cancellation_token,
+                invoke=invoke_with_usage,
+                encode=encode_with_usage,
+                usage_of=lambda result, _: result.usage,
+            )
+            return envelope.value
         return await self._record_call(
             operation="search",
             executor_operation="search",
@@ -1093,9 +1243,7 @@ class RecordingSearchProvider(_RecordingBase):
                 deadline=call_deadline,
                 cancellation_token=cancellation_token,
             ),
-            encode=lambda result: cast(
-                "JsonValue", [hit.model_dump(mode="json") for hit in result]
-            ),
+            encode=lambda result: cast("JsonValue", _safe_search_response(result)),
             usage_of=lambda _, latency: _operation_usage("search", latency),
         )
 
@@ -1115,6 +1263,34 @@ class RecordingFetcher(_RecordingBase):
         cancellation_token: CancellationToken,
     ) -> RawDocument:
         key = _key("fetch", self.provider_id, fetch_request_payload(url))
+        if isinstance(self._delegate, UsageReportingFetcher):
+            delegate = self._delegate
+
+            async def invoke_with_usage(
+                call_deadline: float,
+            ) -> ProviderUsageResult[RawDocument]:
+                return await delegate.fetch_with_usage(
+                    url,
+                    deadline=call_deadline,
+                    cancellation_token=cancellation_token,
+                )
+
+            def encode_with_usage(
+                result: ProviderUsageResult[RawDocument],
+            ) -> JsonValue:
+                return cast("JsonValue", _safe_fetch_response(result.value))
+
+            envelope: ProviderUsageResult[RawDocument] = await self._record_call(
+                operation="fetch",
+                executor_operation="fetch",
+                key=key,
+                deadline=deadline,
+                cancellation_token=cancellation_token,
+                invoke=invoke_with_usage,
+                encode=encode_with_usage,
+                usage_of=lambda result, _: result.usage,
+            )
+            return envelope.value
         return await self._record_call(
             operation="fetch",
             executor_operation="fetch",

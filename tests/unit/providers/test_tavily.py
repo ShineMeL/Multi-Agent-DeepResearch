@@ -58,7 +58,7 @@ async def test_tavily_maps_valid_results_to_stable_rank_and_metadata() -> None:
     )
     provider = _provider()
 
-    hits = await provider.search(
+    outcome = await provider.search_with_usage(
         "agents",
         2,
         {"topic": "general"},
@@ -66,11 +66,10 @@ async def test_tavily_maps_valid_results_to_stable_rank_and_metadata() -> None:
         cancellation_token=CancellationToken(),
     )
 
-    assert [hit.rank for hit in hits] == [1, 2]
-    assert [hit.title for hit in hits] == ["First", "Second"]
-    assert hits[0].provider_metadata == {"score": 0.9}
-    assert provider.last_usage is not None
-    assert provider.last_usage.search_calls == 1
+    assert [hit.rank for hit in outcome.value] == [1, 2]
+    assert [hit.title for hit in outcome.value] == ["First", "Second"]
+    assert outcome.value[0].provider_metadata == {"score": 0.9}
+    assert outcome.usage.search_calls == 1
     assert route.calls.last.request.headers["authorization"] == "Bearer TOP-SECRET-SEARCH"
     assert route.call_count == 1
     assert "TOP-SECRET" not in repr(provider)
@@ -104,6 +103,46 @@ async def test_tavily_rejects_malformed_result_shape() -> None:
     assert error.value.code == "INVALID_RESPONSE"
     assert error.value.usage is not None
     assert error.value.usage.search_calls == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize(
+    "unsafe_url",
+    (
+        "https://user:PASS@example.com/result",
+        "https://example.com/result?api_key=TOP-SECRET-SEARCH",
+    ),
+)
+async def test_tavily_rejects_credential_bearing_result_url(
+    unsafe_url: str,
+) -> None:
+    respx.post("https://api.tavily.com/search").respond(
+        200,
+        json={
+            "results": [
+                {
+                    "url": unsafe_url,
+                    "title": "Unsafe",
+                    "content": "unsafe snippet",
+                }
+            ]
+        },
+    )
+
+    with pytest.raises(ProviderError) as error:
+        await _provider().search(
+            "agents",
+            1,
+            None,
+            deadline=_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+
+    assert error.value.code == "INVALID_RESPONSE"
+    assert "TOP-SECRET" not in str(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
 
 
 @pytest.mark.asyncio

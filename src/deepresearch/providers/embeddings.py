@@ -471,6 +471,16 @@ def _remove_owned_tree(root: Path, *, parent: Path) -> None:
     requested.rmdir()
 
 
+def _path_identity(path: Path) -> tuple[int, int]:
+    metadata = path.stat(follow_symlinks=False)
+    return metadata.st_dev, metadata.st_ino
+
+
+def _require_path_identity(path: Path, expected: tuple[int, int]) -> None:
+    if _is_link_or_reparse(path) or _path_identity(path) != expected:
+        raise ValueError("embedding transaction path was substituted")
+
+
 def _write_lock(path: Path, lock: EmbeddingModelLock) -> None:
     payload = json.dumps(
         lock.model_dump(mode="json"),
@@ -538,8 +548,13 @@ def fetch_and_lock(
     )
     staged_lock = parent / f".{requested_lock.name}.staging.{staging.name.rsplit('.', 1)[-1]}"
     published_root = False
+    published_lock = False
     root_backup: Path | None = None
     lock_backup: Path | None = None
+    root_backup_identity: tuple[int, int] | None = None
+    lock_backup_identity: tuple[int, int] | None = None
+    published_root_identity: tuple[int, int] | None = None
+    published_lock_identity: tuple[int, int] | None = None
     try:
         snapshot_downloader(model_id, revision, staging)
         lock = EmbeddingModelLock.create(
@@ -555,35 +570,74 @@ def fetch_and_lock(
         write_new_lock = existing_lock != lock or replace
         if write_new_lock:
             _write_lock(staged_lock, lock)
-        suffix = staging.name.rsplit(".", 1)[-1]
-        if replace and requested_root.exists():
-            root_backup = parent / f".{requested_root.name}.backup.{suffix}"
-            os.replace(requested_root, root_backup)
-        if replace and requested_lock.exists() and write_new_lock:
-            lock_backup = parent / f".{requested_lock.name}.backup.{suffix}"
-            os.replace(requested_lock, lock_backup)
-        os.replace(staging, requested_root)
-        published_root = True
-        if write_new_lock:
-            os.replace(staged_lock, requested_lock)
-        lock.verify(requested_root)
-        if root_backup is not None:
-            _remove_owned_tree(root_backup, parent=parent)
-        if lock_backup is not None:
-            lock_backup.unlink()
-        return lock
-    except Exception:
-        if published_root and root_backup is not None and root_backup.exists():
-            if requested_root.exists():
-                failed = parent / f".{requested_root.name}.failed.{staging.name}"
-                os.replace(requested_root, failed)
-                _remove_owned_tree(failed, parent=parent)
-            os.replace(root_backup, requested_root)
-        if lock_backup is not None and lock_backup.exists():
-            if requested_lock.exists():
+        try:
+            suffix = staging.name.rsplit(".", 1)[-1]
+            if replace and requested_root.exists():
+                root_backup = parent / f".{requested_root.name}.backup.{suffix}"
+                root_backup_identity = _path_identity(requested_root)
+                os.replace(requested_root, root_backup)
+            if replace and requested_lock.exists() and write_new_lock:
+                lock_backup = parent / f".{requested_lock.name}.backup.{suffix}"
+                lock_backup_identity = _path_identity(requested_lock)
+                os.replace(requested_lock, lock_backup)
+            staging_identity = _path_identity(staging)
+            os.replace(staging, requested_root)
+            published_root = True
+            published_root_identity = staging_identity
+            if write_new_lock:
+                staged_lock_identity = _path_identity(staged_lock)
+                os.replace(staged_lock, requested_lock)
+                published_lock = True
+                published_lock_identity = staged_lock_identity
+            published = EmbeddingModelLock.load(requested_lock)
+            if published != lock:
+                raise ModelSnapshotUnavailable(
+                    "published embedding lock does not match the staged snapshot"
+                )
+            published.verify(requested_root)
+        except Exception:
+            if published_root and requested_root.exists():
+                assert published_root_identity is not None
+                _require_path_identity(requested_root, published_root_identity)
+                _remove_owned_tree(requested_root, parent=parent)
+            if published_lock and requested_lock.exists():
+                assert published_lock_identity is not None
+                _require_path_identity(requested_lock, published_lock_identity)
                 requested_lock.unlink()
-            os.replace(lock_backup, requested_lock)
-        raise
+            if root_backup is not None and root_backup.exists():
+                assert root_backup_identity is not None
+                _require_path_identity(root_backup, root_backup_identity)
+                if requested_root.exists():
+                    raise ValueError("embedding root destination changed during rollback")
+                os.replace(root_backup, requested_root)
+            if lock_backup is not None and lock_backup.exists():
+                assert lock_backup_identity is not None
+                _require_path_identity(lock_backup, lock_backup_identity)
+                if requested_lock.exists():
+                    raise ValueError("embedding lock destination changed during rollback")
+                os.replace(lock_backup, requested_lock)
+            raise
+
+        cleanup_errors: list[Exception] = []
+        if root_backup is not None:
+            try:
+                assert root_backup_identity is not None
+                _require_path_identity(root_backup, root_backup_identity)
+                _remove_owned_tree(root_backup, parent=parent)
+            except (OSError, RuntimeError, ValueError) as error:
+                cleanup_errors.append(error)
+        if lock_backup is not None:
+            try:
+                assert lock_backup_identity is not None
+                _require_path_identity(lock_backup, lock_backup_identity)
+                lock_backup.unlink()
+            except (OSError, RuntimeError, ValueError) as error:
+                cleanup_errors.append(error)
+        if cleanup_errors:
+            raise OSError(
+                "embedding model committed but backup cleanup failed"
+            ) from None
+        return lock
     finally:
         if staging.exists():
             _remove_owned_tree(staging, parent=parent)

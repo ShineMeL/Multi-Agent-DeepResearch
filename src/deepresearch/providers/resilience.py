@@ -88,6 +88,33 @@ class ProviderCallAttempt:
     error_code: ProviderErrorCode | None = None
 
 
+@dataclass(frozen=True)
+class ProviderInvocationTrace:
+    operation: ProviderOperation
+    attempts: tuple[ProviderCallAttempt, ...]
+    started_at: float
+    finished_at: float
+
+    @property
+    def retries(self) -> int:
+        return sum(attempt.attempt_index > 0 for attempt in self.attempts)
+
+    @property
+    def wall_seconds(self) -> float:
+        return max(0.0, self.finished_at - self.started_at)
+
+
+@dataclass(frozen=True)
+class ProviderInvocationOutcome[T]:
+    result: T | None
+    error: ProviderError | None
+    trace: ProviderInvocationTrace
+
+    def __post_init__(self) -> None:
+        if (self.result is None) == (self.error is None):
+            raise ValueError("provider invocation outcome must contain one result or error")
+
+
 class ProviderCallExecutor:
     def __init__(
         self,
@@ -117,8 +144,37 @@ class ProviderCallExecutor:
         remaining_deadline: float,
         fallback_invocations: Sequence[Callable[[float], Awaitable[T]]] = (),
     ) -> T:
+        outcome = await self.call_with_trace(
+            operation,
+            invoke,
+            remaining_deadline=remaining_deadline,
+            fallback_invocations=fallback_invocations,
+        )
+        if outcome.error is not None:
+            raise outcome.error
+        assert outcome.result is not None
+        return outcome.result
+
+    async def call_with_trace(
+        self,
+        operation: ProviderOperation,
+        invoke: Callable[[float], Awaitable[T]],
+        *,
+        remaining_deadline: float,
+        fallback_invocations: Sequence[Callable[[float], Awaitable[T]]] = (),
+    ) -> ProviderInvocationOutcome[T]:
         if not isfinite(remaining_deadline):
             raise ValueError("remaining_deadline must be finite")
+        started_at = self._clock()
+        local_attempts: list[ProviderCallAttempt] = []
+
+        def failure(error: ProviderError) -> ProviderInvocationOutcome[T]:
+            return ProviderInvocationOutcome(
+                result=None,
+                error=error,
+                trace=self._trace(operation, started_at, local_attempts),
+            )
+
         invocations = (invoke,)
         if not self._strict_replay:
             invocations += tuple(fallback_invocations)
@@ -129,7 +185,7 @@ class ProviderCallExecutor:
             attempt_index = 0
             while True:
                 if self._clock() >= remaining_deadline:
-                    raise self._deadline_error(operation)
+                    return failure(self._deadline_error(operation))
                 attempt_deadline = min(
                     remaining_deadline,
                     self._clock() + self._policy.default_timeout_seconds[operation],
@@ -138,23 +194,23 @@ class ProviderCallExecutor:
                     result = await candidate(attempt_deadline)
                 except ProviderError as error:
                     last_error = error
-                    self._attempts.append(
-                        ProviderCallAttempt(
-                            operation=operation,
-                            invocation_index=invocation_index,
-                            attempt_index=attempt_index,
-                            deadline=attempt_deadline,
-                            succeeded=False,
-                            error_code=error.code,
-                        )
+                    attempt = ProviderCallAttempt(
+                        operation=operation,
+                        invocation_index=invocation_index,
+                        attempt_index=attempt_index,
+                        deadline=attempt_deadline,
+                        succeeded=False,
+                        error_code=error.code,
                     )
+                    local_attempts.append(attempt)
+                    self._attempts.append(attempt)
                     if error.code in _NEVER_RETRIED_CODES:
-                        raise
+                        return failure(error)
                     may_retry = error.retryable and error.code in _RETRIED_CODES
                     if not may_retry:
-                        raise
+                        return failure(error)
                     if self._clock() >= remaining_deadline:
-                        raise self._deadline_error(operation) from error
+                        return failure(self._deadline_error(operation))
                     if retries_used >= self._policy.max_retries:
                         break
                     delay = self._retry_delay(error, attempt_index)
@@ -162,24 +218,41 @@ class ProviderCallExecutor:
                         break
                     await self._sleeper(delay)
                     if self._clock() >= remaining_deadline:
-                        raise self._deadline_error(operation) from error
+                        return failure(self._deadline_error(operation))
                     retries_used += 1
                     attempt_index += 1
                 else:
-                    self._attempts.append(
-                        ProviderCallAttempt(
-                            operation=operation,
-                            invocation_index=invocation_index,
-                            attempt_index=attempt_index,
-                            deadline=attempt_deadline,
-                            succeeded=True,
-                        )
+                    attempt = ProviderCallAttempt(
+                        operation=operation,
+                        invocation_index=invocation_index,
+                        attempt_index=attempt_index,
+                        deadline=attempt_deadline,
+                        succeeded=True,
                     )
-                    return result
+                    local_attempts.append(attempt)
+                    self._attempts.append(attempt)
+                    return ProviderInvocationOutcome(
+                        result=result,
+                        error=None,
+                        trace=self._trace(operation, started_at, local_attempts),
+                    )
 
         if last_error is None:
             raise RuntimeError("provider executor reached an impossible state")
-        raise last_error
+        return failure(last_error)
+
+    def _trace(
+        self,
+        operation: ProviderOperation,
+        started_at: float,
+        attempts: list[ProviderCallAttempt],
+    ) -> ProviderInvocationTrace:
+        return ProviderInvocationTrace(
+            operation=operation,
+            attempts=tuple(attempts),
+            started_at=started_at,
+            finished_at=self._clock(),
+        )
 
     def _retry_delay(self, error: ProviderError, attempt_index: int) -> float:
         if error.retry_after is not None:
@@ -204,4 +277,10 @@ class ProviderCallExecutor:
         )
 
 
-__all__ = ["ProviderCallAttempt", "ProviderCallExecutor", "ProviderCallPolicy"]
+__all__ = [
+    "ProviderCallAttempt",
+    "ProviderCallExecutor",
+    "ProviderCallPolicy",
+    "ProviderInvocationOutcome",
+    "ProviderInvocationTrace",
+]

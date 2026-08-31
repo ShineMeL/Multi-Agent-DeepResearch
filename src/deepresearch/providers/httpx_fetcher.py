@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import socket
-import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from datetime import UTC, datetime
@@ -19,6 +18,7 @@ from deepresearch.providers import (
     ProviderCallPolicy,
     ProviderError,
     ProviderErrorCode,
+    ProviderUsageResult,
     RawDocument,
 )
 from deepresearch.retrieval import (
@@ -95,7 +95,6 @@ class HttpxFetcher:
         self._executor = executor or ProviderCallExecutor(
             policy=ProviderCallPolicy.defaults()
         )
-        self.last_usage: ResourceUsage | None = None
 
     @staticmethod
     def _private_url_error() -> ProviderError:
@@ -363,6 +362,15 @@ class HttpxFetcher:
                                     "retrieved_at": datetime.now(UTC),
                                 }
                             )
+                except (httpx.ProtocolError, httpcore.ProtocolError):
+                    raise ProviderError(
+                        code="INVALID_RESPONSE",
+                        provider=self.provider_id,
+                        operation="fetch",
+                        public_message="fetch peer returned invalid HTTP framing",
+                        retryable=False,
+                        usage=_fetch_usage(),
+                    ) from None
                 except (httpx.TimeoutException, httpcore.TimeoutException):
                     raise ProviderError(
                         code="TIMEOUT",
@@ -391,17 +399,27 @@ class HttpxFetcher:
         deadline: float,
         cancellation_token: CancellationToken,
     ) -> RawDocument:
+        return (
+            await self.fetch_with_usage(
+                url,
+                deadline=deadline,
+                cancellation_token=cancellation_token,
+            )
+        ).value
+
+    async def fetch_with_usage(
+        self,
+        url: str,
+        *,
+        deadline: float,
+        cancellation_token: CancellationToken,
+    ) -> ProviderUsageResult[RawDocument]:
         checkpoint(
             deadline=deadline,
             cancellation_token=cancellation_token,
             provider_id=self.provider_id,
             operation="fetch",
         )
-        before = len(self._executor.attempts)
-        started = time.monotonic()
-        caught: ProviderError | None = None
-        document: RawDocument | None = None
-
         async def invoke(call_deadline: float) -> RawDocument:
             return await self._fetch_once(
                 url,
@@ -409,34 +427,28 @@ class HttpxFetcher:
                 cancellation_token=cancellation_token,
             )
 
-        try:
-            document = await self._executor.call(
-                "fetch", invoke, remaining_deadline=deadline
-            )
-        except ProviderError as error:
-            caught = error
-        attempts = self._executor.attempts[before:]
-        retries = sum(attempt.attempt_index > 0 for attempt in attempts)
-        usage = _fetch_usage(
-            pages=int(document is not None),
-            retries=retries,
-            wall_seconds=max(0, time.monotonic() - started),
+        outcome = await self._executor.call_with_trace(
+            "fetch", invoke, remaining_deadline=deadline
         )
-        self.last_usage = usage
-        if caught is not None:
+        usage = _fetch_usage(
+            pages=int(outcome.result is not None),
+            retries=outcome.trace.retries,
+            wall_seconds=outcome.trace.wall_seconds,
+        )
+        if outcome.error is not None:
             failure = ProviderError(
-                code=caught.code,
+                code=outcome.error.code,
                 provider=self.provider_id,
                 operation="fetch",
-                public_message=caught.public_message,
-                retryable=caught.retryable,
-                retry_after=caught.retry_after,
+                public_message=outcome.error.public_message,
+                retryable=outcome.error.retryable,
+                retry_after=outcome.error.retry_after,
                 usage=usage,
             )
-            raise failure
-        if document is None:
+            raise failure from None
+        if outcome.result is None:
             raise RuntimeError("fetch executor returned no document")
-        return document
+        return ProviderUsageResult(value=outcome.result, usage=usage)
 
 
 __all__ = ["HostSlot", "HttpxFetcher", "no_op_host_slot", "resolve_host"]
