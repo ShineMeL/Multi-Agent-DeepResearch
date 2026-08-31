@@ -516,6 +516,43 @@ async def test_openai_stream_accepts_ordered_function_tool_fragments() -> None:
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_openai_stream_accepts_fragmented_nested_tool_object() -> None:
+    respx.post("https://model.test/v1/chat/completions").respond(
+        200,
+        headers={"content-type": "text/event-stream"},
+        content=(
+            b'data: {"choices":[{"index":0,"delta":{"tool_calls":['
+            b'{"index":0,"id":"call-1","type":"function","function":'
+            b'{"name":"search","arguments":"{\\"query\\":{\\"filters\\":['
+            b'"}}]}}]}\n\n'
+            b'data: {"choices":[{"index":0,"delta":{"tool_calls":['
+            b'{"index":0,"function":{"arguments":"{\\"field\\":\\"year\\",'
+            b'\\"values\\":[2025,2026]}]}}"}}]},"finish_reason":"tool_calls"}]}'
+            b'\n\n'
+            b'data: {"choices":[],"usage":{"prompt_tokens":10,'
+            b'"completion_tokens":3,"total_tokens":13}}\n\n'
+            b'data: [DONE]\n\n'
+        ),
+    )
+
+    chunks = tuple(
+        [
+            chunk
+            async for chunk in _provider().stream(
+                _request(),
+                deadline=_deadline(),
+                cancellation_token=CancellationToken(),
+            )
+        ]
+    )
+
+    assert chunks[-1].finish_reason == "tool_calls"
+    assert chunks[-1].final_usage is not None
+    assert chunks[-1].final_usage.total_tokens == 13
+
+
+@pytest.mark.asyncio
+@respx.mock
 @pytest.mark.parametrize(
     "argument_fragments",
     (
@@ -525,6 +562,10 @@ async def test_openai_stream_accepts_ordered_function_tool_fragments() -> None:
         ("{}", "{}"),
         ('{"query":"one","query":"two"}',),
         ('{"query":"agents"} trailing',),
+        ('{"value":NaN}',),
+        ('{"value":Infinity}',),
+        ('{"value":-Infinity}',),
+        ('{"nested":{"value":NaN}}',),
     ),
 )
 async def test_openai_stream_rejects_nonobject_or_incomplete_tool_arguments(
@@ -612,6 +653,71 @@ async def test_openai_stream_rejects_nonobject_or_incomplete_tool_arguments(
         )
 
     assert error.value.code == "INVALID_RESPONSE"
+    assert error.value.usage is not None
+    assert error.value.usage.total_tokens == 13
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_openai_stream_maps_excessive_tool_json_nesting_to_typed_failure() -> None:
+    arguments = '{"value":' + "[" * 1500 + "0" + "]" * 1500 + "}"
+    events = (
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "search",
+                                    "arguments": arguments,
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        },
+        {
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 3,
+                "total_tokens": 13,
+            },
+        },
+    )
+    content = b"".join(
+        f"data: {json.dumps(event, separators=(',', ':'))}\n\n".encode()
+        for event in events
+    ) + b"data: [DONE]\n\n"
+    respx.post("https://model.test/v1/chat/completions").respond(
+        200, headers={"content-type": "text/event-stream"}, content=content
+    )
+
+    with pytest.raises(ProviderError) as error:
+        tuple(
+            [
+                chunk
+                async for chunk in _provider().stream(
+                    _request(),
+                    deadline=_deadline(),
+                    cancellation_token=CancellationToken(),
+                )
+            ]
+        )
+
+    assert error.value.code == "INVALID_RESPONSE"
+    assert error.value.public_message == "model stream tool arguments were invalid"
+    assert error.value.usage is not None
+    assert error.value.usage.total_tokens == 13
     assert error.value.__cause__ is None
     assert error.value.__context__ is None
 

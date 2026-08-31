@@ -8,12 +8,14 @@ import os
 import re
 import stat
 import sys
+import tempfile
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from itertools import pairwise
 from math import isfinite
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Any, BinaryIO, TypeVar, cast
 from urllib.parse import unquote, urlsplit
 
 from pydantic import JsonValue
@@ -152,7 +154,7 @@ def _path_identity(path: Path) -> tuple[int, int]:
     return (details.st_dev, details.st_ino)
 
 
-def _open_windows_marker(path: Path, *, delete_access: bool) -> tuple[Any, int]:
+def _open_windows_marker(path: Path, *, create_new: bool) -> tuple[Any, int]:
     import ctypes
     from ctypes import wintypes
 
@@ -169,13 +171,15 @@ def _open_windows_marker(path: Path, *, delete_access: bool) -> tuple[Any, int]:
     kernel32.CreateFileW.restype = wintypes.HANDLE
     kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
     kernel32.CloseHandle.restype = wintypes.BOOL
-    desired_access = 0x00000080 | (0x00010000 if delete_access else 0)
+    desired_access = 0x00000080
+    if create_new:
+        desired_access |= 0x80000000 | 0x40000000 | 0x00010000
     handle = kernel32.CreateFileW(
         str(path),
         desired_access,
         0x00000001 | 0x00000002 | 0x00000004,
         None,
-        3,
+        1 if create_new else 3,
         0x00200000,
         None,
     )
@@ -221,33 +225,91 @@ def _close_windows_handle(kernel32: Any, handle: int) -> None:
         raise ctypes.WinError(ctypes.get_last_error())
 
 
+def _write_windows_marker(kernel32: Any, handle: int, payload: bytes) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32.WriteFile.argtypes = (
+        wintypes.HANDLE,
+        wintypes.LPCVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
+    )
+    kernel32.WriteFile.restype = wintypes.BOOL
+    kernel32.FlushFileBuffers.argtypes = (wintypes.HANDLE,)
+    kernel32.FlushFileBuffers.restype = wintypes.BOOL
+    buffer = ctypes.create_string_buffer(payload)
+    written = wintypes.DWORD()
+    if not kernel32.WriteFile(
+        handle, buffer, len(payload), ctypes.byref(written), None
+    ) or written.value != len(payload):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if not kernel32.FlushFileBuffers(handle):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _read_windows_marker(
+    kernel32: Any, handle: int, expected_size: int
+) -> bytes | None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32.GetFileSizeEx.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(ctypes.c_longlong),
+    )
+    kernel32.GetFileSizeEx.restype = wintypes.BOOL
+    kernel32.SetFilePointerEx.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_longlong,
+        ctypes.POINTER(ctypes.c_longlong),
+        wintypes.DWORD,
+    )
+    kernel32.SetFilePointerEx.restype = wintypes.BOOL
+    kernel32.ReadFile.argtypes = (
+        wintypes.HANDLE,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
+    )
+    kernel32.ReadFile.restype = wintypes.BOOL
+    size = ctypes.c_longlong()
+    if not kernel32.GetFileSizeEx(handle, ctypes.byref(size)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if size.value != expected_size:
+        return None
+    if not kernel32.SetFilePointerEx(handle, 0, None, 0):
+        raise ctypes.WinError(ctypes.get_last_error())
+    buffer = ctypes.create_string_buffer(expected_size)
+    read = wintypes.DWORD()
+    if not kernel32.ReadFile(
+        handle, buffer, expected_size, ctypes.byref(read), None
+    ) or read.value != expected_size:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return buffer.raw[:expected_size]
+
+
 def _marker_identity(path: Path) -> tuple[int, int]:
     if os.name != "nt":
         details = path.stat(follow_symlinks=False)
         if not stat.S_ISREG(details.st_mode):
             raise ValueError("replay cleanup marker must be a regular file")
         return details.st_dev, details.st_ino
-    kernel32, handle = _open_windows_marker(path, delete_access=False)
+    kernel32, handle = _open_windows_marker(path, create_new=False)
     try:
         return _windows_handle_identity(kernel32, handle)
     finally:
         _close_windows_handle(kernel32, handle)
 
 
-def _remove_marker_by_identity(path: Path, expected_identity: tuple[int, int]) -> None:
-    if os.name != "nt":
-        raise OSError(
-            "identity-coupled repaired marker removal is unavailable on this platform"
-        )
+def _remove_windows_marker_handle(kernel32: Any, handle: int) -> None:
     import ctypes
     from ctypes import wintypes
 
-    kernel32, handle = _open_windows_marker(path, delete_access=True)
     disposition_succeeded = False
     try:
-        if _windows_handle_identity(kernel32, handle) != expected_identity:
-            raise ValueError("repaired replay cleanup marker was substituted")
-
         class FileDispositionInformation(ctypes.Structure):
             _fields_ = (("delete_file", wintypes.BOOL),)
 
@@ -273,6 +335,173 @@ def _remove_marker_by_identity(path: Path, expected_identity: tuple[int, int]) -
         except OSError:
             if disposition_succeeded:
                 raise
+
+
+def _open_posix_anonymous_marker(staging: Path, directory_descriptor: int) -> BinaryIO:
+    if sys.platform.startswith("linux"):
+        anonymous_flag = getattr(os, "O_TMPFILE", 0)
+        if not anonymous_flag:
+            raise OSError("anonymous repaired marker creation is unavailable")
+        descriptor = os.open(
+            ".",
+            os.O_RDWR
+            | anonymous_flag
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+        return cast("BinaryIO", os.fdopen(descriptor, "w+b"))
+    if sys.platform == "darwin":
+        return cast(
+            "BinaryIO",
+            tempfile.TemporaryFile(
+                mode="w+b", prefix=".replay-repair-", dir=staging
+            ),
+        )
+    raise OSError("anonymous repaired marker creation is unsupported")
+
+
+@dataclass
+class _RepairedMarkerProof:
+    directory_identity: tuple[int, int]
+    marker_identity: tuple[int, int]
+    payload: bytes
+    marker_path: Path | None = None
+    windows_api: Any | None = None
+    windows_handle: int | None = None
+    posix_file: BinaryIO | None = None
+    directory_descriptor: int | None = None
+    marker_removed: bool = False
+
+    def validate_creation_object(self) -> None:
+        if self.marker_removed:
+            return
+        if self.windows_handle is not None:
+            if (
+                self.windows_api is None
+                or _windows_handle_identity(
+                    self.windows_api, self.windows_handle
+                )
+                != self.marker_identity
+                or _read_windows_marker(
+                    self.windows_api, self.windows_handle, len(self.payload)
+                )
+                != self.payload
+            ):
+                raise ValueError("repaired replay marker creation object changed")
+            return
+        if self.posix_file is None:
+            raise RuntimeError("repaired replay marker creation object is unavailable")
+        details = os.fstat(self.posix_file.fileno())
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or (details.st_dev, details.st_ino) != self.marker_identity
+        ):
+            raise ValueError("repaired replay marker creation object changed")
+        self.posix_file.seek(0)
+        if self.posix_file.read(len(self.payload) + 1) != self.payload:
+            raise ValueError("repaired replay marker payload changed")
+
+    def validate_directory_object(self, staging: Path) -> None:
+        if self.directory_descriptor is None:
+            return
+        details = os.fstat(self.directory_descriptor)
+        if (
+            not stat.S_ISDIR(details.st_mode)
+            or (details.st_dev, details.st_ino) != self.directory_identity
+            or _path_identity(staging) != self.directory_identity
+        ):
+            raise ValueError("repaired replay cleanup directory was substituted")
+
+    def remove_marker(self) -> None:
+        if self.marker_removed:
+            return
+        if self.windows_handle is not None:
+            if self.windows_api is None:
+                raise RuntimeError("repaired replay marker handle is unavailable")
+            _remove_windows_marker_handle(self.windows_api, self.windows_handle)
+            self.windows_handle = None
+        elif self.posix_file is not None:
+            self.posix_file.close()
+            self.posix_file = None
+        else:
+            raise RuntimeError("repaired replay marker creation object is unavailable")
+        self.marker_removed = True
+
+    def close_directory(self) -> None:
+        descriptor = self.directory_descriptor
+        if descriptor is not None:
+            self.directory_descriptor = None
+            os.close(descriptor)
+
+
+def _create_repaired_marker_proof(
+    staging: Path,
+    marker_path: Path,
+    payload: bytes,
+    directory_identity: tuple[int, int],
+) -> _RepairedMarkerProof:
+    if os.name == "nt":
+        kernel32, handle = _open_windows_marker(marker_path, create_new=True)
+        try:
+            _write_windows_marker(kernel32, handle, payload)
+            marker_identity = _windows_handle_identity(kernel32, handle)
+            proof = _RepairedMarkerProof(
+                directory_identity=directory_identity,
+                marker_identity=marker_identity,
+                payload=payload,
+                marker_path=marker_path,
+                windows_api=kernel32,
+                windows_handle=handle,
+            )
+            proof.validate_creation_object()
+            return proof
+        except BaseException:
+            try:
+                _remove_windows_marker_handle(kernel32, handle)
+            except OSError:
+                pass
+            raise
+
+    directory_descriptor = os.open(
+        staging,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    marker_file: BinaryIO | None = None
+    try:
+        directory_details = os.fstat(directory_descriptor)
+        if (
+            not stat.S_ISDIR(directory_details.st_mode)
+            or (directory_details.st_dev, directory_details.st_ino)
+            != directory_identity
+            or _path_identity(staging) != directory_identity
+        ):
+            raise ValueError("repaired replay cleanup directory was substituted")
+        marker_file = _open_posix_anonymous_marker(staging, directory_descriptor)
+        marker_file.write(payload)
+        marker_file.flush()
+        os.fsync(marker_file.fileno())
+        marker_details = os.fstat(marker_file.fileno())
+        proof = _RepairedMarkerProof(
+            directory_identity=directory_identity,
+            marker_identity=(marker_details.st_dev, marker_details.st_ino),
+            payload=payload,
+            posix_file=marker_file,
+            directory_descriptor=directory_descriptor,
+        )
+        proof.validate_directory_object(staging)
+        proof.validate_creation_object()
+        if tuple(staging.iterdir()):
+            raise ValueError("repaired replay cleanup tombstone contains unowned contents")
+        return proof
+    except BaseException:
+        if marker_file is not None:
+            marker_file.close()
+        os.close(directory_descriptor)
+        raise
 
 
 def _remove_exact_created_staging(
@@ -628,7 +857,7 @@ class ReplayBundleWriter:
         self._closed = False
         self._published = False
         self._cleanup_tombstone: Path | None = None
-        self._repaired_marker_identity: tuple[int, int] | None = None
+        self._repaired_marker_proof: _RepairedMarkerProof | None = None
 
     @classmethod
     def create(cls, final_root: Path, *, run_id: str) -> ReplayBundleWriter:
@@ -875,9 +1104,9 @@ class ReplayBundleWriter:
                 self._release_lock()
 
     def _remove_owned_staging(self) -> None:
-        repaired_marker_identity = self._repair_missing_cleanup_marker()
-        if repaired_marker_identity is not None:
-            self._remove_repaired_cleanup_tombstone(repaired_marker_identity)
+        repaired_marker_proof = self._repair_missing_cleanup_marker()
+        if repaired_marker_proof is not None:
+            self._remove_repaired_cleanup_tombstone(repaired_marker_proof)
             return
         staging = self._validate_owned_staging()
         if self._cleanup_tombstone is None:
@@ -912,7 +1141,10 @@ class ReplayBundleWriter:
         try:
             staging.rmdir()
         except OSError:
-            _write_fsynced(marker_path, marker_payload)
+            proof = _create_repaired_marker_proof(
+                staging, marker_path, marker_payload, self._staging_identity
+            )
+            self._repaired_marker_proof = proof
             _fsync_directory(staging)
             _fsync_directory(staging.parent)
             raise
@@ -920,23 +1152,27 @@ class ReplayBundleWriter:
         _fsync_directory(staging.parent)
 
     def _remove_repaired_cleanup_tombstone(
-        self, marker_identity: tuple[int, int]
+        self, proof: _RepairedMarkerProof
     ) -> None:
         staging = self._staging_root
         tombstone = self._cleanup_tombstone
         if staging is None or tombstone is None:
             raise RuntimeError("repaired replay cleanup tombstone is unavailable")
         marker_path = staging / self._MARKER_NAME
-        self._validate_repaired_tombstone(staging, marker_path, marker_required=True)
-        _remove_marker_by_identity(marker_path, marker_identity)
-        self._validate_repaired_tombstone(staging, marker_path, marker_required=False)
+        self._validate_repaired_tombstone(staging, marker_path, proof)
+        proof.remove_marker()
+        self._validate_repaired_tombstone(staging, marker_path, proof)
         staging.rmdir()
+        proof.close_directory()
         self._staging_root = None
-        self._repaired_marker_identity = None
+        self._repaired_marker_proof = None
         _fsync_directory(staging.parent)
 
     def _validate_repaired_tombstone(
-        self, staging: Path, marker_path: Path, *, marker_required: bool
+        self,
+        staging: Path,
+        marker_path: Path,
+        proof: _RepairedMarkerProof,
     ) -> None:
         parent = self._final_root.parent.resolve(strict=True)
         device, inode = self._staging_identity
@@ -950,24 +1186,31 @@ class ReplayBundleWriter:
             or _is_link_or_reparse(staging)
             or staging.resolve(strict=True) != expected_tombstone
             or _path_identity(staging) != self._staging_identity
-            or _is_link_or_reparse(marker_path)
         ):
             raise ValueError("repaired replay cleanup tombstone changed identity")
+        proof.validate_directory_object(staging)
+        proof.validate_creation_object()
+        marker_required = not proof.marker_removed and proof.marker_path is not None
+        if marker_required and (
+            _is_link_or_reparse(marker_path)
+            or _marker_identity(marker_path) != proof.marker_identity
+        ):
+            raise ValueError("repaired replay cleanup marker was substituted")
         entries = tuple(staging.iterdir())
         expected_entries = (marker_path,) if marker_required else ()
         if entries != expected_entries:
             raise ValueError("repaired replay cleanup tombstone contains unowned contents")
-        if marker_required:
-            self._validate_owned_staging()
 
-    def _repair_missing_cleanup_marker(self) -> tuple[int, int] | None:
+    def _repair_missing_cleanup_marker(self) -> _RepairedMarkerProof | None:
         staging = self._staging_root
         tombstone = self._cleanup_tombstone
         if staging is None or tombstone is None:
             return None
+        if self._repaired_marker_proof is not None:
+            return self._repaired_marker_proof
         marker_path = staging / self._MARKER_NAME
         if marker_path.exists():
-            return self._repaired_marker_identity
+            return None
         parent = self._final_root.parent.resolve(strict=True)
         device, inode = self._staging_identity
         expected_tombstone = parent / (
@@ -991,24 +1234,17 @@ class ReplayBundleWriter:
             or _is_link_or_reparse(marker_path)
         ):
             raise ValueError("replay cleanup tombstone changed during ownership check")
-        _write_fsynced(
-            marker_path, canonical_json_bytes(self._expected_marker())
+        proof = _create_repaired_marker_proof(
+            staging,
+            marker_path,
+            canonical_json_bytes(self._expected_marker()),
+            self._staging_identity,
         )
-        if (
-            _is_link_or_reparse(staging)
-            or staging.resolve(strict=True) != expected_tombstone
-            or _path_identity(staging) != self._staging_identity
-            or _is_link_or_reparse(marker_path)
-        ):
-            raise ValueError("replay cleanup tombstone changed during marker repair")
-        if tuple(staging.iterdir()) != (marker_path,):
-            raise ValueError("replay cleanup tombstone contains unowned contents")
-        self._validate_owned_staging()
+        self._repaired_marker_proof = proof
         _fsync_directory(staging)
         _fsync_directory(parent)
-        marker_identity = _marker_identity(marker_path)
-        self._repaired_marker_identity = marker_identity
-        return marker_identity
+        self._validate_repaired_tombstone(staging, marker_path, proof)
+        return proof
 
     def _validate_owned_staging(self) -> Path:
         staging = self._staging_root

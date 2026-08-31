@@ -1245,8 +1245,18 @@ async def _leave_owned_tombstone_without_marker(
             raise OSError("synthetic cleanup root failure")
         original_rmdir(path)
 
+    def fail_marker_proof(*args: Any, **kwargs: Any) -> NoReturn:
+        del args, kwargs
+        raise OSError("synthetic marker restoration failure")
+
     monkeypatch.setattr(
         recording_module, "_write_fsynced", fail_record_and_marker_restore
+    )
+    monkeypatch.setattr(
+        recording_module,
+        "_create_repaired_marker_proof",
+        fail_marker_proof,
+        raising=False,
     )
     monkeypatch.setattr(Path, "rmdir", fail_cleanup_root)
     with pytest.raises(OSError, match="cleanup"):
@@ -1270,22 +1280,118 @@ async def test_abort_repairs_owned_missing_tombstone_marker_and_retries_cleanup(
     replacement = ReplayBundleWriter.create(final_root, run_id="same-run")
     await replacement.abort()
     monkeypatch.undo()
-    if os.name != "nt":
-        for _ in range(2):
-            with pytest.raises(OSError, match="identity-coupled.*unavailable"):
-                await writer.abort()
-        assert tombstone.is_dir()
-        assert (tombstone / ".replay-writer-owner.json").is_file()
-        second_replacement = ReplayBundleWriter.create(final_root, run_id="same-run")
-        await second_replacement.abort()
-        return
-
     await writer.abort()
     await writer.abort()
 
     assert not tombstone.exists()
     second_replacement = ReplayBundleWriter.create(final_root, run_id="same-run")
     await second_replacement.abort()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "nt", reason="exercises Windows handle disposition")
+async def test_repaired_marker_proof_never_adopts_post_creation_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final_root = tmp_path / "marker-creation-substitution"
+    writer, tombstone = await _leave_owned_tombstone_without_marker(
+        final_root, monkeypatch
+    )
+    monkeypatch.undo()
+    marker = tombstone / ".replay-writer-owner.json"
+    moved_marker = tmp_path / "owned-creation-marker"
+    marker_payload = (
+        b'{"final_name":"marker-creation-substitution","run_id":"same-run",'
+        b'"schema_version":"replay-bundle-v1"}'
+    )
+    original_fsync_directory = recording_module._fsync_directory
+    substituted = False
+
+    def substitute_at_legacy_identity_gap(path: Path) -> None:
+        nonlocal substituted
+        original_fsync_directory(path)
+        if path == tombstone and marker.is_file() and not substituted:
+            substituted = True
+            marker.rename(moved_marker)
+            marker.write_bytes(marker_payload)
+
+    monkeypatch.setattr(
+        recording_module, "_fsync_directory", substitute_at_legacy_identity_gap
+    )
+
+    with pytest.raises(ValueError, match="marker|identity|substitut|contents"):
+        await writer.abort()
+
+    assert substituted
+    assert marker.is_file()
+    assert tombstone.is_dir()
+    with pytest.raises(ValueError, match="marker|identity|substitut|owned"):
+        await writer.abort()
+    assert marker.is_file()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="exercises POSIX anonymous marker")
+async def test_posix_anonymous_marker_rejects_tombstone_path_substitution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final_root = tmp_path / "posix-directory-substitution"
+    writer, tombstone = await _leave_owned_tombstone_without_marker(
+        final_root, monkeypatch
+    )
+    monkeypatch.undo()
+    moved_owned = tombstone.with_name(f"{tombstone.name}.owned")
+    sentinel = tombstone / "sentinel.txt"
+    original_anonymous_marker = recording_module._open_posix_anonymous_marker
+    substituted = False
+
+    def substitute_after_anonymous_creation(*args: Any, **kwargs: Any) -> Any:
+        nonlocal substituted
+        created = original_anonymous_marker(*args, **kwargs)
+        if not substituted:
+            substituted = True
+            tombstone.rename(moved_owned)
+            tombstone.mkdir()
+            sentinel.write_text("not-owned", encoding="utf-8")
+        return created
+
+    monkeypatch.setattr(
+        recording_module,
+        "_open_posix_anonymous_marker",
+        substitute_after_anonymous_creation,
+    )
+
+    with pytest.raises(ValueError, match="identity|substitut|owned"):
+        await writer.abort()
+
+    assert sentinel.read_text(encoding="utf-8") == "not-owned"
+    assert moved_owned.is_dir()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="exercises POSIX anonymous marker")
+async def test_posix_anonymous_marker_creation_failure_preserves_empty_tombstone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final_root = tmp_path / "posix-anonymous-unsupported"
+    writer, tombstone = await _leave_owned_tombstone_without_marker(
+        final_root, monkeypatch
+    )
+    monkeypatch.undo()
+
+    def fail_anonymous_creation(*args: Any, **kwargs: Any) -> NoReturn:
+        del args, kwargs
+        raise OSError("synthetic anonymous marker unsupported")
+
+    monkeypatch.setattr(
+        recording_module, "_open_posix_anonymous_marker", fail_anonymous_creation
+    )
+
+    with pytest.raises(OSError, match="anonymous marker unsupported"):
+        await writer.abort()
+
+    assert tombstone.is_dir()
+    assert tuple(tombstone.iterdir()) == ()
 
 
 @pytest.mark.asyncio
@@ -1297,15 +1403,17 @@ async def test_repaired_tombstone_never_recursively_deletes_post_write_competito
         final_root, monkeypatch
     )
     monkeypatch.undo()
-    original_write = recording_module._write_fsynced
+    original_create_proof = recording_module._create_repaired_marker_proof
     sentinel = tombstone / "unowned.txt"
 
-    def inject_after_marker_write(path: Path, payload: bytes) -> None:
-        original_write(path, payload)
-        if path.parent == tombstone and path.name == ".replay-writer-owner.json":
-            sentinel.write_text("unowned", encoding="utf-8")
+    def inject_after_marker_creation(*args: Any, **kwargs: Any) -> Any:
+        proof = original_create_proof(*args, **kwargs)
+        sentinel.write_text("unowned", encoding="utf-8")
+        return proof
 
-    monkeypatch.setattr(recording_module, "_write_fsynced", inject_after_marker_write)
+    monkeypatch.setattr(
+        recording_module, "_create_repaired_marker_proof", inject_after_marker_creation
+    )
 
     with pytest.raises(ValueError, match="contents|changed|owned"):
         await writer.abort()
@@ -1323,15 +1431,16 @@ async def test_repaired_tombstone_rejects_pre_write_competitor(
         final_root, monkeypatch
     )
     monkeypatch.undo()
-    original_write = recording_module._write_fsynced
+    original_create_proof = recording_module._create_repaired_marker_proof
     sentinel = tombstone / "unowned.txt"
 
-    def inject_before_marker_write(path: Path, payload: bytes) -> None:
-        if path.parent == tombstone and path.name == ".replay-writer-owner.json":
-            sentinel.write_text("unowned", encoding="utf-8")
-        original_write(path, payload)
+    def inject_before_marker_creation(*args: Any, **kwargs: Any) -> Any:
+        sentinel.write_text("unowned", encoding="utf-8")
+        return original_create_proof(*args, **kwargs)
 
-    monkeypatch.setattr(recording_module, "_write_fsynced", inject_before_marker_write)
+    monkeypatch.setattr(
+        recording_module, "_create_repaired_marker_proof", inject_before_marker_creation
+    )
 
     with pytest.raises(ValueError, match="contents|changed|owned"):
         await writer.abort()
@@ -1371,6 +1480,7 @@ async def test_repaired_tombstone_rmdir_fails_closed_on_late_competitor(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "nt", reason="exercises Windows marker pathname")
 async def test_repaired_tombstone_never_unlinks_marker_substituted_after_validation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1380,18 +1490,25 @@ async def test_repaired_tombstone_never_unlinks_marker_substituted_after_validat
     )
     monkeypatch.undo()
     marker = tombstone / ".replay-writer-owner.json"
+    moved_marker = tmp_path / "owned-repaired-marker"
+    marker_payload = (
+        b'{"final_name":"marker-unlink-substitution","run_id":"same-run",'
+        b'"schema_version":"replay-bundle-v1"}'
+    )
     original_validate = writer._validate_repaired_tombstone
     substituted = False
 
     def substitute_after_final_validation(
-        staging: Path, marker_path: Path, *, marker_required: bool
+        staging: Path,
+        marker_path: Path,
+        proof: Any,
     ) -> None:
         nonlocal substituted
-        original_validate(staging, marker_path, marker_required=marker_required)
-        if marker_required and not substituted:
+        original_validate(staging, marker_path, proof)
+        if not proof.marker_removed and not substituted:
             substituted = True
-            marker_path.unlink()
-            marker_path.write_text("{}", encoding="utf-8")
+            marker_path.rename(moved_marker)
+            marker_path.write_bytes(marker_payload)
 
     monkeypatch.setattr(
         writer, "_validate_repaired_tombstone", substitute_after_final_validation
@@ -1400,11 +1517,11 @@ async def test_repaired_tombstone_never_unlinks_marker_substituted_after_validat
     with pytest.raises((OSError, ValueError), match="marker|identity|substitut"):
         await writer.abort()
 
-    assert marker.read_text(encoding="utf-8") == "{}"
+    assert marker.is_file()
     assert tombstone.is_dir()
-    with pytest.raises(ValueError, match="marker|owned"):
+    with pytest.raises(ValueError, match="marker|contents|owned"):
         await writer.abort()
-    assert marker.read_text(encoding="utf-8") == "{}"
+    assert marker.is_file()
 
 
 @pytest.mark.asyncio

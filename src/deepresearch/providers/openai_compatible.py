@@ -32,6 +32,8 @@ from .httpx_transport import await_with_controls, checkpoint
 
 T = TypeVar("T")
 R = TypeVar("R")
+_MAX_TOOL_ARGUMENT_CHARACTERS = 1024 * 1024
+_MAX_TOOL_ARGUMENT_NESTING = 128
 
 
 @dataclass(frozen=True)
@@ -85,6 +87,64 @@ def _usage(payload: object) -> ResourceUsage:
         wall_seconds=0,
         cost_usd=None,
     )
+
+
+def _tool_json_nesting_is_bounded(value: str) -> bool:
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in value:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > _MAX_TOOL_ARGUMENT_NESTING:
+                return False
+        elif character in "]}":
+            depth -= 1
+    return True
+
+
+def _is_strict_tool_json_object(value: str) -> bool:
+    if (
+        len(value) > _MAX_TOOL_ARGUMENT_CHARACTERS
+        or not _tool_json_nesting_is_bounded(value)
+    ):
+        return False
+    duplicate_key = False
+
+    def object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        nonlocal duplicate_key
+        result: dict[str, object] = {}
+        for key, item in pairs:
+            if key in result:
+                duplicate_key = True
+            result[key] = item
+        return result
+
+    def reject_constant(value: str) -> object:
+        del value
+        raise ValueError("non-finite JSON constants are forbidden")
+
+    try:
+        decoded = json.loads(
+            value,
+            object_pairs_hook=object_pairs,
+            parse_constant=reject_constant,
+        )
+    # The decoder is an untrusted-input boundary; no implementation detail
+    # (including recursion or allocation failures) may escape it.
+    except Exception:  # noqa: BLE001
+        return False
+    return isinstance(decoded, dict) and not duplicate_key
 
 
 class OpenAICompatibleModelProvider:
@@ -624,6 +684,13 @@ class OpenAICompatibleModelProvider:
                     except (TypeError, ValueError, ValidationError):
                         raise invalid_stream("model stream contained invalid usage") from None
                     terminal_usage_seen = True
+                    if finish_reason == "tool_calls" and not all(
+                        _is_strict_tool_json_object(arguments)
+                        for arguments in tool_argument_buffers.values()
+                    ):
+                        raise invalid_stream(
+                            "model stream tool arguments were invalid"
+                        )
                     continue
                 if terminal_usage_seen or finished or "usage" in decoded_mapping:
                     raise invalid_stream("model stream choice order was invalid")
@@ -682,6 +749,8 @@ class OpenAICompatibleModelProvider:
                         arguments = function.get("arguments")
                         if not isinstance(arguments, str):
                             raise invalid_stream("model stream tool arguments were invalid")
+                        if len(arguments) > _MAX_TOOL_ARGUMENT_CHARACTERS:
+                            raise invalid_stream("model stream tool arguments were invalid")
                         if tool_index == current_tool_index + 1:
                             tool_id = tool.get("id")
                             tool_type = tool.get("type")
@@ -717,6 +786,14 @@ class OpenAICompatibleModelProvider:
                                 raise invalid_stream(
                                     "model stream tool identity was inconsistent"
                                 )
+                            if (
+                                len(tool_argument_buffers[tool_index])
+                                + len(arguments)
+                                > _MAX_TOOL_ARGUMENT_CHARACTERS
+                            ):
+                                raise invalid_stream(
+                                    "model stream tool arguments were invalid"
+                                )
                             tool_argument_buffers[tool_index] += arguments
                         tool_call_seen = True
                 raw_finish = choice_mapping.get("finish_reason")
@@ -725,33 +802,6 @@ class OpenAICompatibleModelProvider:
                         raise invalid_stream("model stream finish reason was invalid")
                     if (raw_finish == "tool_calls") != tool_call_seen:
                         raise invalid_stream("model stream finish reason was inconsistent")
-                    if raw_finish == "tool_calls":
-                        for arguments in tool_argument_buffers.values():
-                            duplicate_key = False
-
-                            def object_pairs(
-                                pairs: list[tuple[str, object]],
-                            ) -> dict[str, object]:
-                                nonlocal duplicate_key
-                                result: dict[str, object] = {}
-                                for key, item in pairs:
-                                    if key in result:
-                                        duplicate_key = True
-                                    result[key] = item
-                                return result
-
-                            try:
-                                decoded_arguments = json.loads(
-                                    arguments, object_pairs_hook=object_pairs
-                                )
-                            except (json.JSONDecodeError, TypeError, ValueError):
-                                raise invalid_stream(
-                                    "model stream tool arguments were invalid"
-                                ) from None
-                            if not isinstance(decoded_arguments, dict) or duplicate_key:
-                                raise invalid_stream(
-                                    "model stream tool arguments were invalid"
-                                )
                     finish_reason = raw_finish
                     finished = True
                 if not delta and raw_finish is None:
