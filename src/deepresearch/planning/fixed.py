@@ -517,7 +517,7 @@ class FixedPlanner:
             deadline=deadline,
             cancellation_token=cancellation_token,
         )
-        report = self.validator.validate_candidate(
+        report = self.validator.validate_generated_candidate(
             raw,
             request=request,
             budget=self._effective_budget(),
@@ -543,7 +543,7 @@ class FixedPlanner:
             cancellation_token=cancellation_token,
             local_capacity_fallback=null_repair_fallback,
         )
-        repaired = self.validator.validate_candidate(
+        repaired = self.validator.validate_generated_candidate(
             repaired_raw,
             request=request,
             budget=self._effective_budget(),

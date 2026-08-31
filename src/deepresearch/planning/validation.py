@@ -521,6 +521,7 @@ def _is_over_budget(
     *,
     request: ResearchRequest | None,
     search_depth: int,
+    include_plan_generation: bool = True,
 ) -> bool:
     used_searches = sum(usage.search_calls for usage in budget.used_by_node.values())
     used_pages = sum(usage.pages for usage in budget.used_by_node.values())
@@ -540,7 +541,7 @@ def _is_over_budget(
         + 1_000 * required_pages
         + _p1_prompt_token_upper_bound(
             plan,
-            request,
+            request if include_plan_generation else None,
             search_depth=search_depth,
         )
     )
@@ -571,6 +572,39 @@ class PlanValidator:
         request: ResearchRequest | None,
         budget: RunBudget | None,
         candidate_artifact_id: str | None = None,
+    ) -> PlanValidationReport:
+        return self._validate_candidate(
+            candidate,
+            request=request,
+            budget=budget,
+            candidate_artifact_id=candidate_artifact_id,
+            include_plan_generation=True,
+        )
+
+    def validate_generated_candidate(
+        self,
+        candidate: str | bytes | Mapping[str, JsonValue] | ResearchPlan,
+        *,
+        request: ResearchRequest,
+        budget: RunBudget,
+        candidate_artifact_id: str | None = None,
+    ) -> PlanValidationReport:
+        return self._validate_candidate(
+            candidate,
+            request=request,
+            budget=budget,
+            candidate_artifact_id=candidate_artifact_id,
+            include_plan_generation=False,
+        )
+
+    def _validate_candidate(
+        self,
+        candidate: str | bytes | Mapping[str, JsonValue] | ResearchPlan,
+        *,
+        request: ResearchRequest | None,
+        budget: RunBudget | None,
+        candidate_artifact_id: str | None,
+        include_plan_generation: bool,
     ) -> PlanValidationReport:
         codes: set[PlanValidationCode] = set()
         if isinstance(candidate, ResearchPlan):
@@ -688,6 +722,7 @@ class PlanValidator:
                 budget,
                 request=request,
                 search_depth=self.search_depth,
+                include_plan_generation=include_plan_generation,
             ):
                 codes.add("BUDGET_INFEASIBLE")
 

@@ -1192,11 +1192,42 @@ async def test_over_budget_valid_plan_is_audited_but_not_returned(
 
 
 @pytest.mark.asyncio
-async def test_settled_planner_usage_is_included_once_before_plan_publication(
+async def test_settled_usage_does_not_double_count_completed_plan_generation(
     tmp_path: Path,
 ) -> None:
     raw = plan_json()
     model = FakeModel([raw], complete_usages=[model_usage(11_000)])
+    original_budget = RunBudget.preset("low")
+    original_usage = dict(original_budget.used_by_node)
+    original_usage["Planner"] = model_usage(1_000)
+    budget = original_budget.model_copy(update={"used_by_node": original_usage})
+    store = LocalArtifactStore(tmp_path)
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=store,
+        budget=budget,
+    )
+
+    plan = await planner.create_plan(
+        research_request(),
+        deadline=future_deadline(),
+        cancellation_token=CancellationToken(),
+    )
+
+    artifact_id = "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    assert plan.plan_id == "plan-1"
+    assert model.complete_calls == 1
+    assert store.get_bytes(artifact_id) == raw.encode("utf-8")
+    assert budget.used_by_node["Planner"].total_tokens == 1_000
+    assert vars(planner)["_model_tokens_used"] == 11_000
+
+
+@pytest.mark.asyncio
+async def test_settled_usage_rejects_plan_when_outstanding_work_will_not_fit(
+    tmp_path: Path,
+) -> None:
+    raw = plan_json()
+    model = FakeModel([raw], complete_usages=[model_usage(13_000)])
     original_budget = RunBudget.preset("low")
     original_usage = dict(original_budget.used_by_node)
     original_usage["Planner"] = model_usage(1_000)
@@ -1220,7 +1251,7 @@ async def test_settled_planner_usage_is_included_once_before_plan_publication(
     assert model.complete_calls == 1
     assert store.get_bytes(artifact_id) == raw.encode("utf-8")
     assert budget.used_by_node["Planner"].total_tokens == 1_000
-    assert vars(planner)["_model_tokens_used"] == 11_000
+    assert vars(planner)["_model_tokens_used"] == 13_000
 
 
 @pytest.mark.asyncio
