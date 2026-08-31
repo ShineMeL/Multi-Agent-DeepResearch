@@ -39,6 +39,7 @@ _MAX_REPAIR_CANDIDATE_CHARS = 1_000_000
 _MAX_REPAIR_JSON_DEPTH = 64
 _MAX_REPAIR_JSON_NODES = 20_000
 _LOCK_POLL_SECONDS = 0.01
+_MODEL_REQUEST_FIXED_BYTES = 512
 
 
 class PlanGenerationError(RuntimeError):
@@ -165,6 +166,51 @@ def _request(
     )
 
 
+def _remaining_token_budget(budget: RunBudget) -> int:
+    used = sum(usage.total_tokens for usage in budget.used_by_node.values())
+    return max(0, budget.max_total_tokens - used)
+
+
+def _request_token_upper_bound(request: ModelRequest) -> int:
+    prompt_bytes = sum(
+        len(message.content.encode("utf-8")) for message in request.messages
+    )
+    return _MODEL_REQUEST_FIXED_BYTES + prompt_bytes + request.max_output_tokens
+
+
+def _request_exceeds_budget(request: ModelRequest, remaining: int) -> bool:
+    try:
+        return _request_token_upper_bound(request) > remaining
+    except UnicodeEncodeError:
+        return True
+
+
+def _ensure_request_within_budget(
+    request: ModelRequest,
+    *,
+    budget: RunBudget,
+    provider: str,
+) -> None:
+    try:
+        upper_bound = _request_token_upper_bound(request)
+    except UnicodeEncodeError:
+        raise ProviderError(
+            code="INVALID_REQUEST",
+            provider=provider,
+            operation="model",
+            public_message="model request contains invalid text",
+            retryable=False,
+        ) from None
+    if upper_bound > _remaining_token_budget(budget):
+        raise ProviderError(
+            code="INVALID_REQUEST",
+            provider=provider,
+            operation="model",
+            public_message="model request exceeds remaining token budget",
+            retryable=False,
+        )
+
+
 def _repair_candidate(raw: str) -> JsonValue | None:
     if len(raw) > _MAX_REPAIR_CANDIDATE_CHARS:
         return None
@@ -237,16 +283,27 @@ class FixedPlanner:
             )
             for key, value in raw.items()
         }
-        return _request(
+        model_request = _request(
             model=self.model,
             system_prompt=_PLAN_SYSTEM_PROMPT,
             user_prompt=_canonical_json(payload),
             prompt_version=self.prompt_version,
             max_output_tokens=max(1, min(8_000, self.budget.max_total_tokens)),
         )
+        _ensure_request_within_budget(
+            model_request,
+            budget=self.budget,
+            provider=self.model.provider_id,
+        )
+        return model_request
 
     def _repair_request(self, raw: str, report: PlanValidationReport) -> ModelRequest:
-        rejected = _repair_candidate(raw)
+        remaining = _remaining_token_budget(self.budget)
+        rejected = (
+            None
+            if len(raw) > remaining or len(raw.encode("utf-8")) > remaining
+            else _repair_candidate(raw)
+        )
         bounded = (
             None
             if rejected is None
@@ -256,18 +313,32 @@ class FixedPlanner:
                 bound_mapping_keys=True,
             )
         )
-        payload = {
-            "candidate": bounded,
-            "error_codes": list(report.error_codes),
-            "instruction": "Return one corrected ResearchPlan JSON object.",
-        }
-        return _request(
-            model=self.model,
-            system_prompt=_REPAIR_SYSTEM_PROMPT,
-            user_prompt=_canonical_json(payload),
-            prompt_version=f"{self.prompt_version}-repair",
-            max_output_tokens=max(1, min(8_000, self.budget.max_total_tokens)),
+        def build(candidate: JsonValue | None) -> ModelRequest:
+            payload = {
+                "candidate": candidate,
+                "error_codes": list(report.error_codes),
+                "instruction": "Return one corrected ResearchPlan JSON object.",
+            }
+            return _request(
+                model=self.model,
+                system_prompt=_REPAIR_SYSTEM_PROMPT,
+                user_prompt=_canonical_json(payload),
+                prompt_version=f"{self.prompt_version}-repair",
+                max_output_tokens=max(
+                    1,
+                    min(8_000, self.budget.max_total_tokens),
+                ),
+            )
+
+        model_request = build(bounded)
+        if bounded is not None and _request_exceeds_budget(model_request, remaining):
+            model_request = build(None)
+        _ensure_request_within_budget(
+            model_request,
+            budget=self.budget,
+            provider=self.model.provider_id,
         )
+        return model_request
 
     async def _generate_candidate(
         self,
@@ -371,7 +442,7 @@ class FixedPlanner:
             "search_depth": self.search_depth,
             "subquestion": _bound_json(raw_subquestion, self.content_boundary),
         }
-        return _request(
+        model_request = _request(
             model=self.model,
             system_prompt=_QUERY_SYSTEM_PROMPT,
             user_prompt=_canonical_json(payload),
@@ -379,6 +450,12 @@ class FixedPlanner:
             output_schema=_QueryOutput,
             max_output_tokens=max(128, min(2_000, self.budget.max_total_tokens)),
         )
+        _ensure_request_within_budget(
+            model_request,
+            budget=self.budget,
+            provider=self.model.provider_id,
+        )
+        return model_request
 
     async def _acquire_query_lock(
         self,

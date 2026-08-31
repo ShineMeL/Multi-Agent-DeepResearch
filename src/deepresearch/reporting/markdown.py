@@ -4,7 +4,12 @@ import json
 import re
 import unicodedata
 from collections.abc import Sequence
+from dataclasses import dataclass
+from html.parser import HTMLParser
 from typing import Protocol, cast
+
+from markdown_it import MarkdownIt
+from markdown_it.token import Token
 
 from deepresearch.domain import EvidenceSpan, SourceDocument, StopReason
 from deepresearch.retrieval import canonicalize_url, normalize_text
@@ -12,17 +17,32 @@ from deepresearch.storage import LocalEvidenceStore
 
 from .boundary import ContentBoundary, identity_content_boundary
 
-_CITATION = re.compile(r"(?<!\\)\[(E-[A-Za-z0-9_-]+)\]")
-_CITATION_START = re.compile(r"(?<!\\)\[E")
-_FENCE_OPEN = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
-_REFERENCE_DEFINITION = re.compile(r"^[ \t]{0,3}\[[^]\n]+\]:")
-_HEADING = re.compile(r"^[ \t]{0,3}#{1,6}(?:[ \t]+|$)")
-_INLINE_LINK = re.compile(r"!?\[[^]\n]*\]\([^\n)]*\)")
-_REFERENCE_LINK = re.compile(r"!?\[[^]\n]*\]\[[^]\n]*\]")
-_HTML_CODE = re.compile(r"<(?:code|pre)\b[^>]*>.*?</(?:code|pre)\s*>", re.IGNORECASE | re.DOTALL)
-_HTML_TAG = re.compile(r"<[^>\n]+>")
+_CITATION = re.compile(r"\[(E-[A-Za-z0-9_-]+)\]")
+_CITATION_START = re.compile(r"\[E")
+_AMBIGUOUS_HTML_CITATION = re.compile(
+    r"<\s*/?\s*[A-Za-z][^>\r\n]*\[E",
+    re.IGNORECASE,
+)
 _MARKDOWN_SPECIAL = re.compile(r"([\\`*_{\[\]}<>#!|~])")
 _STOP_REASONS = frozenset({"SUFFICIENT", "PLATEAU", "BUDGET_EXHAUSTED", "BLOCKED"})
+_HIDDEN_HTML_TAGS = frozenset({"code", "pre", "script", "style"})
+_BIDI_CONTROLS = frozenset(
+    {
+        "\u061c",
+        "\u200e",
+        "\u200f",
+        "\u202a",
+        "\u202b",
+        "\u202c",
+        "\u202d",
+        "\u202e",
+        "\u2066",
+        "\u2067",
+        "\u2068",
+        "\u2069",
+    }
+)
+_MARKDOWN = MarkdownIt("commonmark")
 
 
 class UnknownEvidenceCitation(ValueError):
@@ -41,116 +61,228 @@ class _PromptRecorder(Protocol):
     last_prompt: str
 
 
+@dataclass(frozen=True)
+class _RenderedMarkdown:
+    visible_units: tuple[str, ...]
+    claim_units: tuple[tuple[str, str], ...]
+
+
+class _HtmlVisibilityParser(HTMLParser):
+    def __init__(self, *, collect_text: bool) -> None:
+        super().__init__(convert_charrefs=True)
+        self.collect_text = collect_text
+        self.hidden_tags: list[str] = []
+        self.visible_parts: list[str] = []
+        self.ambiguous = False
+
+    @property
+    def hides_text(self) -> bool:
+        return bool(self.hidden_tags)
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        del attrs
+        normalized = tag.casefold()
+        if normalized in _HIDDEN_HTML_TAGS:
+            self.hidden_tags.append(normalized)
+
+    def handle_startendtag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        del tag, attrs
+
+    def handle_endtag(self, tag: str) -> None:
+        normalized = tag.casefold()
+        if normalized not in _HIDDEN_HTML_TAGS:
+            return
+        if not self.hidden_tags or self.hidden_tags[-1] != normalized:
+            self.ambiguous = True
+            return
+        self.hidden_tags.pop()
+
+    def handle_data(self, data: str) -> None:
+        if self.collect_text and not self.hides_text:
+            self.visible_parts.append(data)
+
+    def handle_comment(self, data: str) -> None:
+        del data
+
+
 def _dedupe(values: Sequence[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
-def _blank(chars: list[str], start: int, end: int) -> None:
-    for index in range(start, end):
-        if chars[index] not in {"\n", "\r"}:
-            chars[index] = " "
+def _feed_html(parser: _HtmlVisibilityParser, content: str) -> None:
+    try:
+        parser.feed(content)
+    except MemoryError:
+        raise
+    except (
+        AssertionError,
+        IndexError,
+        KeyError,
+        OverflowError,
+        RecursionError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        raise MalformedEvidenceCitation(
+            "report contains an ambiguous evidence citation"
+        ) from None
 
 
-def _blank_pattern(chars: list[str], pattern: re.Pattern[str]) -> None:
-    text = "".join(chars)
-    for match in pattern.finditer(text):
-        _blank(chars, match.start(), match.end())
-
-
-def _blank_inline_code(chars: list[str]) -> None:
-    text = "".join(chars)
-    cursor = 0
-    while cursor < len(text):
-        opening = text.find("`", cursor)
-        if opening < 0:
-            return
-        opening_end = opening
-        while opening_end < len(text) and text[opening_end] == "`":
-            opening_end += 1
-        marker = text[opening:opening_end]
-        search_from = opening_end
-        closing = -1
-        while True:
-            candidate = text.find(marker, search_from)
-            if candidate < 0:
-                break
-            before_is_tick = candidate > 0 and text[candidate - 1] == "`"
-            after = candidate + len(marker)
-            after_is_tick = after < len(text) and text[after] == "`"
-            if not before_is_tick and not after_is_tick:
-                closing = candidate
-                break
-            search_from = candidate + 1
-        if closing < 0:
-            cursor = opening_end
+def _inline_views(children: Sequence[Token]) -> tuple[str, str]:
+    visible: list[str] = []
+    eligible: list[str] = []
+    link_depth = 0
+    html = _HtmlVisibilityParser(collect_text=False)
+    for child in children:
+        if child.type == "html_inline":
+            _feed_html(html, child.content)
+            eligible.append(" ")
             continue
-        end = closing + len(marker)
-        _blank(chars, opening, end)
-        cursor = end
+        if child.type == "link_open":
+            link_depth += 1
+            eligible.append(" ")
+            continue
+        if child.type == "link_close":
+            if link_depth == 0:
+                html.ambiguous = True
+            else:
+                link_depth -= 1
+            eligible.append(" ")
+            continue
+        if child.type == "image":
+            eligible.append(" ")
+            continue
+        if child.type in {"softbreak", "hardbreak"}:
+            if not html.hides_text:
+                visible.append("\n")
+                eligible.append("\n" if link_depth == 0 else " ")
+            continue
+        if child.type == "text":
+            if _AMBIGUOUS_HTML_CITATION.search(child.content):
+                html.ambiguous = True
+            if not html.hides_text:
+                visible.append(child.content)
+                eligible.append(child.content if link_depth == 0 else " ")
+            continue
+        if child.type == "code_inline":
+            eligible.append(" ")
+            continue
+        if "[E" in child.content:
+            html.ambiguous = True
+        eligible.append(" ")
+    if link_depth or html.hides_text or html.ambiguous:
+        raise MalformedEvidenceCitation(
+            "report contains an ambiguous evidence citation"
+        )
+    return "".join(visible), "".join(eligible)
 
 
-def _rendered_claim_prose(markdown: str) -> str:
-    chars = list(markdown)
-    cursor = 0
-    while True:
-        start = markdown.find("<!--", cursor)
-        if start < 0:
-            break
-        closing = markdown.find("-->", start + 4)
-        end = len(markdown) if closing < 0 else closing + 3
-        _blank(chars, start, end)
-        cursor = end
-
-    _blank_inline_code(chars)
-
-    offset = 0
-    fence: tuple[str, int] | None = None
-    for line in "".join(chars).splitlines(keepends=True):
-        content = line.rstrip("\r\n")
-        if fence is None:
-            opening = _FENCE_OPEN.match(content)
-            if opening is not None:
-                marker = opening.group(1)
-                fence = (marker[0], len(marker))
-                _blank(chars, offset, offset + len(line))
-            elif (
-                content.startswith(("    ", "\t"))
-                or _REFERENCE_DEFINITION.match(content)
-                or _HEADING.match(content)
-            ):
-                _blank(chars, offset, offset + len(line))
-        else:
-            marker, minimum = fence
-            stripped = content.lstrip(" \t")
-            marker_length = len(stripped) - len(stripped.lstrip(marker))
-            _blank(chars, offset, offset + len(line))
-            if marker_length >= minimum and not stripped[marker_length:].strip():
-                fence = None
-        offset += len(line)
-
-    _blank_pattern(chars, _INLINE_LINK)
-    _blank_pattern(chars, _REFERENCE_LINK)
-    _blank_pattern(chars, _HTML_CODE)
-    _blank_pattern(chars, _HTML_TAG)
-    return "".join(chars)
+def _html_block_visible(content: str) -> str:
+    parser = _HtmlVisibilityParser(collect_text=True)
+    _feed_html(parser, content)
+    try:
+        parser.close()
+    except MemoryError:
+        raise
+    except (
+        AssertionError,
+        IndexError,
+        KeyError,
+        OverflowError,
+        RecursionError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        raise MalformedEvidenceCitation(
+            "report contains an ambiguous evidence citation"
+        ) from None
+    if parser.hides_text or parser.ambiguous:
+        raise MalformedEvidenceCitation(
+            "report contains an ambiguous evidence citation"
+        )
+    return "".join(parser.visible_parts)
 
 
-def _citation_ids(report_markdown: str) -> tuple[str, ...]:
-    prose = _rendered_claim_prose(report_markdown)
-    matches = tuple(_CITATION.finditer(prose))
-    valid_starts = {match.start() for match in matches}
-    if any(match.start() not in valid_starts for match in _CITATION_START.finditer(prose)):
-        raise MalformedEvidenceCitation("report contains a malformed evidence citation")
-    return _dedupe(tuple(match.group(1) for match in matches))
+def _rendered_markdown(report_markdown: str) -> _RenderedMarkdown:
+    try:
+        tokens = _MARKDOWN.parse(report_markdown)
+    except MemoryError:
+        raise
+    except (
+        AssertionError,
+        IndexError,
+        KeyError,
+        OverflowError,
+        RecursionError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        raise MalformedEvidenceCitation(
+            "report contains an ambiguous evidence citation"
+        ) from None
+
+    visible_units: list[str] = []
+    claim_units: list[tuple[str, str]] = []
+    paragraph_depth = 0
+    for token in tokens:
+        if token.type == "paragraph_open":
+            paragraph_depth += 1
+            continue
+        if token.type == "paragraph_close":
+            paragraph_depth = max(0, paragraph_depth - 1)
+            continue
+        if token.type == "inline":
+            visible, eligible = _inline_views(token.children or ())
+            if visible:
+                visible_units.append(visible)
+                if paragraph_depth:
+                    claim_units.append((visible, eligible))
+            continue
+        if token.type == "html_block":
+            visible = _html_block_visible(token.content)
+            if visible:
+                visible_units.append(visible)
+                claim_units.append((visible, ""))
+    return _RenderedMarkdown(
+        visible_units=tuple(visible_units),
+        claim_units=tuple(claim_units),
+    )
 
 
-def validate_citations(
-    report_markdown: str,
+def _citation_ids_from_rendered(rendered: _RenderedMarkdown) -> tuple[str, ...]:
+    citation_ids: list[str] = []
+    for visible in rendered.visible_units:
+        matches = tuple(_CITATION.finditer(visible))
+        valid_starts = {match.start() for match in matches}
+        if any(
+            match.start() not in valid_starts
+            for match in _CITATION_START.finditer(visible)
+        ):
+            raise MalformedEvidenceCitation(
+                "report contains a malformed evidence citation"
+            )
+        citation_ids.extend(match.group(1) for match in matches)
+    return _dedupe(citation_ids)
+
+
+def _validate_visible_citations(
+    rendered: _RenderedMarkdown,
     evidence_store: LocalEvidenceStore,
     *,
-    selected_evidence_ids: Sequence[str] | None = None,
+    selected_evidence_ids: Sequence[str] | None,
 ) -> tuple[str, ...]:
-    citation_ids = _citation_ids(report_markdown)
+    citation_ids = _citation_ids_from_rendered(rendered)
     selected = None if selected_evidence_ids is None else set(selected_evidence_ids)
     missing = [
         evidence_id
@@ -161,6 +293,20 @@ def validate_citations(
     if missing:
         raise UnknownEvidenceCitation(", ".join(missing))
     return citation_ids
+
+
+def validate_citations(
+    report_markdown: str,
+    evidence_store: LocalEvidenceStore,
+    *,
+    selected_evidence_ids: Sequence[str] | None = None,
+) -> tuple[str, ...]:
+    rendered = _rendered_markdown(report_markdown)
+    return _validate_visible_citations(
+        rendered,
+        evidence_store,
+        selected_evidence_ids=selected_evidence_ids,
+    )
 
 
 def _canonical_json(value: object) -> str:
@@ -176,7 +322,9 @@ def _canonical_json(value: object) -> str:
 def _markdown_safe_single_line(text: str) -> str:
     normalized = normalize_text(text)
     without_controls = "".join(
-        " " if unicodedata.category(character).startswith("C") else character
+        " "
+        if unicodedata.category(character) == "Cc" or character in _BIDI_CONTROLS
+        else character
         for character in normalized
     )
     single_line = " ".join(without_controls.split())
@@ -270,11 +418,9 @@ class MarkdownReportWriter:
             recorder.last_prompt = prompt
         return prompt
 
-    def _validate_claim_support(self, report_markdown: str) -> None:
-        prose = _rendered_claim_prose(report_markdown)
-        for paragraph in re.split(r"\n\s*\n", prose):
-            claim = paragraph.strip()
-            if claim and _CITATION.search(claim) is None:
+    def _validate_claim_support(self, rendered: _RenderedMarkdown) -> None:
+        for visible, eligible in rendered.claim_units:
+            if visible.strip() and _CITATION.search(eligible) is None:
                 raise EvidenceBackedClaimRequired(
                     "every report claim paragraph requires an inline evidence citation"
                 )
@@ -289,11 +435,13 @@ class MarkdownReportWriter:
         uncovered_information_needs: Sequence[str] = (),
     ) -> str:
         draft = draft_markdown.strip()
-        citations = self.validate_citations(
-            draft,
+        rendered = _rendered_markdown(draft)
+        citations = _validate_visible_citations(
+            rendered,
+            self.evidence_store,
             selected_evidence_ids=selected_evidence_ids,
         )
-        self._validate_claim_support(draft)
+        self._validate_claim_support(rendered)
         if stop_reason is not None and (
             not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
                 stop_reason, str

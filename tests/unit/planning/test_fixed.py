@@ -652,3 +652,151 @@ async def test_nonfinite_json_number_is_repaired_without_serialization_failure(
     assert plan.plan_id == "plan-1"
     assert repair_payload["candidate"] is None
     assert repair_payload["error_codes"] == ["INVALID_SCHEMA"]
+
+
+@pytest.mark.asyncio
+async def test_oversized_rejected_candidate_is_not_republished_in_repair_prompt(
+    tmp_path: Path,
+) -> None:
+    raw = json.dumps("x" * 900_000)
+    model = FakeModel([raw, plan_json()])
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=LocalArtifactStore(tmp_path),
+        budget=RunBudget.preset("medium"),
+    )
+
+    plan = await planner.create_plan(
+        research_request(),
+        deadline=future_deadline(),
+        cancellation_token=CancellationToken(),
+    )
+
+    repair_prompt = model.complete_requests[1].messages[-1].content
+    repair_payload = json.loads(repair_prompt)
+    assert plan.plan_id == "plan-1"
+    assert repair_payload["candidate"] is None
+    assert len(repair_prompt.encode("utf-8")) < 2_000
+
+
+@pytest.mark.asyncio
+async def test_boundary_expansion_cannot_publish_an_over_budget_initial_prompt(
+    tmp_path: Path,
+) -> None:
+    model = FakeModel([plan_json()])
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=LocalArtifactStore(tmp_path),
+        budget=RunBudget.preset("medium"),
+        content_boundary=lambda text: text * 50_000,
+    )
+
+    with pytest.raises(ProviderError) as error:
+        await planner.create_plan(
+            research_request(),
+            deadline=future_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+
+    assert error.value.code == "INVALID_REQUEST"
+    assert error.value.retryable is False
+    assert "Compare planner optimization methods" not in error.value.public_message
+    assert model.complete_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_boundary_expansion_cannot_publish_or_poison_an_over_budget_query(
+    tmp_path: Path,
+) -> None:
+    state = {"expand": False}
+
+    def boundary(text: str) -> str:
+        if state["expand"] and text == "plan-1":
+            return text * 50_000
+        return text
+
+    model = FakeModel([plan_json()], query_outputs=[["bounded query"]])
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=LocalArtifactStore(tmp_path),
+        budget=RunBudget.preset("medium"),
+        content_boundary=boundary,
+    )
+    plan = await planner.create_plan(
+        research_request(),
+        deadline=future_deadline(),
+        cancellation_token=CancellationToken(),
+    )
+    state["expand"] = True
+
+    with pytest.raises(ProviderError) as error:
+        await planner.queries_for(
+            plan.subquestions[0],
+            plan_id=plan.plan_id,
+            deadline=future_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+
+    assert error.value.code == "INVALID_REQUEST"
+    assert model.structured_calls == 0
+
+    state["expand"] = False
+    assert await planner.queries_for(
+        plan.subquestions[0],
+        plan_id=plan.plan_id,
+        deadline=future_deadline(),
+        cancellation_token=CancellationToken(),
+    ) == ("bounded query",)
+    assert model.structured_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_boundary_expansion_uses_null_for_an_over_budget_repair_candidate(
+    tmp_path: Path,
+) -> None:
+    def boundary(text: str) -> str:
+        if text in {"bad", "value"}:
+            return text * 50_000
+        return text
+
+    model = FakeModel([json.dumps({"bad": "value"}), plan_json()])
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=LocalArtifactStore(tmp_path),
+        budget=RunBudget.preset("medium"),
+        content_boundary=boundary,
+    )
+
+    plan = await planner.create_plan(
+        research_request(),
+        deadline=future_deadline(),
+        cancellation_token=CancellationToken(),
+    )
+
+    repair_payload = json.loads(model.complete_requests[1].messages[-1].content)
+    assert plan.plan_id == "plan-1"
+    assert repair_payload["candidate"] is None
+
+
+@pytest.mark.asyncio
+async def test_non_utf8_boundary_output_is_rejected_before_prompt_publication(
+    tmp_path: Path,
+) -> None:
+    model = FakeModel([plan_json()])
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=LocalArtifactStore(tmp_path),
+        budget=RunBudget.preset("medium"),
+        content_boundary=lambda text: f"{text}\ud800",
+    )
+
+    with pytest.raises(ProviderError) as error:
+        await planner.create_plan(
+            research_request(),
+            deadline=future_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+
+    assert error.value.code == "INVALID_REQUEST"
+    assert error.value.retryable is False
+    assert model.complete_calls == 0

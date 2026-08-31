@@ -241,12 +241,11 @@ def test_writer_rejects_credential_bearing_source_urls(tmp_path: Path) -> None:
     [
         "<!-- [E-known] -->",
         "`[E-known]`",
-        "```text\n[E-known]\n```",
         "\n\n```text\n[E-known]\n```",
         "\n\n    [E-known]",
         "<code>[E-known]</code>",
         "[ordinary link](https://example.com/[E-known])",
-        "[ordinary link][E-known]",
+        "[ordinary link][ref]\n\n[ref]: https://example.com/[E-known]",
     ],
 )
 def test_non_prose_citations_cannot_support_a_visible_claim(
@@ -330,3 +329,177 @@ def test_writer_restricts_partial_stop_reason_to_public_literals(
             is_partial=True,
             stop_reason=stop_reason,
         )
+
+
+@pytest.mark.parametrize(
+    "hidden_citation",
+    [
+        "> ~~~text\n> [E-known]\n> ~~~",
+        "<script>[E-known]</script>",
+        '<span\n data-note="[E-known]">visible text</span>',
+        r"[ordinary](https://example.com/foo\)[E-known])",
+        "<style>p::after { content: '[E-known]' }</style>",
+        "<pre>example [E-known]</pre>",
+    ],
+)
+def test_commonmark_hidden_citations_cannot_support_visible_claims(
+    evidence_store: LocalEvidenceStore,
+    hidden_citation: str,
+) -> None:
+    with pytest.raises(EvidenceBackedClaimRequired):
+        MarkdownReportWriter(evidence_store).finalize_report(
+            f"Unsupported visible claim. {hidden_citation}",
+            selected_evidence_ids=("E-known",),
+        )
+
+
+@pytest.mark.parametrize(
+    "draft",
+    [
+        "# Heading [E-missing]\n\nSupported [E-known].",
+        "Supported [E-known]; unknown &#91;E-missing].",
+        r"Supported [E-known]; unknown \\[E-missing].",
+        "# Malformed [E-bad!]\n\nSupported [E-known].",
+    ],
+)
+def test_all_rendered_visible_citations_are_validated(
+    evidence_store: LocalEvidenceStore,
+    draft: str,
+) -> None:
+    error_type = (
+        MalformedEvidenceCitation if "bad!" in draft else UnknownEvidenceCitation
+    )
+    with pytest.raises(error_type):
+        MarkdownReportWriter(evidence_store).finalize_report(
+            draft, selected_evidence_ids=("E-known",)
+        )
+
+
+@pytest.mark.parametrize(
+    "draft",
+    [
+        "Supported claim &#91;E-known]",
+        r"Supported claim with literal tick \` [E-known] `",
+        r"Supported claim with visible slash \\[E-known].",
+        "Supported claim with literal ```text\n[E-known]\n``` markers.",
+        "Supported claim with unresolved [ordinary][E-known].",
+    ],
+)
+def test_commonmark_rendered_citations_support_claim_prose(
+    evidence_store: LocalEvidenceStore,
+    draft: str,
+) -> None:
+    report = MarkdownReportWriter(evidence_store).finalize_report(
+        draft, selected_evidence_ids=("E-known",)
+    )
+
+    assert "- [E-known] Fixture title" in report
+
+
+def test_html_attributes_and_hidden_bodies_are_ignored_but_visible_html_text_is_validated(
+    evidence_store: LocalEvidenceStore,
+) -> None:
+    writer = MarkdownReportWriter(evidence_store)
+
+    with pytest.raises(UnknownEvidenceCitation, match="E-missing"):
+        writer.finalize_report(
+            '<span data-note="[E-other]">Visible [E-missing]</span> [E-known].',
+            selected_evidence_ids=("E-known",),
+        )
+
+    report = writer.finalize_report(
+        '<span data-note="[E-other]">Visible claim</span> [E-known]. '
+        '<script>[E-other]</script>',
+        selected_evidence_ids=("E-known",),
+    )
+    assert "- [E-known] Fixture title" in report
+    assert "- [E-other]" not in report
+
+
+def test_link_destinations_and_images_are_hidden_but_visible_link_labels_are_validated(
+    evidence_store: LocalEvidenceStore,
+) -> None:
+    writer = MarkdownReportWriter(evidence_store)
+    report = writer.finalize_report(
+        "Supported [E-known] with [ordinary](https://example.com/[E-other]) "
+        "and ![image [E-other]](https://example.com/image.png).",
+        selected_evidence_ids=("E-known",),
+    )
+
+    assert "- [E-other]" not in report
+
+    with pytest.raises(UnknownEvidenceCitation, match="E-other"):
+        writer.finalize_report(
+            "Supported [E-known] and [visible [E-other]](https://example.com).",
+            selected_evidence_ids=("E-known",),
+        )
+
+
+def test_ambiguous_raw_html_citation_fails_closed_without_leaking_draft(
+    evidence_store: LocalEvidenceStore,
+) -> None:
+    draft = "Supported [E-known]. <script data-x='[E-other]'"
+
+    with pytest.raises(MalformedEvidenceCitation) as error:
+        MarkdownReportWriter(evidence_store).finalize_report(
+            draft, selected_evidence_ids=("E-known",)
+        )
+
+    assert draft not in str(error.value)
+    assert "E-other" not in str(error.value)
+
+
+def test_raw_html_block_visibility_is_validated_without_supporting_claims(
+    evidence_store: LocalEvidenceStore,
+) -> None:
+    writer = MarkdownReportWriter(evidence_store)
+
+    with pytest.raises(UnknownEvidenceCitation, match="E-missing"):
+        writer.finalize_report(
+            "<div>\nVisible [E-missing]\n</div>\n\nSupported [E-known].",
+            selected_evidence_ids=("E-known",),
+        )
+
+    with pytest.raises(EvidenceBackedClaimRequired):
+        writer.finalize_report(
+            "<div>\nVisible raw claim [E-known]\n</div>",
+            selected_evidence_ids=("E-known",),
+        )
+
+
+def test_citation_split_by_inline_markup_cannot_support_claim_prose(
+    evidence_store: LocalEvidenceStore,
+) -> None:
+    with pytest.raises(EvidenceBackedClaimRequired):
+        MarkdownReportWriter(evidence_store).finalize_report(
+            "Rendered but structurally ambiguous [E-**known**].",
+            selected_evidence_ids=("E-known",),
+        )
+
+
+def test_markdown_metadata_preserves_joiners_and_neutralizes_bidi_controls(
+    tmp_path: Path,
+) -> None:
+    store = LocalEvidenceStore(tmp_path)
+    title = "研究 👩\u200d💻 Persian می\u200cخواهم \u202eunsafe"
+    need = "Need 👨\u200d👩\u200d👧 and می\u200cخواهم \u2066unsafe"
+    add_evidence(
+        store,
+        evidence_id="E-known",
+        source_id="source-known",
+        title=title,
+    )
+
+    report = MarkdownReportWriter(store).finalize_report(
+        "Supported [E-known].",
+        selected_evidence_ids=("E-known",),
+        is_partial=True,
+        stop_reason="BUDGET_EXHAUSTED",
+        uncovered_information_needs=(need,),
+    )
+
+    assert "👩\u200d💻" in report
+    assert "👨\u200d👩\u200d👧" in report
+    assert "می\u200cخواهم" in report
+    assert "\u202e" not in report
+    assert "\u2066" not in report

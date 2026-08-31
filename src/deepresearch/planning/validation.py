@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from copy import deepcopy
 from datetime import date
 from typing import Literal, cast
@@ -49,6 +49,9 @@ _MAX_CANDIDATE_BYTES = 1_000_000
 _MAX_JSON_DEPTH = 64
 _MAX_JSON_NODES = 20_000
 _MAX_JSON_STRING_CHARS = 250_000
+_P1_PROMPT_FIXED_BYTES = 512
+_P1_PLAN_OUTPUT_ALLOWANCE = 8_000
+_P1_QUERY_OUTPUT_ALLOWANCE = 2_000
 
 
 class PlanValidationReport(BaseModel):
@@ -72,18 +75,54 @@ def _strict_json(value: str) -> object:
 
 
 def _structure_is_bounded_json(value: object) -> bool:
-    stack: list[tuple[object, int]] = [(value, 0)]
-    seen_containers: set[int] = set()
+    stack: list[tuple[str, object, int, int | None]] = [
+        ("value", value, 0, None)
+    ]
+    active_containers: set[int] = set()
     node_count = 0
     string_chars = 0
     while stack:
-        item, depth = stack.pop()
+        kind, payload, depth, container_id = stack.pop()
+        if kind in {"mapping", "sequence"}:
+            iterator = payload
+            try:
+                if kind == "mapping":
+                    key_iterator, mapping = cast(
+                        "tuple[Iterator[object], Mapping[object, object]]",
+                        iterator,
+                    )
+                    key = next(key_iterator)
+                    if not isinstance(key, str):
+                        return False
+                    string_chars += len(key)
+                    if string_chars > _MAX_JSON_STRING_CHARS:
+                        return False
+                    try:
+                        key.encode("utf-8")
+                    except UnicodeEncodeError:
+                        return False
+                    child = mapping[key]
+                else:
+                    child = next(cast("Iterator[object]", iterator))
+            except StopIteration:
+                assert container_id is not None
+                active_containers.remove(container_id)
+                continue
+            stack.append((kind, iterator, depth, container_id))
+            stack.append(("value", child, depth + 1, None))
+            continue
+
+        item = payload
         node_count += 1
         if node_count > _MAX_JSON_NODES or depth > _MAX_JSON_DEPTH:
             return False
         if isinstance(item, str):
             string_chars += len(item)
             if string_chars > _MAX_JSON_STRING_CHARS:
+                return False
+            try:
+                item.encode("utf-8")
+            except UnicodeEncodeError:
                 return False
             continue
         if item is None or isinstance(item, (bool, int)):
@@ -95,24 +134,18 @@ def _structure_is_bounded_json(value: object) -> bool:
         if isinstance(item, Mapping):
             mapping = cast("Mapping[object, object]", item)
             identity = id(mapping)
-            if identity in seen_containers:
+            if identity in active_containers:
                 return False
-            seen_containers.add(identity)
-            for key, child in mapping.items():
-                if not isinstance(key, str):
-                    return False
-                string_chars += len(key)
-                if string_chars > _MAX_JSON_STRING_CHARS:
-                    return False
-                stack.append((child, depth + 1))
+            active_containers.add(identity)
+            stack.append(("mapping", (iter(mapping), mapping), depth, identity))
             continue
         if isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray)):
             sequence = cast("Sequence[object]", item)
             identity = id(sequence)
-            if identity in seen_containers:
+            if identity in active_containers:
                 return False
-            seen_containers.add(identity)
-            stack.extend((child, depth + 1) for child in sequence)
+            active_containers.add(identity)
+            stack.append(("sequence", iter(sequence), depth, identity))
             continue
         return False
     return True
@@ -359,8 +392,51 @@ def _is_unexecutable(plan: ResearchPlan, request: ResearchRequest) -> bool:
     return False
 
 
+def _json_utf8_size(value: object) -> int:
+    return len(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+
+def _p1_prompt_token_upper_bound(
+    plan: ResearchPlan,
+    request: ResearchRequest | None,
+    *,
+    search_depth: int,
+) -> int:
+    total = 0
+    if request is not None:
+        total += (
+            _P1_PROMPT_FIXED_BYTES
+            + _json_utf8_size(request.model_dump(mode="json"))
+            + _P1_PLAN_OUTPUT_ALLOWANCE
+        )
+    for subquestion in plan.subquestions:
+        query_payload = {
+            "plan_id": plan.plan_id,
+            "search_depth": search_depth,
+            "subquestion": subquestion.model_dump(mode="json"),
+        }
+        total += (
+            _P1_PROMPT_FIXED_BYTES
+            + _json_utf8_size(query_payload)
+            + _P1_QUERY_OUTPUT_ALLOWANCE
+        )
+    return total
+
+
 def _is_over_budget(
-    plan: ResearchPlan, budget: RunBudget, *, search_depth: int
+    plan: ResearchPlan,
+    budget: RunBudget,
+    *,
+    request: ResearchRequest | None,
+    search_depth: int,
 ) -> bool:
     used_searches = sum(usage.search_calls for usage in budget.used_by_node.values())
     used_pages = sum(usage.pages for usage in budget.used_by_node.values())
@@ -374,7 +450,16 @@ def _is_over_budget(
         )
         for item in plan.subquestions
     )
-    required_tokens = 1_000 + 1_000 * required_searches + 1_000 * required_pages
+    required_tokens = (
+        1_000
+        + 1_000 * required_searches
+        + 1_000 * required_pages
+        + _p1_prompt_token_upper_bound(
+            plan,
+            request,
+            search_depth=search_depth,
+        )
+    )
     return (
         required_searches > budget.max_search_calls - used_searches
         or required_pages > budget.max_pages - used_pages
@@ -445,7 +530,7 @@ class PlanValidator:
 
         try:
             structure_is_valid = _structure_is_bounded_json(raw)
-        except (OverflowError, RecursionError, TypeError, ValueError):
+        except (LookupError, OverflowError, RecursionError, TypeError, ValueError):
             structure_is_valid = False
         if not structure_is_valid:
             codes.add("INVALID_SCHEMA")
@@ -505,7 +590,10 @@ class PlanValidator:
                 if _is_unexecutable(semantic_plan, request):
                     codes.add("UNEXECUTABLE_GOAL")
             if budget is not None and _is_over_budget(
-                semantic_plan, budget, search_depth=self.search_depth
+                semantic_plan,
+                budget,
+                request=request,
+                search_depth=self.search_depth,
             ):
                 codes.add("BUDGET_INFEASIBLE")
 

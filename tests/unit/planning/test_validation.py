@@ -464,3 +464,114 @@ def test_plan_validator_default_search_depth_accounts_for_p1_query_fanout() -> N
 
     assert "BUDGET_INFEASIBLE" in default_report.error_codes
     assert shallow_report.valid is True
+
+
+def test_plan_validator_accepts_acyclic_aliased_json_containers() -> None:
+    shared: list[object] = []
+    aliased = valid_candidate()
+    aliased["scope"]["excluded_topics"] = shared  # type: ignore[index]
+    aliased["subquestions"][0]["dependencies"] = shared  # type: ignore[index]
+    separate = deepcopy(aliased)
+    separate["subquestions"][0]["dependencies"] = []  # type: ignore[index]
+
+    aliased_report = PlanValidator().validate_candidate(
+        aliased, request=None, budget=None
+    )
+    separate_report = PlanValidator().validate_candidate(
+        separate, request=None, budget=None
+    )
+
+    assert aliased_report.valid is True
+    assert separate_report.valid is True
+    assert aliased_report.candidate == separate_report.candidate
+
+
+def test_plan_validator_rejects_real_container_cycles() -> None:
+    candidate = valid_candidate()
+    cycle: dict[str, object] = {}
+    cycle["self"] = cycle
+    candidate["unexpected"] = cycle
+
+    report = PlanValidator().validate_candidate(candidate, request=None, budget=None)
+
+    assert report.valid is False
+    assert report.error_codes == ("INVALID_SCHEMA",)
+
+
+def test_plan_validator_stops_wide_sequence_iteration_at_the_node_bound() -> None:
+    class CountingList(list[object]):
+        iterations = 0
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            for item in super().__iter__():
+                self.iterations += 1
+                yield item
+
+    wide = CountingList(["x"] * 100_000)
+    candidate = valid_candidate()
+    candidate["scope"]["included_topics"] = wide  # type: ignore[index]
+
+    report = PlanValidator().validate_candidate(candidate, request=None, budget=None)
+
+    assert report.valid is False
+    assert report.error_codes == ("INVALID_SCHEMA",)
+    assert wide.iterations < 25_000
+
+
+def test_plan_validator_does_not_translate_memory_exhaustion_to_candidate_error() -> None:
+    class MemoryFaultMapping(dict[str, object]):
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            raise MemoryError("synthetic allocation failure")
+
+    with pytest.raises(MemoryError, match="synthetic allocation failure"):
+        PlanValidator().validate_candidate(
+            MemoryFaultMapping(valid_candidate()), request=None, budget=None
+        )
+
+
+def test_plan_validator_translates_invalid_mapping_iteration_to_stable_code() -> None:
+    class MissingKeyMapping(dict[str, object]):
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            yield "missing-key"
+
+    report = PlanValidator().validate_candidate(
+        MissingKeyMapping(valid_candidate()), request=None, budget=None
+    )
+
+    assert report.valid is False
+    assert report.error_codes == ("INVALID_SCHEMA",)
+
+
+@pytest.mark.parametrize(
+    "oversized_question",
+    ["x " * 100_000, "界" * 20_000],
+    ids=("ascii", "multibyte-utf8"),
+)
+def test_plan_validator_accounts_for_every_prompt_string_in_utf8_bytes(
+    oversized_question: str,
+) -> None:
+    candidate = valid_candidate()
+    candidate["subquestions"][0]["question"] = oversized_question  # type: ignore[index]
+
+    report = PlanValidator().validate_candidate(
+        candidate,
+        request=research_request(),
+        budget=RunBudget.preset("medium"),
+    )
+
+    assert report.valid is False
+    assert report.error_codes == ("BUDGET_INFEASIBLE",)
+
+
+def test_plan_validator_rejects_non_utf8_scalar_without_leaking_encoder_error() -> None:
+    candidate = valid_candidate()
+    candidate["subquestions"][0]["question"] = "invalid \ud800 scalar"  # type: ignore[index]
+
+    report = PlanValidator().validate_candidate(
+        candidate,
+        request=research_request(),
+        budget=RunBudget.preset("medium"),
+    )
+
+    assert report.valid is False
+    assert report.error_codes == ("INVALID_SCHEMA",)
