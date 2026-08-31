@@ -553,6 +553,9 @@ class OpenAICompatibleModelProvider:
         current_tool_index = -1
         tool_call_seen = False
         tool_call_ids: set[str] = set()
+        tool_ids_by_index: dict[int, str] = {}
+        tool_names_by_index: dict[int, str] = {}
+        tool_argument_buffers: dict[int, str] = {}
         failure: ProviderError | None = None
 
         def invalid_stream(message: str) -> ProviderError:
@@ -693,13 +696,28 @@ class OpenAICompatibleModelProvider:
                             ):
                                 raise invalid_stream("model stream tool identity was invalid")
                             tool_call_ids.add(tool_id)
+                            tool_ids_by_index[tool_index] = tool_id
+                            tool_names_by_index[tool_index] = tool_name
+                            tool_argument_buffers[tool_index] = arguments
                             current_tool_index = tool_index
-                        elif (
-                            "id" in tool
-                            or "type" in tool
-                            or "name" in function
-                        ):
-                            raise invalid_stream("model stream tool fragment was duplicated")
+                        else:
+                            repeated_id = tool.get("id")
+                            repeated_type = tool.get("type")
+                            repeated_name = function.get("name")
+                            if (
+                                repeated_id is not None
+                                and repeated_id != tool_ids_by_index[tool_index]
+                            ) or (
+                                repeated_type is not None
+                                and repeated_type != "function"
+                            ) or (
+                                repeated_name is not None
+                                and repeated_name != tool_names_by_index[tool_index]
+                            ):
+                                raise invalid_stream(
+                                    "model stream tool identity was inconsistent"
+                                )
+                            tool_argument_buffers[tool_index] += arguments
                         tool_call_seen = True
                 raw_finish = choice_mapping.get("finish_reason")
                 if raw_finish is not None:
@@ -707,6 +725,33 @@ class OpenAICompatibleModelProvider:
                         raise invalid_stream("model stream finish reason was invalid")
                     if (raw_finish == "tool_calls") != tool_call_seen:
                         raise invalid_stream("model stream finish reason was inconsistent")
+                    if raw_finish == "tool_calls":
+                        for arguments in tool_argument_buffers.values():
+                            duplicate_key = False
+
+                            def object_pairs(
+                                pairs: list[tuple[str, object]],
+                            ) -> dict[str, object]:
+                                nonlocal duplicate_key
+                                result: dict[str, object] = {}
+                                for key, item in pairs:
+                                    if key in result:
+                                        duplicate_key = True
+                                    result[key] = item
+                                return result
+
+                            try:
+                                decoded_arguments = json.loads(
+                                    arguments, object_pairs_hook=object_pairs
+                                )
+                            except (json.JSONDecodeError, TypeError, ValueError):
+                                raise invalid_stream(
+                                    "model stream tool arguments were invalid"
+                                ) from None
+                            if not isinstance(decoded_arguments, dict) or duplicate_key:
+                                raise invalid_stream(
+                                    "model stream tool arguments were invalid"
+                                )
                     finish_reason = raw_finish
                     finished = True
                 if not delta and raw_finish is None:

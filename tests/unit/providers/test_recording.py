@@ -1083,6 +1083,56 @@ async def test_finalized_failure_redacts_encoded_opaque_and_userinfo_credentials
 
 
 @pytest.mark.asyncio
+async def test_recording_append_failure_never_retains_delegate_error_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writer = ReplayBundleWriter.create(
+        tmp_path / "append-failure-chain", run_id="append-failure-chain"
+    )
+
+    async def fail_append(**kwargs: Any) -> NoReturn:
+        del kwargs
+        raise RuntimeError("synthetic safe append failure")
+
+    monkeypatch.setattr(writer, "append", fail_append)
+    recorder = RecordingSearchProvider(
+        ChainedMessageFailureSearch(
+            "upstream rejected api_key=TOP-SECRET-DELEGATE"
+        ),
+        writer,
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic safe append failure") as caught:
+        await recorder.search(
+            "append-failure-chain",
+            1,
+            None,
+            deadline=_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+
+    error = caught.value
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    rendered: list[str] = []
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        rendered.extend((str(current), repr(current)))
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    assert "top-secret" not in "\n".join(rendered).lower()
+
+    await writer.abort()
+
+
+@pytest.mark.asyncio
 async def test_create_marker_failure_removes_exact_staging_and_allows_same_run_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1220,6 +1270,16 @@ async def test_abort_repairs_owned_missing_tombstone_marker_and_retries_cleanup(
     replacement = ReplayBundleWriter.create(final_root, run_id="same-run")
     await replacement.abort()
     monkeypatch.undo()
+    if os.name != "nt":
+        for _ in range(2):
+            with pytest.raises(OSError, match="identity-coupled.*unavailable"):
+                await writer.abort()
+        assert tombstone.is_dir()
+        assert (tombstone / ".replay-writer-owner.json").is_file()
+        second_replacement = ReplayBundleWriter.create(final_root, run_id="same-run")
+        await second_replacement.abort()
+        return
+
     await writer.abort()
     await writer.abort()
 
@@ -1308,6 +1368,43 @@ async def test_repaired_tombstone_rmdir_fails_closed_on_late_competitor(
 
     assert sentinel.read_text(encoding="utf-8") == "unowned"
     assert tombstone.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_repaired_tombstone_never_unlinks_marker_substituted_after_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final_root = tmp_path / "marker-unlink-substitution"
+    writer, tombstone = await _leave_owned_tombstone_without_marker(
+        final_root, monkeypatch
+    )
+    monkeypatch.undo()
+    marker = tombstone / ".replay-writer-owner.json"
+    original_validate = writer._validate_repaired_tombstone
+    substituted = False
+
+    def substitute_after_final_validation(
+        staging: Path, marker_path: Path, *, marker_required: bool
+    ) -> None:
+        nonlocal substituted
+        original_validate(staging, marker_path, marker_required=marker_required)
+        if marker_required and not substituted:
+            substituted = True
+            marker_path.unlink()
+            marker_path.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(
+        writer, "_validate_repaired_tombstone", substitute_after_final_validation
+    )
+
+    with pytest.raises((OSError, ValueError), match="marker|identity|substitut"):
+        await writer.abort()
+
+    assert marker.read_text(encoding="utf-8") == "{}"
+    assert tombstone.is_dir()
+    with pytest.raises(ValueError, match="marker|owned"):
+        await writer.abort()
+    assert marker.read_text(encoding="utf-8") == "{}"
 
 
 @pytest.mark.asyncio

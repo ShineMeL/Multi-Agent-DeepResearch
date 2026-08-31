@@ -516,6 +516,108 @@ async def test_openai_stream_accepts_ordered_function_tool_fragments() -> None:
 
 @pytest.mark.asyncio
 @respx.mock
+@pytest.mark.parametrize(
+    "argument_fragments",
+    (
+        ("{",),
+        ("1",),
+        ("[]",),
+        ("{}", "{}"),
+        ('{"query":"one","query":"two"}',),
+        ('{"query":"agents"} trailing',),
+    ),
+)
+async def test_openai_stream_rejects_nonobject_or_incomplete_tool_arguments(
+    argument_fragments: tuple[str, ...],
+) -> None:
+    events = [
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "search",
+                                    "arguments": argument_fragments[0],
+                                },
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+    ]
+    events.extend(
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {"arguments": fragment},
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+        for fragment in argument_fragments[1:]
+    )
+    events.extend(
+        (
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            },
+            {
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 3,
+                    "total_tokens": 13,
+                },
+            },
+        )
+    )
+    content = b"".join(
+        f"data: {json.dumps(event, separators=(',', ':'))}\n\n".encode()
+        for event in events
+    ) + b"data: [DONE]\n\n"
+    respx.post("https://model.test/v1/chat/completions").respond(
+        200, headers={"content-type": "text/event-stream"}, content=content
+    )
+
+    with pytest.raises(ProviderError) as error:
+        tuple(
+            [
+                chunk
+                async for chunk in _provider().stream(
+                    _request(),
+                    deadline=_deadline(),
+                    cancellation_token=CancellationToken(),
+                )
+            ]
+        )
+
+    assert error.value.code == "INVALID_RESPONSE"
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_openai_cancelled_before_call_never_reaches_network() -> None:
     route = respx.post("https://model.test/v1/chat/completions").respond(
         200, json=_response("unused")

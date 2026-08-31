@@ -152,6 +152,129 @@ def _path_identity(path: Path) -> tuple[int, int]:
     return (details.st_dev, details.st_ino)
 
 
+def _open_windows_marker(path: Path, *, delete_access: bool) -> tuple[Any, int]:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    desired_access = 0x00000080 | (0x00010000 if delete_access else 0)
+    handle = kernel32.CreateFileW(
+        str(path),
+        desired_access,
+        0x00000001 | 0x00000002 | 0x00000004,
+        None,
+        3,
+        0x00200000,
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return kernel32, cast("int", handle)
+
+
+def _windows_handle_identity(kernel32: Any, handle: int) -> tuple[int, int]:
+    import ctypes
+    from ctypes import wintypes
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = (
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        )
+
+    kernel32.GetFileInformationByHandle.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(ByHandleFileInformation),
+    )
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    information = ByHandleFileInformation()
+    if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(information)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    file_index = (information.file_index_high << 32) | information.file_index_low
+    return information.volume_serial_number, file_index
+
+
+def _close_windows_handle(kernel32: Any, handle: int) -> None:
+    import ctypes
+
+    if not kernel32.CloseHandle(handle):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _marker_identity(path: Path) -> tuple[int, int]:
+    if os.name != "nt":
+        details = path.stat(follow_symlinks=False)
+        if not stat.S_ISREG(details.st_mode):
+            raise ValueError("replay cleanup marker must be a regular file")
+        return details.st_dev, details.st_ino
+    kernel32, handle = _open_windows_marker(path, delete_access=False)
+    try:
+        return _windows_handle_identity(kernel32, handle)
+    finally:
+        _close_windows_handle(kernel32, handle)
+
+
+def _remove_marker_by_identity(path: Path, expected_identity: tuple[int, int]) -> None:
+    if os.name != "nt":
+        raise OSError(
+            "identity-coupled repaired marker removal is unavailable on this platform"
+        )
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32, handle = _open_windows_marker(path, delete_access=True)
+    disposition_succeeded = False
+    try:
+        if _windows_handle_identity(kernel32, handle) != expected_identity:
+            raise ValueError("repaired replay cleanup marker was substituted")
+
+        class FileDispositionInformation(ctypes.Structure):
+            _fields_ = (("delete_file", wintypes.BOOL),)
+
+        kernel32.SetFileInformationByHandle.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        )
+        kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+        disposition = FileDispositionInformation(True)
+        if not kernel32.SetFileInformationByHandle(
+            handle,
+            4,
+            ctypes.byref(disposition),
+            ctypes.sizeof(disposition),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        disposition_succeeded = True
+    finally:
+        try:
+            _close_windows_handle(kernel32, handle)
+        except OSError:
+            if disposition_succeeded:
+                raise
+
+
 def _remove_exact_created_staging(
     staging: Path,
     *,
@@ -505,6 +628,7 @@ class ReplayBundleWriter:
         self._closed = False
         self._published = False
         self._cleanup_tombstone: Path | None = None
+        self._repaired_marker_identity: tuple[int, int] | None = None
 
     @classmethod
     def create(cls, final_root: Path, *, run_id: str) -> ReplayBundleWriter:
@@ -751,9 +875,9 @@ class ReplayBundleWriter:
                 self._release_lock()
 
     def _remove_owned_staging(self) -> None:
-        repaired_marker = self._repair_missing_cleanup_marker()
-        if repaired_marker:
-            self._remove_repaired_cleanup_tombstone()
+        repaired_marker_identity = self._repair_missing_cleanup_marker()
+        if repaired_marker_identity is not None:
+            self._remove_repaired_cleanup_tombstone(repaired_marker_identity)
             return
         staging = self._validate_owned_staging()
         if self._cleanup_tombstone is None:
@@ -795,17 +919,20 @@ class ReplayBundleWriter:
         self._staging_root = None
         _fsync_directory(staging.parent)
 
-    def _remove_repaired_cleanup_tombstone(self) -> None:
+    def _remove_repaired_cleanup_tombstone(
+        self, marker_identity: tuple[int, int]
+    ) -> None:
         staging = self._staging_root
         tombstone = self._cleanup_tombstone
         if staging is None or tombstone is None:
             raise RuntimeError("repaired replay cleanup tombstone is unavailable")
         marker_path = staging / self._MARKER_NAME
         self._validate_repaired_tombstone(staging, marker_path, marker_required=True)
-        marker_path.unlink()
+        _remove_marker_by_identity(marker_path, marker_identity)
         self._validate_repaired_tombstone(staging, marker_path, marker_required=False)
         staging.rmdir()
         self._staging_root = None
+        self._repaired_marker_identity = None
         _fsync_directory(staging.parent)
 
     def _validate_repaired_tombstone(
@@ -833,14 +960,14 @@ class ReplayBundleWriter:
         if marker_required:
             self._validate_owned_staging()
 
-    def _repair_missing_cleanup_marker(self) -> bool:
+    def _repair_missing_cleanup_marker(self) -> tuple[int, int] | None:
         staging = self._staging_root
         tombstone = self._cleanup_tombstone
         if staging is None or tombstone is None:
-            return False
+            return None
         marker_path = staging / self._MARKER_NAME
         if marker_path.exists():
-            return False
+            return self._repaired_marker_identity
         parent = self._final_root.parent.resolve(strict=True)
         device, inode = self._staging_identity
         expected_tombstone = parent / (
@@ -879,7 +1006,9 @@ class ReplayBundleWriter:
         self._validate_owned_staging()
         _fsync_directory(staging)
         _fsync_directory(parent)
-        return True
+        marker_identity = _marker_identity(marker_path)
+        self._repaired_marker_identity = marker_identity
+        return marker_identity
 
     def _validate_owned_staging(self) -> Path:
         staging = self._staging_root
@@ -971,7 +1100,7 @@ class _RecordingBase:
         )
         started = time.monotonic()
         failure_fields: tuple[
-            ProviderErrorCode, str, bool, float | None, ResourceUsage
+            ProviderErrorCode, str, bool, float | None, ResourceUsage | None
         ] | None = None
         result: T | None = None
         try:
@@ -979,35 +1108,44 @@ class _RecordingBase:
                 cast("Any", executor_operation), invoke, remaining_deadline=deadline
             )
         except ProviderError as error:
-            latency_ms = max(0, round((time.monotonic() - started) * 1000))
-            usage = error.usage or _operation_usage(operation, latency_ms)
-            redacted_message = _redact_public_message(error.public_message)
-            await self._writer.append(
-                key=key,
-                outcome=ReplayFailure(
-                    code=error.code,
-                    public_message=redacted_message,
-                    retryable=error.retryable,
-                    retry_after=error.retry_after,
-                ),
-                usage=usage,
-                latency_ms=latency_ms,
-            )
             failure_fields = (
                 error.code,
-                redacted_message,
+                _redact_public_message(error.public_message),
                 error.retryable,
                 error.retry_after,
-                usage,
+                error.usage,
             )
         if failure_fields is not None:
+            code, public_message, retryable, retry_after, failure_usage = failure_fields
+            latency_ms = max(0, round((time.monotonic() - started) * 1000))
+            usage = failure_usage or _operation_usage(operation, latency_ms)
+            append_error: Exception | None = None
+            try:
+                await self._writer.append(
+                    key=key,
+                    outcome=ReplayFailure(
+                        code=code,
+                        public_message=public_message,
+                        retryable=retryable,
+                        retry_after=retry_after,
+                    ),
+                    usage=usage,
+                    latency_ms=latency_ms,
+                )
+            # Storage failures cross a credential-safety boundary: detach every
+            # ordinary append exception, while leaving task cancellation alone.
+            except Exception as error:  # noqa: BLE001
+                append_error = error
+            if append_error is not None:
+                append_error.__cause__ = None
+                append_error.__context__ = None
+                raise append_error from None
             self._checkpoint(
                 deadline=deadline,
                 cancellation_token=cancellation_token,
                 provider_id=key.provider_id,
                 operation=operation,
             )
-            code, public_message, retryable, retry_after, usage = failure_fields
             failure = ProviderError(
                 code=code,
                 provider=key.provider_id,
