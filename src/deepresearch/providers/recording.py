@@ -188,9 +188,64 @@ def _open_windows_marker(path: Path, *, create_new: bool) -> tuple[Any, int]:
     return kernel32, cast("int", handle)
 
 
+def _open_windows_directory(path: Path) -> tuple[Any, int]:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.CreateFileW(
+        str(path),
+        0x00000080 | 0x00010000,
+        0x00000001 | 0x00000002,
+        None,
+        3,
+        0x02000000 | 0x00200000,
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return kernel32, cast("int", handle)
+
+
 def _windows_handle_identity(kernel32: Any, handle: int) -> tuple[int, int]:
     import ctypes
     from ctypes import wintypes
+
+    class FileIdInformation(ctypes.Structure):
+        _fields_ = (
+            ("volume_serial_number", ctypes.c_ulonglong),
+            ("file_id", ctypes.c_ubyte * 16),
+        )
+
+    kernel32.GetFileInformationByHandleEx.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    information = FileIdInformation()
+    if kernel32.GetFileInformationByHandleEx(
+        handle,
+        0x12,
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+    ):
+        return information.volume_serial_number, int.from_bytes(
+            information.file_id, byteorder="little"
+        )
 
     class ByHandleFileInformation(ctypes.Structure):
         _fields_ = (
@@ -211,11 +266,11 @@ def _windows_handle_identity(kernel32: Any, handle: int) -> tuple[int, int]:
         ctypes.POINTER(ByHandleFileInformation),
     )
     kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
-    information = ByHandleFileInformation()
-    if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(information)):
+    fallback = ByHandleFileInformation()
+    if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(fallback)):
         raise ctypes.WinError(ctypes.get_last_error())
-    file_index = (information.file_index_high << 32) | information.file_index_low
-    return information.volume_serial_number, file_index
+    file_index = (fallback.file_index_high << 32) | fallback.file_index_low
+    return fallback.volume_serial_number, file_index
 
 
 def _close_windows_handle(kernel32: Any, handle: int) -> None:
@@ -304,30 +359,34 @@ def _marker_identity(path: Path) -> tuple[int, int]:
         _close_windows_handle(kernel32, handle)
 
 
-def _remove_windows_marker_handle(kernel32: Any, handle: int) -> None:
+def _set_windows_delete_disposition(kernel32: Any, handle: int) -> None:
     import ctypes
     from ctypes import wintypes
 
+    class FileDispositionInformation(ctypes.Structure):
+        _fields_ = (("delete_file", wintypes.BOOL),)
+
+    kernel32.SetFileInformationByHandle.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+    disposition = FileDispositionInformation(True)
+    if not kernel32.SetFileInformationByHandle(
+        handle,
+        4,
+        ctypes.byref(disposition),
+        ctypes.sizeof(disposition),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _remove_windows_marker_handle(kernel32: Any, handle: int) -> None:
     disposition_succeeded = False
     try:
-        class FileDispositionInformation(ctypes.Structure):
-            _fields_ = (("delete_file", wintypes.BOOL),)
-
-        kernel32.SetFileInformationByHandle.argtypes = (
-            wintypes.HANDLE,
-            ctypes.c_int,
-            wintypes.LPVOID,
-            wintypes.DWORD,
-        )
-        kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
-        disposition = FileDispositionInformation(True)
-        if not kernel32.SetFileInformationByHandle(
-            handle,
-            4,
-            ctypes.byref(disposition),
-            ctypes.sizeof(disposition),
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
+        _set_windows_delete_disposition(kernel32, handle)
         disposition_succeeded = True
     finally:
         try:
@@ -337,26 +396,37 @@ def _remove_windows_marker_handle(kernel32: Any, handle: int) -> None:
                 raise
 
 
+def _remove_windows_directory_handle(kernel32: Any, handle: int) -> None:
+    _set_windows_delete_disposition(kernel32, handle)
+    _close_windows_handle(kernel32, handle)
+
+
 def _open_posix_anonymous_marker(staging: Path, directory_descriptor: int) -> BinaryIO:
+    del staging
     if sys.platform.startswith("linux"):
         anonymous_flag = getattr(os, "O_TMPFILE", 0)
-        if not anonymous_flag:
-            raise OSError("anonymous repaired marker creation is unavailable")
-        descriptor = os.open(
-            ".",
-            os.O_RDWR
-            | anonymous_flag
-            | getattr(os, "O_CLOEXEC", 0),
-            0o600,
-            dir_fd=directory_descriptor,
-        )
-        return cast("BinaryIO", os.fdopen(descriptor, "w+b"))
-    if sys.platform == "darwin":
+        if anonymous_flag:
+            try:
+                descriptor = os.open(
+                    ".",
+                    os.O_RDWR
+                    | anonymous_flag
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+            except OSError:
+                pass
+            else:
+                try:
+                    return cast("BinaryIO", os.fdopen(descriptor, "w+b"))
+                except BaseException:
+                    os.close(descriptor)
+                    raise
+    if sys.platform.startswith("linux") or sys.platform == "darwin":
         return cast(
             "BinaryIO",
-            tempfile.TemporaryFile(
-                mode="w+b", prefix=".replay-repair-", dir=staging
-            ),
+            tempfile.TemporaryFile(mode="w+b", prefix=".replay-repair-"),
         )
     raise OSError("anonymous repaired marker creation is unsupported")
 
@@ -371,6 +441,8 @@ class _RepairedMarkerProof:
     windows_handle: int | None = None
     posix_file: BinaryIO | None = None
     directory_descriptor: int | None = None
+    windows_directory_api: Any | None = None
+    windows_directory_handle: int | None = None
     marker_removed: bool = False
 
     def validate_creation_object(self) -> None:
@@ -403,8 +475,20 @@ class _RepairedMarkerProof:
             raise ValueError("repaired replay marker payload changed")
 
     def validate_directory_object(self, staging: Path) -> None:
-        if self.directory_descriptor is None:
+        if self.windows_directory_handle is not None:
+            if (
+                self.windows_directory_api is None
+                or _windows_handle_identity(
+                    self.windows_directory_api, self.windows_directory_handle
+                )
+                != self.directory_identity
+                or _is_link_or_reparse(staging)
+                or _path_identity(staging) != self.directory_identity
+            ):
+                raise ValueError("repaired replay cleanup directory was substituted")
             return
+        if self.directory_descriptor is None:
+            raise RuntimeError("repaired replay cleanup directory handle is unavailable")
         details = os.fstat(self.directory_descriptor)
         if (
             not stat.S_ISDIR(details.st_mode)
@@ -428,7 +512,29 @@ class _RepairedMarkerProof:
             raise RuntimeError("repaired replay marker creation object is unavailable")
         self.marker_removed = True
 
+    def remove_directory(self, staging: Path) -> None:
+        handle = self.windows_directory_handle
+        if handle is not None:
+            if self.windows_directory_api is None:
+                raise RuntimeError("repaired replay cleanup directory handle is unavailable")
+            _remove_windows_directory_handle(self.windows_directory_api, handle)
+            self.windows_directory_handle = None
+            self.windows_directory_api = None
+            return
+        if self.directory_descriptor is None:
+            raise RuntimeError("repaired replay cleanup directory handle is unavailable")
+        staging.rmdir()
+        self.close_directory()
+
     def close_directory(self) -> None:
+        handle = self.windows_directory_handle
+        if handle is not None:
+            if self.windows_directory_api is None:
+                raise RuntimeError("repaired replay cleanup directory handle is unavailable")
+            self.windows_directory_handle = None
+            api = self.windows_directory_api
+            self.windows_directory_api = None
+            _close_windows_handle(api, handle)
         descriptor = self.directory_descriptor
         if descriptor is not None:
             self.directory_descriptor = None
@@ -442,23 +548,43 @@ def _create_repaired_marker_proof(
     directory_identity: tuple[int, int],
 ) -> _RepairedMarkerProof:
     if os.name == "nt":
-        kernel32, handle = _open_windows_marker(marker_path, create_new=True)
+        directory_api, directory_handle = _open_windows_directory(staging)
+        marker_api: Any | None = None
+        marker_handle: int | None = None
         try:
-            _write_windows_marker(kernel32, handle, payload)
-            marker_identity = _windows_handle_identity(kernel32, handle)
+            if (
+                _is_link_or_reparse(staging)
+                or _windows_handle_identity(directory_api, directory_handle)
+                != directory_identity
+                or _path_identity(staging) != directory_identity
+            ):
+                raise ValueError("repaired replay cleanup directory was substituted")
+            marker_api, marker_handle = _open_windows_marker(
+                marker_path, create_new=True
+            )
+            _write_windows_marker(marker_api, marker_handle, payload)
+            marker_identity = _windows_handle_identity(marker_api, marker_handle)
             proof = _RepairedMarkerProof(
                 directory_identity=directory_identity,
                 marker_identity=marker_identity,
                 payload=payload,
                 marker_path=marker_path,
-                windows_api=kernel32,
-                windows_handle=handle,
+                windows_api=marker_api,
+                windows_handle=marker_handle,
+                windows_directory_api=directory_api,
+                windows_directory_handle=directory_handle,
             )
+            proof.validate_directory_object(staging)
             proof.validate_creation_object()
             return proof
         except BaseException:
+            if marker_api is not None and marker_handle is not None:
+                try:
+                    _remove_windows_marker_handle(marker_api, marker_handle)
+                except OSError:
+                    pass
             try:
-                _remove_windows_marker_handle(kernel32, handle)
+                _close_windows_handle(directory_api, directory_handle)
             except OSError:
                 pass
             raise
@@ -1162,8 +1288,7 @@ class ReplayBundleWriter:
         self._validate_repaired_tombstone(staging, marker_path, proof)
         proof.remove_marker()
         self._validate_repaired_tombstone(staging, marker_path, proof)
-        staging.rmdir()
-        proof.close_directory()
+        proof.remove_directory(staging)
         self._staging_root = None
         self._repaired_marker_proof = None
         _fsync_directory(staging.parent)

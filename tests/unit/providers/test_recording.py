@@ -1,6 +1,8 @@
 import asyncio
+import io
 import json
 import os
+import sys
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from datetime import UTC, datetime
@@ -1331,6 +1333,55 @@ async def test_repaired_marker_proof_never_adopts_post_creation_replacement(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "nt", reason="exercises real Windows directory handle")
+async def test_repaired_marker_creation_never_writes_into_substituted_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final_root = tmp_path / "marker-parent-substitution"
+    writer, tombstone = await _leave_owned_tombstone_without_marker(
+        final_root, monkeypatch
+    )
+    monkeypatch.undo()
+    moved_owned = tombstone.with_name(f"{tombstone.name}.owned")
+    marker = tombstone / ".replay-writer-owner.json"
+    sentinel = tombstone / "sentinel.txt"
+    original_create_proof = recording_module._create_repaired_marker_proof
+    substituted = False
+
+    def substitute_directory_before_marker_creation(*args: Any, **kwargs: Any) -> Any:
+        nonlocal substituted
+        if not substituted:
+            substituted = True
+            tombstone.rename(moved_owned)
+            tombstone.mkdir()
+            sentinel.write_text("not-owned", encoding="utf-8")
+        return original_create_proof(*args, **kwargs)
+
+    monkeypatch.setattr(
+        recording_module,
+        "_create_repaired_marker_proof",
+        substitute_directory_before_marker_creation,
+    )
+
+    try:
+        with pytest.raises(ValueError, match="identity|substitut|owned"):
+            await writer.abort()
+
+        assert substituted
+        assert sentinel.read_text(encoding="utf-8") == "not-owned"
+        assert not marker.exists()
+        assert moved_owned.is_dir()
+        replacement = ReplayBundleWriter.create(final_root, run_id="same-run")
+        await replacement.abort()
+    finally:
+        proof = writer._repaired_marker_proof
+        if proof is not None and not proof.marker_removed:
+            proof.remove_marker()
+        if proof is not None:
+            proof.close_directory()
+
+
+@pytest.mark.asyncio
 @pytest.mark.skipif(os.name == "nt", reason="exercises POSIX anonymous marker")
 async def test_posix_anonymous_marker_rejects_tombstone_path_substitution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1392,6 +1443,134 @@ async def test_posix_anonymous_marker_creation_failure_preserves_empty_tombstone
 
     assert tombstone.is_dir()
     assert tuple(tombstone.iterdir()) == ()
+
+
+@pytest.mark.parametrize("platform_name", ("linux", "darwin"))
+def test_posix_anonymous_proof_fallback_never_resolves_the_tombstone_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform_name: str,
+) -> None:
+    tombstone = tmp_path / "mutable-tombstone"
+    tombstone.mkdir()
+    temporary_file_calls: list[dict[str, object]] = []
+
+    def fake_temporary_file(**kwargs: object) -> io.BytesIO:
+        temporary_file_calls.append(kwargs)
+        return io.BytesIO()
+
+    monkeypatch.setattr(sys, "platform", platform_name)
+    monkeypatch.setattr(os, "O_TMPFILE", 0, raising=False)
+    monkeypatch.setattr(
+        recording_module.tempfile, "TemporaryFile", fake_temporary_file
+    )
+
+    proof_file = recording_module._open_posix_anonymous_marker(tombstone, -1)
+    proof_file.close()
+
+    assert len(temporary_file_calls) == 1
+    assert temporary_file_calls[0].get("dir") is None
+    assert not tuple(tombstone.iterdir())
+
+
+def test_linux_anonymous_proof_falls_back_when_otmpfile_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tombstone = tmp_path / "otmpfile-rejected"
+    tombstone.mkdir()
+    attempted_otmpfile = False
+    fallback_used = False
+
+    def reject_otmpfile(*args: object, **kwargs: object) -> NoReturn:
+        nonlocal attempted_otmpfile
+        del args, kwargs
+        attempted_otmpfile = True
+        raise OSError("synthetic O_TMPFILE rejection")
+
+    def fallback_temporary_file(**kwargs: object) -> io.BytesIO:
+        nonlocal fallback_used
+        assert kwargs.get("dir") is None
+        fallback_used = True
+        return io.BytesIO()
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(os, "O_TMPFILE", 0x400000, raising=False)
+    monkeypatch.setattr(os, "open", reject_otmpfile)
+    monkeypatch.setattr(
+        recording_module.tempfile,
+        "TemporaryFile",
+        fallback_temporary_file,
+    )
+
+    proof_file = recording_module._open_posix_anonymous_marker(tombstone, 73)
+    proof_file.write(b"proof")
+    proof_file.seek(0)
+
+    assert proof_file.read() == b"proof"
+    assert attempted_otmpfile
+    assert fallback_used
+    assert not tuple(tombstone.iterdir())
+    proof_file.close()
+
+
+@pytest.mark.parametrize("platform_name", ("linux", "darwin"))
+@pytest.mark.asyncio
+async def test_posix_repaired_cleanup_uses_platform_removal_and_is_repeatable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform_name: str,
+) -> None:
+    final_root = tmp_path / f"{platform_name}-platform-recovery"
+    writer, tombstone = await _leave_owned_tombstone_without_marker(
+        final_root, monkeypatch
+    )
+    monkeypatch.undo()
+    events: list[str] = []
+
+    class FaultInjectedPosixProof:
+        marker_path: None = None
+        marker_removed = False
+
+        def validate_directory_object(self, staging: Path) -> None:
+            assert staging == tombstone
+            events.append("validate-directory")
+
+        def validate_creation_object(self) -> None:
+            events.append("validate-proof")
+
+        def remove_marker(self) -> None:
+            self.marker_removed = True
+            events.append("remove-proof")
+
+        def remove_directory(self, staging: Path) -> None:
+            assert staging == tombstone
+            assert tuple(staging.iterdir()) == ()
+            staging.rmdir()
+            events.append(f"remove-directory:{platform_name}")
+
+        def close_directory(self) -> NoReturn:
+            raise AssertionError("directory removal bypassed the platform helper")
+
+    proof = FaultInjectedPosixProof()
+
+    def create_fault_injected_proof(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        return proof
+
+    monkeypatch.setattr(
+        recording_module,
+        "_create_repaired_marker_proof",
+        create_fault_injected_proof,
+    )
+
+    await writer.abort()
+    await writer.abort()
+
+    assert events.count(f"remove-directory:{platform_name}") == 1
+    assert not tombstone.exists()
+    replacement = ReplayBundleWriter.create(final_root, run_id="same-run")
+    await replacement.abort()
 
 
 @pytest.mark.asyncio
@@ -1457,18 +1636,22 @@ async def test_repaired_tombstone_rmdir_fails_closed_on_late_competitor(
         final_root, monkeypatch
     )
     monkeypatch.undo()
-    original_rmdir = Path.rmdir
+    original_remove_directory = recording_module._RepairedMarkerProof.remove_directory
     sentinel = tombstone / "unowned.txt"
     injected = False
 
-    def inject_before_rmdir(path: Path) -> None:
+    def inject_before_rmdir(proof: Any, path: Path) -> None:
         nonlocal injected
         if path == tombstone and not injected:
             injected = True
             sentinel.write_text("unowned", encoding="utf-8")
-        original_rmdir(path)
+        original_remove_directory(proof, path)
 
-    monkeypatch.setattr(Path, "rmdir", inject_before_rmdir)
+    monkeypatch.setattr(
+        recording_module._RepairedMarkerProof,
+        "remove_directory",
+        inject_before_rmdir,
+    )
 
     with pytest.raises(OSError):
         await writer.abort()
@@ -1477,6 +1660,55 @@ async def test_repaired_tombstone_rmdir_fails_closed_on_late_competitor(
 
     assert sentinel.read_text(encoding="utf-8") == "unowned"
     assert tombstone.is_dir()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="exercises real Windows directory swap")
+@pytest.mark.asyncio
+async def test_repaired_tombstone_never_removes_empty_directory_substituted_after_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final_root = tmp_path / "post-proof-directory-substitution"
+    writer, tombstone = await _leave_owned_tombstone_without_marker(
+        final_root, monkeypatch
+    )
+    monkeypatch.undo()
+    moved_owned = tombstone.with_name(f"{tombstone.name}.owned")
+    original_validate = writer._validate_repaired_tombstone
+    original_details = tombstone.stat(follow_symlinks=False)
+    original_identity = (original_details.st_dev, original_details.st_ino)
+    substitution_attempted = False
+
+    def substitute_empty_directory_after_final_proof(
+        staging: Path,
+        marker_path: Path,
+        proof: Any,
+    ) -> None:
+        nonlocal substitution_attempted
+        original_validate(staging, marker_path, proof)
+        if proof.marker_removed and not substitution_attempted:
+            substitution_attempted = True
+            tombstone.rename(moved_owned)
+            tombstone.mkdir()
+
+    monkeypatch.setattr(
+        writer,
+        "_validate_repaired_tombstone",
+        substitute_empty_directory_after_final_proof,
+    )
+
+    with pytest.raises(OSError):
+        await writer.abort()
+
+    assert substitution_attempted
+    assert tombstone.is_dir()
+    details = tombstone.stat(follow_symlinks=False)
+    assert (details.st_dev, details.st_ino) == original_identity
+    assert not moved_owned.exists()
+
+    await writer.abort()
+    assert not tombstone.exists()
+    replacement = ReplayBundleWriter.create(final_root, run_id="same-run")
+    await replacement.abort()
 
 
 @pytest.mark.asyncio
