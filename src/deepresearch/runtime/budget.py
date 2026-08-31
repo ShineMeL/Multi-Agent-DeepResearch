@@ -14,6 +14,7 @@ from typing import (
     Self,
     TypeAlias,
     TypeVar,
+    cast,
     override,
 )
 
@@ -200,6 +201,107 @@ class BudgetAccountant:
             ) from error
         self._used_by_node = used_by_node
         self._last_observed_usage = zero
+
+    @classmethod
+    def from_snapshot(
+        cls,
+        budget: RunBudget,
+        snapshot: BudgetSnapshot,
+        *,
+        run_scope: str = "local",
+    ) -> Self:
+        if type(budget) is not RunBudget or type(snapshot) is not BudgetSnapshot:
+            raise ValueError("budget snapshot inputs must use exact runtime models")
+        budget_mapping_type = type(RunBudget.preset("low").used_by_node)
+        if (
+            type(budget.used_by_node) is not budget_mapping_type
+            or type(snapshot.used_by_node) is not _FrozenDict
+            or type(snapshot.last_observed_usage) is not ResourceUsage
+        ):
+            raise ValueError("budget snapshot contains invalid usage models")
+        budget_used_value: object = budget.used_by_node
+        budget_used = cast("dict[str, ResourceUsage]", budget_used_value)
+        snapshot_used = cast(
+            "dict[BudgetNode, ResourceUsage]", snapshot.__dict__["used_by_node"]
+        )
+        if any(type(item) is not ResourceUsage for item in budget_used.values()) or any(
+            type(item) is not ResourceUsage for item in snapshot_used.values()
+        ):
+            raise ValueError("budget snapshot contains invalid usage models")
+
+        def fresh_usage(value: ResourceUsage) -> ResourceUsage:
+            try:
+                return ResourceUsage.model_validate(dict(value.__dict__), strict=True)
+            except (TypeError, ValueError):
+                raise ValueError("budget snapshot contains invalid usage") from None
+
+        try:
+            budget_payload = dict(budget.__dict__)
+            budget_payload["used_by_node"] = {
+                node: fresh_usage(value)
+                for node, value in budget_used.items()
+            }
+            budget_value = RunBudget.model_validate(budget_payload, strict=True)
+            snapshot_payload = dict(snapshot.__dict__)
+            snapshot_payload["used_by_node"] = {
+                node: fresh_usage(value)
+                for node, value in snapshot_used.items()
+            }
+            snapshot_payload["last_observed_usage"] = fresh_usage(
+                snapshot.last_observed_usage
+            )
+            restored_snapshot = BudgetSnapshot.model_validate(
+                snapshot_payload,
+                strict=True,
+            )
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError("budget snapshot is invalid") from None
+        if any(
+            value != 0
+            for value in (
+                restored_snapshot.reserved_search_calls,
+                restored_snapshot.reserved_pages,
+                restored_snapshot.reserved_tokens,
+                restored_snapshot.reserved_wall_seconds,
+                restored_snapshot.reserved_retries,
+            )
+        ) or restored_snapshot.reserved_cost_usd not in (None, Decimal(0)):
+            raise ValueError("budget snapshot contains active reserved capacity")
+        additive_fields = (
+            "input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "cached_tokens",
+            "total_tokens",
+            "search_calls",
+            "pages",
+            "retries",
+            "wall_seconds",
+        )
+        for node in _NODES:
+            original = budget_value.used_by_node[node]
+            restored = restored_snapshot.used_by_node[node]
+            if any(
+                getattr(restored, field) < getattr(original, field)
+                for field in additive_fields
+            ) or (
+                budget_value.max_cost_usd is not None
+                and (restored.cost_usd or Decimal(0))
+                < (original.cost_usd or Decimal(0))
+            ):
+                raise ValueError("budget snapshot rewinds configured seed history")
+        seeded_budget = budget_value.model_copy(
+            update={"used_by_node": restored_snapshot.used_by_node}
+        )
+        accountant = cls(seeded_budget, run_scope=run_scope)
+        accountant._last_observed_usage = accountant._validate_usage(
+            restored_snapshot.last_observed_usage,
+            require_known_cost=False,
+            label="snapshot last observed usage",
+        )
+        if accountant.snapshot() != restored_snapshot:
+            raise ValueError("budget snapshot does not reconcile with usage")
+        return accountant
 
     def snapshot(self) -> BudgetSnapshot:
         with self._lock:
