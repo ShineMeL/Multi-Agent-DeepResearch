@@ -2,17 +2,27 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from collections.abc import Sequence
 from typing import Protocol, cast
 
-from deepresearch.domain import EvidenceSpan, SourceDocument
-from deepresearch.retrieval import canonicalize_url
+from deepresearch.domain import EvidenceSpan, SourceDocument, StopReason
+from deepresearch.retrieval import canonicalize_url, normalize_text
 from deepresearch.storage import LocalEvidenceStore
 
 from .boundary import ContentBoundary, identity_content_boundary
 
-_CITATION = re.compile(r"\[(E-[A-Za-z0-9_-]+)\]")
-_CITATION_START = re.compile(r"\[E")
+_CITATION = re.compile(r"(?<!\\)\[(E-[A-Za-z0-9_-]+)\]")
+_CITATION_START = re.compile(r"(?<!\\)\[E")
+_FENCE_OPEN = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
+_REFERENCE_DEFINITION = re.compile(r"^[ \t]{0,3}\[[^]\n]+\]:")
+_HEADING = re.compile(r"^[ \t]{0,3}#{1,6}(?:[ \t]+|$)")
+_INLINE_LINK = re.compile(r"!?\[[^]\n]*\]\([^\n)]*\)")
+_REFERENCE_LINK = re.compile(r"!?\[[^]\n]*\]\[[^]\n]*\]")
+_HTML_CODE = re.compile(r"<(?:code|pre)\b[^>]*>.*?</(?:code|pre)\s*>", re.IGNORECASE | re.DOTALL)
+_HTML_TAG = re.compile(r"<[^>\n]+>")
+_MARKDOWN_SPECIAL = re.compile(r"([\\`*_{\[\]}<>#!|~])")
+_STOP_REASONS = frozenset({"SUFFICIENT", "PLATEAU", "BUDGET_EXHAUSTED", "BLOCKED"})
 
 
 class UnknownEvidenceCitation(ValueError):
@@ -35,10 +45,101 @@ def _dedupe(values: Sequence[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
+def _blank(chars: list[str], start: int, end: int) -> None:
+    for index in range(start, end):
+        if chars[index] not in {"\n", "\r"}:
+            chars[index] = " "
+
+
+def _blank_pattern(chars: list[str], pattern: re.Pattern[str]) -> None:
+    text = "".join(chars)
+    for match in pattern.finditer(text):
+        _blank(chars, match.start(), match.end())
+
+
+def _blank_inline_code(chars: list[str]) -> None:
+    text = "".join(chars)
+    cursor = 0
+    while cursor < len(text):
+        opening = text.find("`", cursor)
+        if opening < 0:
+            return
+        opening_end = opening
+        while opening_end < len(text) and text[opening_end] == "`":
+            opening_end += 1
+        marker = text[opening:opening_end]
+        search_from = opening_end
+        closing = -1
+        while True:
+            candidate = text.find(marker, search_from)
+            if candidate < 0:
+                break
+            before_is_tick = candidate > 0 and text[candidate - 1] == "`"
+            after = candidate + len(marker)
+            after_is_tick = after < len(text) and text[after] == "`"
+            if not before_is_tick and not after_is_tick:
+                closing = candidate
+                break
+            search_from = candidate + 1
+        if closing < 0:
+            cursor = opening_end
+            continue
+        end = closing + len(marker)
+        _blank(chars, opening, end)
+        cursor = end
+
+
+def _rendered_claim_prose(markdown: str) -> str:
+    chars = list(markdown)
+    cursor = 0
+    while True:
+        start = markdown.find("<!--", cursor)
+        if start < 0:
+            break
+        closing = markdown.find("-->", start + 4)
+        end = len(markdown) if closing < 0 else closing + 3
+        _blank(chars, start, end)
+        cursor = end
+
+    _blank_inline_code(chars)
+
+    offset = 0
+    fence: tuple[str, int] | None = None
+    for line in "".join(chars).splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        if fence is None:
+            opening = _FENCE_OPEN.match(content)
+            if opening is not None:
+                marker = opening.group(1)
+                fence = (marker[0], len(marker))
+                _blank(chars, offset, offset + len(line))
+            elif (
+                content.startswith(("    ", "\t"))
+                or _REFERENCE_DEFINITION.match(content)
+                or _HEADING.match(content)
+            ):
+                _blank(chars, offset, offset + len(line))
+        else:
+            marker, minimum = fence
+            stripped = content.lstrip(" \t")
+            marker_length = len(stripped) - len(stripped.lstrip(marker))
+            _blank(chars, offset, offset + len(line))
+            if marker_length >= minimum and not stripped[marker_length:].strip():
+                fence = None
+        offset += len(line)
+
+    _blank_pattern(chars, _INLINE_LINK)
+    _blank_pattern(chars, _REFERENCE_LINK)
+    _blank_pattern(chars, _HTML_CODE)
+    _blank_pattern(chars, _HTML_TAG)
+    return "".join(chars)
+
+
 def _citation_ids(report_markdown: str) -> tuple[str, ...]:
-    matches = tuple(_CITATION.finditer(report_markdown))
+    prose = _rendered_claim_prose(report_markdown)
+    matches = tuple(_CITATION.finditer(prose))
     valid_starts = {match.start() for match in matches}
-    if any(match.start() not in valid_starts for match in _CITATION_START.finditer(report_markdown)):
+    if any(match.start() not in valid_starts for match in _CITATION_START.finditer(prose)):
         raise MalformedEvidenceCitation("report contains a malformed evidence citation")
     return _dedupe(tuple(match.group(1) for match in matches))
 
@@ -70,6 +171,18 @@ def _canonical_json(value: object) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _markdown_safe_single_line(text: str) -> str:
+    normalized = normalize_text(text)
+    without_controls = "".join(
+        " " if unicodedata.category(character).startswith("C") else character
+        for character in normalized
+    )
+    single_line = " ".join(without_controls.split())
+    if not single_line:
+        return "(empty)"
+    return _MARKDOWN_SPECIAL.sub(r"\\\1", single_line)
 
 
 class MarkdownReportWriter:
@@ -158,10 +271,9 @@ class MarkdownReportWriter:
         return prompt
 
     def _validate_claim_support(self, report_markdown: str) -> None:
-        for paragraph in re.split(r"\n\s*\n", report_markdown):
-            claim = "\n".join(
-                line for line in paragraph.splitlines() if not line.lstrip().startswith("#")
-            ).strip()
+        prose = _rendered_claim_prose(report_markdown)
+        for paragraph in re.split(r"\n\s*\n", prose):
+            claim = paragraph.strip()
             if claim and _CITATION.search(claim) is None:
                 raise EvidenceBackedClaimRequired(
                     "every report claim paragraph requires an inline evidence citation"
@@ -173,7 +285,7 @@ class MarkdownReportWriter:
         *,
         selected_evidence_ids: Sequence[str],
         is_partial: bool = False,
-        stop_reason: str | None = None,
+        stop_reason: StopReason | None = None,
         uncovered_information_needs: Sequence[str] = (),
     ) -> str:
         draft = draft_markdown.strip()
@@ -182,14 +294,23 @@ class MarkdownReportWriter:
             selected_evidence_ids=selected_evidence_ids,
         )
         self._validate_claim_support(draft)
-        if is_partial and not stop_reason:
+        if stop_reason is not None and (
+            not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+                stop_reason, str
+            )
+            or stop_reason not in _STOP_REASONS
+        ):
+            raise ValueError("stop reason must be a public StopReason literal")
+        if is_partial and stop_reason is None:
             raise ValueError("partial reports require a stop reason")
         if not is_partial and (stop_reason is not None or uncovered_information_needs):
             raise ValueError("stop reason and uncovered needs require a partial report")
 
         sections = [draft]
         if is_partial:
-            needs = sorted(set(uncovered_information_needs))
+            needs = sorted(
+                {_markdown_safe_single_line(need) for need in uncovered_information_needs}
+            )
             partial = ["## Partial report", "", f"Stop reason: `{stop_reason}`"]
             if needs:
                 partial.extend(("", "Uncovered information needs:", ""))
@@ -201,7 +322,8 @@ class MarkdownReportWriter:
             evidence = self.evidence_store.get_evidence(evidence_id)
             source = self.evidence_store.get_source(evidence.source_id)
             safe_url = canonicalize_url(str(source.canonical_url))
-            references.append(f"- [{evidence_id}] {source.title} — {safe_url}")
+            safe_title = _markdown_safe_single_line(source.title)
+            references.append(f"- [{evidence_id}] {safe_title} — {safe_url}")
         sections.append("\n".join(references))
         return "\n\n".join(sections)
 

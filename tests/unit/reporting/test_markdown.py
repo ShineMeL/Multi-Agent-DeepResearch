@@ -234,3 +234,99 @@ def test_writer_rejects_credential_bearing_source_urls(tmp_path: Path) -> None:
             "Supported claim [E-secret].",
             selected_evidence_ids=("E-secret",),
         )
+
+
+@pytest.mark.parametrize(
+    "hidden_citation",
+    [
+        "<!-- [E-known] -->",
+        "`[E-known]`",
+        "```text\n[E-known]\n```",
+        "\n\n```text\n[E-known]\n```",
+        "\n\n    [E-known]",
+        "<code>[E-known]</code>",
+        "[ordinary link](https://example.com/[E-known])",
+        "[ordinary link][E-known]",
+    ],
+)
+def test_non_prose_citations_cannot_support_a_visible_claim(
+    evidence_store: LocalEvidenceStore,
+    hidden_citation: str,
+) -> None:
+    with pytest.raises(EvidenceBackedClaimRequired):
+        MarkdownReportWriter(evidence_store).finalize_report(
+            f"Unsupported visible claim. {hidden_citation}",
+            selected_evidence_ids=("E-known",),
+        )
+
+
+def test_hidden_valid_citation_cannot_mask_malformed_visible_citation(
+    evidence_store: LocalEvidenceStore,
+) -> None:
+    with pytest.raises(MalformedEvidenceCitation):
+        MarkdownReportWriter(evidence_store).finalize_report(
+            "Malformed visible [E-bad!] <!-- [E-known] -->",
+            selected_evidence_ids=("E-known",),
+        )
+
+
+def test_citation_inside_inline_code_is_not_added_to_references(
+    evidence_store: LocalEvidenceStore,
+) -> None:
+    report = MarkdownReportWriter(evidence_store).finalize_report(
+        "Visible support [E-known]; example code `[E-other]`.",
+        selected_evidence_ids=("E-known", "E-other"),
+    )
+
+    assert "- [E-known] Fixture title" in report
+    assert "- [E-other]" not in report
+
+
+def test_writer_serializes_hostile_final_metadata_as_markdown_safe_single_lines(
+    tmp_path: Path,
+) -> None:
+    store = LocalEvidenceStore(tmp_path)
+    add_evidence(
+        store,
+        evidence_id="E-known",
+        source_id="source-known",
+        title="Safe title\n## Injected section\n- [E-missing] `forged`",
+    )
+
+    report = MarkdownReportWriter(store).finalize_report(
+        "Supported claim [E-known].",
+        selected_evidence_ids=("E-known",),
+        is_partial=True,
+        stop_reason="BUDGET_EXHAUSTED",
+        uncovered_information_needs=(
+            "Need one\n## Injected need",
+            "Need `two` with [E-missing]",
+        ),
+    )
+
+    assert "\n## Injected" not in report
+    assert "\n- [E-missing]" not in report
+    assert "\\[E-missing\\]" in report
+    assert "Need one \\#\\# Injected need" in report
+    assert "Need \\`two\\` with \\[E-missing\\]" in report
+    assert [line for line in report.splitlines() if line.startswith("## ")] == [
+        "## Partial report",
+        "## References",
+    ]
+
+
+@pytest.mark.parametrize(
+    "stop_reason",
+    ["BUDGET_EXHAUSTED`\n## Injected", "UNKNOWN", ""],
+)
+def test_writer_restricts_partial_stop_reason_to_public_literals(
+    evidence_store: LocalEvidenceStore,
+    stop_reason: str,
+) -> None:
+    with pytest.raises(ValueError, match="stop reason"):
+        MarkdownReportWriter(evidence_store).finalize_report(
+            "Supported claim [E-known].",
+            selected_evidence_ids=("E-known",),
+            is_partial=True,
+            stop_reason=stop_reason,
+        )

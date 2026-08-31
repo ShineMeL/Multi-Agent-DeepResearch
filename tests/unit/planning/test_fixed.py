@@ -142,6 +142,35 @@ class FakeModel:
         raise NotImplementedError
 
 
+class BlockingQueryModel(FakeModel):
+    def __init__(self, complete_outputs: list[str]) -> None:
+        super().__init__(complete_outputs)
+        self.query_started = asyncio.Event()
+        self.release_query = asyncio.Event()
+
+    async def structured(
+        self,
+        request: ModelRequest,
+        output_schema: type[Any],
+        *,
+        deadline: float,
+        cancellation_token: CancellationToken,
+    ) -> StructuredModelResult[Any]:
+        del deadline, cancellation_token
+        self.structured_calls += 1
+        self.structured_requests.append(request)
+        self.query_started.set()
+        await self.release_query.wait()
+        return StructuredModelResult[Any](
+            output=output_schema.model_validate({"queries": ["shared"]}),
+            usage=ResourceUsage.zero(),
+            provider_id=self.provider_id,
+            model_id="fake-model",
+            raw_response_artifact_id="sha256:" + "2" * 64,
+            output_schema_hash="3" * 64,
+        )
+
+
 def future_deadline() -> float:
     return time.monotonic() + 30.0
 
@@ -394,3 +423,232 @@ async def test_expired_and_nonfinite_deadlines_do_not_call_model(tmp_path: Path)
             )
         assert error.value.code in {"INVALID_REQUEST", "TIMEOUT"}
     assert model.complete_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_fixed_planner_validates_with_its_configured_search_depth(
+    tmp_path: Path,
+) -> None:
+    candidate = json.loads(plan_json())
+    template = candidate["subquestions"][0]
+    candidate["subquestions"] = []
+    for index in range(5):
+        item = json.loads(json.dumps(template))
+        item["id"] = f"sq-{index}"
+        item["information_needs"][0]["need_id"] = f"need-{index}"
+        candidate["subquestions"].append(item)
+    raw = json.dumps(candidate, separators=(",", ":"), sort_keys=True)
+    shallow_model = FakeModel([raw])
+    shallow = FixedPlanner(
+        model=shallow_model,
+        artifact_store=LocalArtifactStore(tmp_path / "shallow"),
+        budget=RunBudget.preset("medium"),
+        search_depth=1,
+    )
+    deep_model = FakeModel([raw, raw])
+    deep = FixedPlanner(
+        model=deep_model,
+        artifact_store=LocalArtifactStore(tmp_path / "deep"),
+        budget=RunBudget.preset("medium"),
+        search_depth=2,
+    )
+
+    plan = await shallow.create_plan(
+        research_request(),
+        deadline=future_deadline(),
+        cancellation_token=CancellationToken(),
+    )
+    with pytest.raises(PlanGenerationError):
+        await deep.create_plan(
+            research_request(),
+            deadline=future_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+
+    assert len(plan.subquestions) == 5
+    assert shallow_model.complete_calls == 1
+    assert deep_model.complete_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_same_key_waiters_observe_own_deadline_and_cancellation(
+    tmp_path: Path,
+) -> None:
+    model = BlockingQueryModel([plan_json()])
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=LocalArtifactStore(tmp_path),
+        budget=RunBudget.preset("medium"),
+    )
+    plan = await planner.create_plan(
+        research_request(),
+        deadline=future_deadline(),
+        cancellation_token=CancellationToken(),
+    )
+    owner = asyncio.create_task(
+        planner.queries_for(
+            plan.subquestions[0],
+            plan_id=plan.plan_id,
+            deadline=future_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+    )
+    await model.query_started.wait()
+    cancelled_token = CancellationToken()
+    timeout_waiter = asyncio.create_task(
+        planner.queries_for(
+            plan.subquestions[0],
+            plan_id=plan.plan_id,
+            deadline=time.monotonic() + 0.04,
+            cancellation_token=CancellationToken(),
+        )
+    )
+    cancelled_waiter = asyncio.create_task(
+        planner.queries_for(
+            plan.subquestions[0],
+            plan_id=plan.plan_id,
+            deadline=future_deadline(),
+            cancellation_token=cancelled_token,
+        )
+    )
+    await asyncio.sleep(0.02)
+    cancelled_token.cancel()
+
+    try:
+        with pytest.raises(ProviderError) as timeout_error:
+            await asyncio.wait_for(timeout_waiter, timeout=0.3)
+        with pytest.raises(OperationCancelled):
+            await asyncio.wait_for(cancelled_waiter, timeout=0.3)
+        assert timeout_error.value.code == "TIMEOUT"
+        assert owner.done() is False
+        assert model.structured_calls == 1
+    finally:
+        model.release_query.set()
+        assert await owner == ("shared",)
+
+    cached = await planner.queries_for(
+        plan.subquestions[0],
+        plan_id=plan.plan_id,
+        deadline=future_deadline(),
+        cancellation_token=CancellationToken(),
+    )
+    assert cached == ("shared",)
+    assert model.structured_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_repair_keys_and_query_plan_id_are_bounded_as_external_strings(
+    tmp_path: Path,
+) -> None:
+    seen: list[str] = []
+
+    def boundary(text: str) -> str:
+        seen.append(text)
+        return f"BOUND<{text}>"
+
+    initial = json.dumps({"ATTACK_KEY": {"nested": "PAYLOAD"}})
+    model = FakeModel([initial, plan_json()], query_outputs=[["query"]])
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=LocalArtifactStore(tmp_path),
+        budget=RunBudget.preset("medium"),
+        content_boundary=boundary,
+    )
+
+    plan = await planner.create_plan(
+        research_request(),
+        deadline=future_deadline(),
+        cancellation_token=CancellationToken(),
+    )
+    repair_payload = json.loads(model.complete_requests[1].messages[-1].content)
+
+    assert {"ATTACK_KEY", "nested", "PAYLOAD"} <= set(seen)
+    assert repair_payload["candidate"] == {
+        "BOUND<ATTACK_KEY>": {"BOUND<nested>": "BOUND<PAYLOAD>"}
+    }
+    seen.clear()
+
+    await planner.queries_for(
+        plan.subquestions[0],
+        plan_id="UNTRUSTED_PLAN_ID",
+        deadline=future_deadline(),
+        cancellation_token=CancellationToken(),
+    )
+    query_payload = json.loads(model.structured_requests[0].messages[-1].content)
+
+    assert "UNTRUSTED_PLAN_ID" in seen
+    assert query_payload["plan_id"] == "BOUND<UNTRUSTED_PLAN_ID>"
+
+
+@pytest.mark.asyncio
+async def test_boundary_mapping_key_collisions_are_rejected_before_repair_prompt(
+    tmp_path: Path,
+) -> None:
+    def boundary(text: str) -> str:
+        if text in {"first-key", "second-key"}:
+            return "COLLISION"
+        return f"BOUND<{text}>"
+
+    initial = json.dumps({"first-key": 1, "second-key": 2})
+    model = FakeModel([initial, plan_json()])
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=LocalArtifactStore(tmp_path),
+        budget=RunBudget.preset("medium"),
+        content_boundary=boundary,
+    )
+
+    with pytest.raises(ValueError, match="duplicate mapping keys"):
+        await planner.create_plan(
+            research_request(),
+            deadline=future_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+
+    assert model.complete_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_deep_candidate_is_repaired_without_raw_parser_failure(tmp_path: Path) -> None:
+    deep_candidate = "[" * 2_000 + "]" * 2_000
+    model = FakeModel([deep_candidate, plan_json()])
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=LocalArtifactStore(tmp_path),
+        budget=RunBudget.preset("medium"),
+    )
+
+    plan = await planner.create_plan(
+        research_request(),
+        deadline=future_deadline(),
+        cancellation_token=CancellationToken(),
+    )
+
+    repair_payload = json.loads(model.complete_requests[1].messages[-1].content)
+    assert plan.plan_id == "plan-1"
+    assert model.complete_calls == 2
+    assert repair_payload["candidate"] is None
+    assert repair_payload["error_codes"] == ["MALFORMED_JSON"]
+
+
+@pytest.mark.asyncio
+async def test_nonfinite_json_number_is_repaired_without_serialization_failure(
+    tmp_path: Path,
+) -> None:
+    model = FakeModel(["1e10000", plan_json()])
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=LocalArtifactStore(tmp_path),
+        budget=RunBudget.preset("medium"),
+    )
+
+    plan = await planner.create_plan(
+        research_request(),
+        deadline=future_deadline(),
+        cancellation_token=CancellationToken(),
+    )
+
+    repair_payload = json.loads(model.complete_requests[1].messages[-1].content)
+    assert plan.plan_id == "plan-1"
+    assert repair_payload["candidate"] is None
+    assert repair_payload["error_codes"] == ["INVALID_SCHEMA"]

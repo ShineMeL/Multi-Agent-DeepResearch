@@ -3,6 +3,8 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import date
 
+import pytest
+
 from deepresearch.domain import (
     DateRange,
     EvidenceRequirements,
@@ -285,3 +287,180 @@ def test_validated_plan_keeps_date_values_and_frozen_models() -> None:
     assert result.candidate.scope.date_range == DateRange(
         start=date(2024, 1, 1), end=date(2026, 12, 31)
     )
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        "[" * 2_000 + "]" * 2_000,
+        ("[" * 2_000 + "]" * 2_000).encode(),
+        '"' + "x" * 1_100_000 + '"',
+    ],
+    ids=("deep-text", "deep-bytes", "oversize-text"),
+)
+def test_plan_validator_bounds_untrusted_json_without_leaking_runtime_errors(
+    candidate: str | bytes,
+) -> None:
+    report = PlanValidator().validate_candidate(candidate, request=None, budget=None)
+
+    assert report.valid is False
+    assert report.error_codes == ("MALFORMED_JSON",)
+
+
+def test_plan_validator_bounds_preparsed_mapping_depth() -> None:
+    nested: object = "leaf"
+    for _ in range(200):
+        nested = {"nested": nested}
+    candidate = valid_candidate()
+    candidate["unexpected"] = nested
+
+    report = PlanValidator().validate_candidate(candidate, request=None, budget=None)
+
+    assert report.valid is False
+    assert report.error_codes == ("INVALID_SCHEMA",)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ("subquestions", 0, "importance"),
+        ("subquestions", 0, "information_needs", 0, "importance"),
+        ("subquestions", 0, "evidence_requirements", "min_independent_sources"),
+        (
+            "subquestions",
+            0,
+            "evidence_requirements",
+            "freshness",
+            "retrieved_within_days",
+        ),
+    ],
+)
+def test_plan_validator_rejects_bool_in_every_numeric_plan_field(
+    path: tuple[str | int, ...],
+) -> None:
+    candidate = valid_candidate()
+    candidate["subquestions"][0]["evidence_requirements"]["freshness"] = {  # type: ignore[index]
+        "kind": "retrieved_within_days",
+        "retrieved_within_days": 7,
+    }
+    target: object = candidate
+    for component in path[:-1]:
+        target = target[component]  # type: ignore[index]
+    target[path[-1]] = True  # type: ignore[index]
+
+    report = PlanValidator().validate_candidate(
+        candidate,
+        request=research_request(),
+        budget=RunBudget.preset("medium"),
+    )
+
+    assert "INVALID_SCHEMA" in report.error_codes
+
+
+def test_plan_validator_retains_real_boolean_fields() -> None:
+    candidate = valid_candidate()
+    requirements = candidate["subquestions"][0]["evidence_requirements"]  # type: ignore[index]
+    requirements["must_include_primary"] = True
+
+    report = PlanValidator().validate_candidate(
+        candidate,
+        request=research_request(),
+        budget=RunBudget.preset("medium"),
+    )
+
+    assert report.valid is True
+    assert report.candidate is not None
+    assert report.candidate.subquestions[0].evidence_requirements.must_include_primary is True
+
+
+def test_plan_validator_rejects_empty_included_topic_scope() -> None:
+    candidate = valid_candidate()
+    candidate["scope"]["included_topics"] = []  # type: ignore[index]
+
+    report = PlanValidator().validate_candidate(
+        candidate,
+        request=research_request(),
+        budget=RunBudget.preset("medium"),
+    )
+
+    assert report.error_codes == ("EMPTY_GOAL", "OUT_OF_SCOPE_GOAL")
+
+
+@pytest.mark.parametrize(
+    "date_range",
+    [None, {"start": "2025-12-31", "end": "2026-12-31"}],
+)
+def test_plan_validator_rejects_omitted_or_insufficient_freshness_range(
+    date_range: object,
+) -> None:
+    request = research_request().model_copy(
+        update={
+            "output_requirements": {
+                "answer_shape": "brief",
+                "excluded_topics": ["credential harvesting"],
+                "included_topics": ["planner optimization"],
+            },
+            "freshness_requirement": FreshnessRequirement(
+                kind="published_after", published_after=date(2026, 1, 1)
+            )
+        }
+    )
+    candidate = valid_candidate()
+    candidate["scope"]["date_range"] = date_range  # type: ignore[index]
+
+    report = PlanValidator().validate_candidate(
+        candidate, request=request, budget=RunBudget.preset("medium")
+    )
+
+    assert "OUT_OF_SCOPE_GOAL" in report.error_codes
+
+
+@pytest.mark.parametrize("reverse_duplicate_rows", [False, True])
+def test_plan_validator_detects_cycles_across_every_duplicate_row_edge(
+    reverse_duplicate_rows: bool,
+) -> None:
+    candidate = valid_candidate()
+    template = candidate["subquestions"][0]  # type: ignore[index]
+    first_a = deepcopy(template)
+    first_a.update({"id": "A", "dependencies": []})
+    first_a["information_needs"][0]["need_id"] = "need-a1"
+    second_a = deepcopy(template)
+    second_a.update({"id": "A", "dependencies": ["B"]})
+    second_a["information_needs"][0]["need_id"] = "need-a2"
+    b_row = deepcopy(template)
+    b_row.update({"id": "B", "dependencies": ["A"]})
+    b_row["information_needs"][0]["need_id"] = "need-b"
+    duplicate_rows = [second_a, first_a] if reverse_duplicate_rows else [first_a, second_a]
+    candidate["subquestions"] = [*duplicate_rows, b_row]
+
+    report = PlanValidator().validate_candidate(candidate, request=None, budget=None)
+
+    assert report.error_codes == (
+        "DUPLICATE_SUBQUESTION_ID",
+        "DEPENDENCY_CYCLE",
+    )
+
+
+def test_plan_validator_default_search_depth_accounts_for_p1_query_fanout() -> None:
+    candidate = valid_candidate()
+    template = candidate["subquestions"][0]  # type: ignore[index]
+    candidate["subquestions"] = []
+    for index in range(5):
+        item = deepcopy(template)
+        item["id"] = f"sq-{index}"
+        item["information_needs"][0]["need_id"] = f"need-{index}"
+        candidate["subquestions"].append(item)  # type: ignore[union-attr]
+
+    default_report = PlanValidator().validate_candidate(
+        candidate,
+        request=research_request(),
+        budget=RunBudget.preset("medium"),
+    )
+    shallow_report = PlanValidator(search_depth=1).validate_candidate(
+        candidate,
+        request=research_request(),
+        budget=RunBudget.preset("medium"),
+    )
+
+    assert "BUDGET_INFEASIBLE" in default_report.error_codes
+    assert shallow_report.valid is True

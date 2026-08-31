@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from datetime import date
@@ -44,6 +45,10 @@ _PRIMARY_SOURCE_TYPES = frozenset(
         "first_party_statement",
     }
 )
+_MAX_CANDIDATE_BYTES = 1_000_000
+_MAX_JSON_DEPTH = 64
+_MAX_JSON_NODES = 20_000
+_MAX_JSON_STRING_CHARS = 250_000
 
 
 class PlanValidationReport(BaseModel):
@@ -64,6 +69,53 @@ def _strict_json(value: str) -> object:
         raise ValueError("non-finite JSON number")
 
     return json.loads(value, parse_constant=reject_constant)
+
+
+def _structure_is_bounded_json(value: object) -> bool:
+    stack: list[tuple[object, int]] = [(value, 0)]
+    seen_containers: set[int] = set()
+    node_count = 0
+    string_chars = 0
+    while stack:
+        item, depth = stack.pop()
+        node_count += 1
+        if node_count > _MAX_JSON_NODES or depth > _MAX_JSON_DEPTH:
+            return False
+        if isinstance(item, str):
+            string_chars += len(item)
+            if string_chars > _MAX_JSON_STRING_CHARS:
+                return False
+            continue
+        if item is None or isinstance(item, (bool, int)):
+            continue
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                return False
+            continue
+        if isinstance(item, Mapping):
+            mapping = cast("Mapping[object, object]", item)
+            identity = id(mapping)
+            if identity in seen_containers:
+                return False
+            seen_containers.add(identity)
+            for key, child in mapping.items():
+                if not isinstance(key, str):
+                    return False
+                string_chars += len(key)
+                if string_chars > _MAX_JSON_STRING_CHARS:
+                    return False
+                stack.append((child, depth + 1))
+            continue
+        if isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray)):
+            sequence = cast("Sequence[object]", item)
+            identity = id(sequence)
+            if identity in seen_containers:
+                return False
+            seen_containers.add(identity)
+            stack.extend((child, depth + 1) for child in sequence)
+            continue
+        return False
+    return True
 
 
 def _mapping(value: object) -> Mapping[str, object] | None:
@@ -126,7 +178,10 @@ def _graph_codes(raw: Mapping[str, object]) -> set[PlanValidationCode]:
     raw_scope = _mapping(raw.get("scope"))
     if raw_scope is not None:
         topics = _sequence(raw_scope.get("included_topics"))
-        if topics is not None and any(isinstance(item, str) and not item.strip() for item in topics):
+        if topics is not None and (
+            not topics
+            or any(isinstance(item, str) and not item.strip() for item in topics)
+        ):
             empty_goal = True
     if not subquestions:
         empty_goal = True
@@ -139,29 +194,22 @@ def _graph_codes(raw: Mapping[str, object]) -> set[PlanValidationCode]:
     if any(dependency not in known_ids for _, dependencies in dependency_rows for dependency in dependencies):
         codes.add("UNKNOWN_DEPENDENCY")
 
-    graph: dict[str, tuple[str, ...]] = {}
+    graph: dict[str, set[str]] = {subquestion_id: set() for subquestion_id in known_ids}
     for subquestion_id, dependencies in dependency_rows:
-        graph.setdefault(
-            subquestion_id,
-            tuple(dependency for dependency in dependencies if dependency in known_ids),
+        graph[subquestion_id].update(
+            dependency for dependency in dependencies if dependency in known_ids
         )
-    visiting: set[str] = set()
-    visited: set[str] = set()
-
-    def visit(node: str) -> bool:
-        if node in visiting:
-            return True
-        if node in visited:
-            return False
-        visiting.add(node)
-        if any(visit(dependency) for dependency in graph.get(node, ())):
-            return True
-        visiting.remove(node)
-        visited.add(node)
-        return False
-
-    if any(visit(node) for node in graph):
-        codes.add("DEPENDENCY_CYCLE")
+    remaining = set(graph)
+    while remaining:
+        ready = {
+            subquestion_id
+            for subquestion_id in remaining
+            if graph[subquestion_id].isdisjoint(remaining)
+        }
+        if not ready:
+            codes.add("DEPENDENCY_CYCLE")
+            break
+        remaining.difference_update(ready)
     return codes
 
 
@@ -174,10 +222,14 @@ def _has_bool_for_numeric_field(raw: Mapping[str, object]) -> bool:
         if isinstance(subquestion.get("importance"), bool):
             return True
         raw_requirements = _mapping(subquestion.get("evidence_requirements"))
-        if raw_requirements is not None and isinstance(
-            raw_requirements.get("min_independent_sources"), bool
-        ):
-            return True
+        if raw_requirements is not None:
+            if isinstance(raw_requirements.get("min_independent_sources"), bool):
+                return True
+            freshness = _mapping(raw_requirements.get("freshness"))
+            if freshness is not None and isinstance(
+                freshness.get("retrieved_within_days"), bool
+            ):
+                return True
         raw_needs = _sequence(subquestion.get("information_needs")) or ()
         for raw_need in raw_needs:
             need = _mapping(raw_need)
@@ -251,6 +303,8 @@ def _scope_is_outside_request(plan: ResearchPlan, request: ResearchRequest) -> b
     excluded = _normalized_strings(requirements.get("excluded_topics")) or ()
     plan_included = tuple(topic.strip().casefold() for topic in plan.scope.included_topics)
     plan_excluded = {topic.strip().casefold() for topic in plan.scope.excluded_topics}
+    if not plan_included:
+        return True
     if allowed is not None and any(topic not in set(allowed) for topic in plan_included):
         return True
     if any(topic in set(excluded) or topic in plan_excluded for topic in plan_included):
@@ -275,13 +329,17 @@ def _scope_is_outside_request(plan: ResearchPlan, request: ResearchRequest) -> b
             plan_range.end is None or plan_range.end > requested_end
         ):
             return True
-        freshness = request.freshness_requirement
-        if (
-            freshness.kind == "published_after"
-            and freshness.published_after is not None
-            and (plan_range.start is None or plan_range.start < freshness.published_after)
-        ):
-            return True
+    freshness = request.freshness_requirement
+    if (
+        freshness.kind == "published_after"
+        and freshness.published_after is not None
+        and (
+            plan_range is None
+            or plan_range.start is None
+            or plan_range.start < freshness.published_after
+        )
+    ):
+        return True
     return not request.report_language.strip()
 
 
@@ -301,14 +359,19 @@ def _is_unexecutable(plan: ResearchPlan, request: ResearchRequest) -> bool:
     return False
 
 
-def _is_over_budget(plan: ResearchPlan, budget: RunBudget) -> bool:
+def _is_over_budget(
+    plan: ResearchPlan, budget: RunBudget, *, search_depth: int
+) -> bool:
     used_searches = sum(usage.search_calls for usage in budget.used_by_node.values())
     used_pages = sum(usage.pages for usage in budget.used_by_node.values())
     used_tokens = sum(usage.total_tokens for usage in budget.used_by_node.values())
-    required_searches = sum(max(1, len(item.information_needs)) for item in plan.subquestions)
+    required_searches = search_depth * len(plan.subquestions)
     required_pages = sum(
-        max(1, len(item.information_needs))
-        * item.evidence_requirements.min_independent_sources
+        max(
+            search_depth,
+            max(1, len(item.information_needs))
+            * item.evidence_requirements.min_independent_sources,
+        )
         for item in plan.subquestions
     )
     required_tokens = 1_000 + 1_000 * required_searches + 1_000 * required_pages
@@ -320,6 +383,15 @@ def _is_over_budget(plan: ResearchPlan, budget: RunBudget) -> bool:
 
 
 class PlanValidator:
+    def __init__(self, *, search_depth: int = 2) -> None:
+        if (
+            isinstance(search_depth, bool)
+            or not isinstance(search_depth, int)  # pyright: ignore[reportUnnecessaryIsInstance]
+            or search_depth <= 0
+        ):
+            raise ValueError("search_depth must be a positive integer")
+        self.search_depth = search_depth
+
     def validate(self, plan: ResearchPlan) -> PlanValidationReport:
         return self.validate_candidate(plan, request=None, budget=None)
 
@@ -335,9 +407,16 @@ class PlanValidator:
         if isinstance(candidate, ResearchPlan):
             raw: object = candidate.model_dump(mode="json")
         elif isinstance(candidate, bytes):
+            if len(candidate) > _MAX_CANDIDATE_BYTES:
+                codes.add("MALFORMED_JSON")
+                return PlanValidationReport(
+                    valid=False,
+                    error_codes=_ordered(codes),
+                    candidate_artifact_id=candidate_artifact_id,
+                )
             try:
                 raw = _strict_json(candidate.decode("utf-8"))
-            except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+            except (RecursionError, UnicodeDecodeError, ValueError):
                 codes.add("MALFORMED_JSON")
                 return PlanValidationReport(
                     valid=False,
@@ -345,9 +424,16 @@ class PlanValidator:
                     candidate_artifact_id=candidate_artifact_id,
                 )
         elif isinstance(candidate, str):
+            if len(candidate) > _MAX_CANDIDATE_BYTES:
+                codes.add("MALFORMED_JSON")
+                return PlanValidationReport(
+                    valid=False,
+                    error_codes=_ordered(codes),
+                    candidate_artifact_id=candidate_artifact_id,
+                )
             try:
                 raw = _strict_json(candidate)
-            except (ValueError, json.JSONDecodeError):
+            except (RecursionError, ValueError):
                 codes.add("MALFORMED_JSON")
                 return PlanValidationReport(
                     valid=False,
@@ -355,7 +441,19 @@ class PlanValidator:
                     candidate_artifact_id=candidate_artifact_id,
                 )
         else:
-            raw = deepcopy(dict(candidate))
+            raw = candidate
+
+        try:
+            structure_is_valid = _structure_is_bounded_json(raw)
+        except (OverflowError, RecursionError, TypeError, ValueError):
+            structure_is_valid = False
+        if not structure_is_valid:
+            codes.add("INVALID_SCHEMA")
+            return PlanValidationReport(
+                valid=False,
+                error_codes=_ordered(codes),
+                candidate_artifact_id=candidate_artifact_id,
+            )
 
         raw_mapping = _mapping(raw)
         if raw_mapping is None:
@@ -366,7 +464,15 @@ class PlanValidator:
                 candidate_artifact_id=candidate_artifact_id,
             )
 
-        graph_codes = _graph_codes(raw_mapping)
+        try:
+            graph_codes = _graph_codes(raw_mapping)
+        except (OverflowError, RecursionError, TypeError, ValueError):
+            codes.add("INVALID_SCHEMA")
+            return PlanValidationReport(
+                valid=False,
+                error_codes=_ordered(codes),
+                candidate_artifact_id=candidate_artifact_id,
+            )
         codes.update(graph_codes)
         strict_numeric_failure = _has_bool_for_numeric_field(raw_mapping)
         validated: ResearchPlan | None = None
@@ -376,7 +482,7 @@ class PlanValidator:
             has_field_error = any(item.get("loc") for item in error.errors(include_input=False))
             if strict_numeric_failure or has_field_error or not graph_codes:
                 codes.add("INVALID_SCHEMA")
-        except (TypeError, ValueError):
+        except (OverflowError, RecursionError, TypeError, ValueError):
             codes.add("INVALID_SCHEMA")
         if strict_numeric_failure:
             codes.add("INVALID_SCHEMA")
@@ -387,7 +493,7 @@ class PlanValidator:
                 semantic_plan = ResearchPlan.model_validate(
                     _without_graph_conflicts(raw_mapping, graph_codes)
                 )
-            except (TypeError, ValueError, ValidationError):
+            except (OverflowError, RecursionError, TypeError, ValueError, ValidationError):
                 semantic_plan = None
 
         if semantic_plan is not None:
@@ -398,7 +504,9 @@ class PlanValidator:
                     codes.add("OUT_OF_SCOPE_GOAL")
                 if _is_unexecutable(semantic_plan, request):
                     codes.add("UNEXECUTABLE_GOAL")
-            if budget is not None and _is_over_budget(semantic_plan, budget):
+            if budget is not None and _is_over_budget(
+                semantic_plan, budget, search_depth=self.search_depth
+            ):
                 codes.add("BUDGET_INFEASIBLE")
 
         ordered = _ordered(codes)

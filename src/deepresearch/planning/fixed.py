@@ -35,6 +35,10 @@ _REPAIR_SYSTEM_PROMPT = (
     "Return exactly one corrected ResearchPlan JSON object."
 )
 _QUERY_SYSTEM_PROMPT = "Return deterministic search queries for the supplied subquestion."
+_MAX_REPAIR_CANDIDATE_CHARS = 1_000_000
+_MAX_REPAIR_JSON_DEPTH = 64
+_MAX_REPAIR_JSON_NODES = 20_000
+_LOCK_POLL_SECONDS = 0.01
 
 
 class PlanGenerationError(RuntimeError):
@@ -162,16 +166,38 @@ def _request(
 
 
 def _repair_candidate(raw: str) -> JsonValue | None:
+    if len(raw) > _MAX_REPAIR_CANDIDATE_CHARS:
+        return None
     try:
         parsed: object = json.loads(
             raw,
             parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
         )
-    except (ValueError, json.JSONDecodeError):
+    except (RecursionError, ValueError):
         return None
-    if isinstance(parsed, (dict, list, str, int, float, bool)) or parsed is None:
-        return cast("JsonValue", parsed)
-    return None
+    stack: list[tuple[object, int]] = [(parsed, 0)]
+    node_count = 0
+    while stack:
+        item, depth = stack.pop()
+        node_count += 1
+        if node_count > _MAX_REPAIR_JSON_NODES or depth > _MAX_REPAIR_JSON_DEPTH:
+            return None
+        if isinstance(item, dict):
+            mapping = cast("dict[object, object]", item)
+            if any(not isinstance(key, str) for key in mapping):
+                return None
+            stack.extend((child, depth + 1) for child in mapping.values())
+        elif isinstance(item, list):
+            values = cast("list[object]", item)
+            stack.extend((child, depth + 1) for child in values)
+        elif (
+            isinstance(item, float) and not math.isfinite(item)
+        ) or not (
+            item is None
+            or isinstance(item, (str, int, float, bool))
+        ):
+            return None
+    return cast("JsonValue", parsed)
 
 
 class FixedPlanner:
@@ -197,7 +223,7 @@ class FixedPlanner:
         self.search_depth = search_depth
         self.prompt_version = prompt_version
         self.content_boundary = content_boundary
-        self.validator = PlanValidator()
+        self.validator = PlanValidator(search_depth=search_depth)
         self._query_cache: dict[tuple[str, str, str], tuple[str, ...]] = {}
         self._query_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
 
@@ -221,7 +247,15 @@ class FixedPlanner:
 
     def _repair_request(self, raw: str, report: PlanValidationReport) -> ModelRequest:
         rejected = _repair_candidate(raw)
-        bounded = None if rejected is None else _bound_json(rejected, self.content_boundary)
+        bounded = (
+            None
+            if rejected is None
+            else _bound_json(
+                rejected,
+                self.content_boundary,
+                bound_mapping_keys=True,
+            )
+        )
         payload = {
             "candidate": bounded,
             "error_codes": list(report.error_codes),
@@ -317,6 +351,11 @@ class FixedPlanner:
             candidate_artifact_id=repaired_artifact_id,
         )
         if not repaired.valid or repaired.candidate is None:
+            _check_call_boundary(
+                provider=self.model.provider_id,
+                deadline=deadline,
+                cancellation_token=cancellation_token,
+            )
             raise PlanGenerationError
         _check_call_boundary(
             provider=self.model.provider_id,
@@ -328,7 +367,7 @@ class FixedPlanner:
     def _query_request(self, subquestion: SubQuestion, plan_id: str) -> ModelRequest:
         raw_subquestion = cast("JsonValue", subquestion.model_dump(mode="json"))
         payload: dict[str, JsonValue] = {
-            "plan_id": plan_id,
+            "plan_id": _bound_json(plan_id, self.content_boundary),
             "search_depth": self.search_depth,
             "subquestion": _bound_json(raw_subquestion, self.content_boundary),
         }
@@ -340,6 +379,38 @@ class FixedPlanner:
             output_schema=_QueryOutput,
             max_output_tokens=max(128, min(2_000, self.budget.max_total_tokens)),
         )
+
+    async def _acquire_query_lock(
+        self,
+        lock: asyncio.Lock,
+        *,
+        deadline: Deadline,
+        cancellation_token: CancellationToken,
+    ) -> None:
+        while True:
+            _check_call_boundary(
+                provider=self.model.provider_id,
+                deadline=deadline,
+                cancellation_token=cancellation_token,
+            )
+            remaining = deadline - time.monotonic()
+            try:
+                await asyncio.wait_for(
+                    lock.acquire(),
+                    timeout=min(_LOCK_POLL_SECONDS, remaining),
+                )
+            except TimeoutError:
+                continue
+            try:
+                _check_call_boundary(
+                    provider=self.model.provider_id,
+                    deadline=deadline,
+                    cancellation_token=cancellation_token,
+                )
+            except BaseException:
+                lock.release()
+                raise
+            return
 
     async def queries_for(
         self,
@@ -364,7 +435,12 @@ class FixedPlanner:
             )
             return cached
         lock = self._query_locks.setdefault(key, asyncio.Lock())
-        async with lock:
+        await self._acquire_query_lock(
+            lock,
+            deadline=deadline,
+            cancellation_token=cancellation_token,
+        )
+        try:
             _check_call_boundary(
                 provider=self.model.provider_id,
                 deadline=deadline,
@@ -415,7 +491,18 @@ class FixedPlanner:
                 cancellation_token=cancellation_token,
             )
             self._query_cache[key] = value
+            try:
+                _check_call_boundary(
+                    provider=self.model.provider_id,
+                    deadline=deadline,
+                    cancellation_token=cancellation_token,
+                )
+            except BaseException:
+                self._query_cache.pop(key, None)
+                raise
             return value
+        finally:
+            lock.release()
 
 
 __all__ = ["FixedPlanner", "PlanGenerationError"]
