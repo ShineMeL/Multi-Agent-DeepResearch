@@ -1,0 +1,15 @@
+{
+  "files": [
+    {
+      "path": "config.json",
+      "sha256": "548465344ec7544a3f07a91666f960caf183993f92992842d86c29276c96abee",
+      "size_bytes": 18
+    }
+  ],
+  "model_id": "synthetic/embedding",
+  "normalize_embeddings": true,
+  "revision": "1111111111111111111111111111111111111111",
+  "schema_version": "embedding-model-lock-v1",
+  "snapshot_sha256": "67b0a4cbaff2da019861a0e8ed08334a93e8f75898634eefed0dfe6e85e1ab4f",
+  "vector_dimension": 3
+}
