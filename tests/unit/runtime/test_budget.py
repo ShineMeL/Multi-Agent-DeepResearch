@@ -581,6 +581,18 @@ def test_from_snapshot_rejects_cost_disabled_seed_cost_rewind(
         BudgetAccountant.from_snapshot(budget, rewound)
 
 
+def test_from_snapshot_maps_missing_constructed_fields_to_public_value_error() -> None:
+    valid_budget = RunBudget.preset("low")
+    valid_snapshot = BudgetAccountant(valid_budget).snapshot()
+    missing_budget = RunBudget.model_construct()
+    missing_snapshot = BudgetSnapshot.model_construct()
+
+    with pytest.raises(ValueError, match="budget|snapshot|invalid"):
+        BudgetAccountant.from_snapshot(missing_budget, valid_snapshot)
+    with pytest.raises(ValueError, match="budget|snapshot|invalid"):
+        BudgetAccountant.from_snapshot(valid_budget, missing_snapshot)
+
+
 def test_from_snapshot_does_not_restore_reservation_objects_or_indexes() -> None:
     budget = RunBudget.preset("low")
     original = BudgetAccountant(budget, run_scope="same")

@@ -213,17 +213,21 @@ class BudgetAccountant:
         if type(budget) is not RunBudget or type(snapshot) is not BudgetSnapshot:
             raise ValueError("budget snapshot inputs must use exact runtime models")
         budget_mapping_type = type(RunBudget.preset("low").used_by_node)
+        try:
+            budget_used_value: object = budget.used_by_node
+            snapshot_used_value: object = snapshot.used_by_node
+            last_observed_value: object = snapshot.last_observed_usage
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError("budget snapshot is invalid") from None
         if (
-            type(budget.used_by_node) is not budget_mapping_type
-            or type(snapshot.used_by_node) is not _FrozenDict
-            or type(snapshot.last_observed_usage) is not ResourceUsage
+            type(budget_used_value) is not budget_mapping_type
+            or type(snapshot_used_value) is not _FrozenDict
+            or type(last_observed_value) is not ResourceUsage
         ):
             raise ValueError("budget snapshot contains invalid usage models")
-        budget_used_value: object = budget.used_by_node
         budget_used = cast("dict[str, ResourceUsage]", budget_used_value)
-        snapshot_used = cast(
-            "dict[BudgetNode, ResourceUsage]", snapshot.__dict__["used_by_node"]
-        )
+        snapshot_used = cast("dict[BudgetNode, ResourceUsage]", snapshot_used_value)
+        last_observed = last_observed_value
         if any(type(item) is not ResourceUsage for item in budget_used.values()) or any(
             type(item) is not ResourceUsage for item in snapshot_used.values()
         ):
@@ -248,7 +252,7 @@ class BudgetAccountant:
                 for node, value in snapshot_used.items()
             }
             snapshot_payload["last_observed_usage"] = fresh_usage(
-                snapshot.last_observed_usage
+                last_observed
             )
             restored_snapshot = BudgetSnapshot.model_validate(
                 snapshot_payload,
