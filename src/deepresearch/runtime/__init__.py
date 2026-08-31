@@ -6,6 +6,7 @@ from .budget import (
     ResourceEstimate,
 )
 from .cancellation import CancellationToken, OperationCancelled
+from .checkpoints import checkpoint_serializer, open_sqlite_checkpointer
 from .ports import CheckpointRef, ResearchRunner
 
 __all__ = [
@@ -18,4 +19,6 @@ __all__ = [
     "OperationCancelled",
     "ResearchRunner",
     "ResourceEstimate",
+    "checkpoint_serializer",
+    "open_sqlite_checkpointer",
 ]

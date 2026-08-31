@@ -895,9 +895,12 @@ class RunManifest(_ManifestModel):
             )
             if self.usage_by_node[node] != expected:
                 raise ValueError("usage_by_node does not match aggregated node executions")
+        envelope_wall_seconds = (self.finished_at - self.started_at).total_seconds()
+        if self.usage.wall_seconds > envelope_wall_seconds:
+            raise ValueError("active wall time exceeds the run envelope")
         expected_run = self._aggregate_usage(
             tuple(self.usage_by_node.values()),
-            wall_seconds=(self.finished_at - self.started_at).total_seconds(),
+            wall_seconds=self.usage.wall_seconds,
             cost_usd=self._charged_cost(self.provider_calls),
         )
         if self.usage != expected_run:

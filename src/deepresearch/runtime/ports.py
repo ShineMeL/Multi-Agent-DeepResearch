@@ -28,7 +28,7 @@ class CheckpointRef:
             raise TypeError("thread_id is invalid")
         if not thread_id:
             raise ValueError("thread_id must not be empty")
-        if not isinstance(created_at, datetime):
+        if type(created_at) is not datetime:
             raise TypeError("created_at is invalid")
         if created_at.tzinfo is None or created_at.utcoffset() is None:
             raise ValueError("created_at must be timezone-aware")

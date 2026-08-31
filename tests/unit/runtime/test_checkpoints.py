@@ -9,6 +9,7 @@ import pytest
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph import END, StateGraph
 
+from deepresearch import runtime as runtime_package
 from deepresearch.domain import CoverageLedgerEntry, FreshnessRequirement, ResearchRequest
 from deepresearch.runtime import CheckpointRef
 from deepresearch.runtime.checkpoints import (
@@ -34,6 +35,13 @@ def request() -> ResearchRequest:
         run_purpose="test",
         budget_preset="low",
     )
+
+
+def test_runtime_publicly_exports_checkpoint_factories() -> None:
+    assert runtime_package.checkpoint_serializer is checkpoint_serializer
+    assert runtime_package.open_sqlite_checkpointer is open_sqlite_checkpointer
+    assert "checkpoint_serializer" in runtime_package.__all__
+    assert "open_sqlite_checkpointer" in runtime_package.__all__
 
 
 def ledger() -> CoverageLedgerEntry:
@@ -290,3 +298,20 @@ def test_checkpoint_ref_strictly_rejects_invalid_field_types(
             thread_id=thread_id,  # type: ignore[arg-type]
             created_at=created_at,  # type: ignore[arg-type]
         )
+
+
+def test_checkpoint_ref_rejects_datetime_subclass_without_calling_it() -> None:
+    called = False
+
+    class DatetimeSubclass(datetime):
+        def utcoffset(self):  # type: ignore[no-untyped-def]
+            nonlocal called
+            called = True
+            return super().utcoffset()
+
+    value = DatetimeSubclass(2026, 9, 1, tzinfo=UTC)
+
+    with pytest.raises(TypeError, match="created_at is invalid"):
+        CheckpointRef(checkpoint_id="cp-1", thread_id="thread-1", created_at=value)
+
+    assert called is False

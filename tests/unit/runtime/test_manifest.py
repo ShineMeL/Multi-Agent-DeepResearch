@@ -292,6 +292,40 @@ def test_manifest_wall_time_uses_run_envelope_not_concurrent_sum(
     assert sum(item.wall_seconds for item in concurrent.usage_by_node.values()) == 1.1
 
 
+def test_manifest_allows_inactive_resume_gap_outside_active_wall(
+    pricing_snapshot: PricingSnapshot,
+) -> None:
+    base = _manifest(pricing_snapshot)
+    active_usage = base.usage.model_copy(update={"wall_seconds": 0.75})
+
+    resumed = RunManifest.create(
+        {
+            **base.model_dump(),
+            "usage": active_usage,
+            "manifest_sha256": "",
+        }
+    )
+
+    assert resumed.usage.wall_seconds == 0.75
+    assert (resumed.finished_at - resumed.started_at).total_seconds() == 1.0
+
+
+def test_manifest_rejects_active_wall_greater_than_calendar_envelope(
+    pricing_snapshot: PricingSnapshot,
+) -> None:
+    base = _manifest(pricing_snapshot)
+    impossible_usage = base.usage.model_copy(update={"wall_seconds": 1.01})
+
+    with pytest.raises(ValidationError, match="wall|envelope"):
+        RunManifest.create(
+            {
+                **base.model_dump(),
+                "usage": impossible_usage,
+                "manifest_sha256": "",
+            }
+        )
+
+
 def _search_call(
     started: datetime,
     *,
@@ -681,6 +715,27 @@ def test_one_protocol_invocation_retains_aggregate_provider_retries(
     manifest = _manifest_with_one_tool_execution(base, calls)
 
     assert manifest.usage.retries == 2
+
+
+def test_one_protocol_invocation_rejects_aggregate_retries_above_budget(
+    pricing_snapshot: PricingSnapshot,
+) -> None:
+    base = _manifest(pricing_snapshot)
+    calls = (
+        _search_call(
+            base.started_at,
+            request_sha256="a" * 64,
+            attempt=1,
+            offset_ms=10,
+            usage_retries=2,
+        ),
+    )
+    limited = base.model_copy(
+        update={"budget": base.budget.model_copy(update={"max_retries": 1})}
+    )
+
+    with pytest.raises(ValidationError, match="retry.*budget"):
+        _manifest_with_one_tool_execution(limited, calls)
 
 
 def test_retry_history_reconciles_multiple_retries_and_cache_outcomes(
