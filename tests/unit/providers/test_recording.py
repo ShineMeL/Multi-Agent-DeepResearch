@@ -161,6 +161,33 @@ class FakeSearch:
         return [SearchHit(url="https://example.com", title=query, snippet="hit", rank=1)][:limit]
 
 
+class MessageFailureSearch(FakeSearch):
+    def __init__(self, public_message: str) -> None:
+        super().__init__()
+        self.public_message = public_message
+
+    async def search(
+        self,
+        query: str,
+        limit: int,
+        filters: Mapping[str, JsonValue] | None,
+        *,
+        deadline: float,
+        cancellation_token: CancellationToken,
+    ) -> list[SearchHit]:
+        del query, limit, filters, deadline
+        cancellation_token.raise_if_cancelled()
+        self.calls += 1
+        raise ProviderError(
+            code="INVALID_RESPONSE",
+            provider=self.provider_id,
+            operation="search",
+            public_message=self.public_message,
+            retryable=False,
+            usage=_usage(),
+        )
+
+
 class FakeFetcher:
     provider_id = "record-fetch"
 
@@ -669,6 +696,133 @@ async def test_recording_fetch_retains_safe_response_metadata(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "secret_path",
+    (
+        "api_key=TOP-SECRET",
+        "api%5fkey%3dTOP-SECRET",
+        "AuTh%256FrIzAtIoN%253DTOP-SECRET",
+    ),
+)
+async def test_finalized_bundle_excludes_credential_assignment_in_url_path(
+    tmp_path: Path, secret_path: str
+) -> None:
+    final_root = tmp_path / f"path-assignment-{len(list(tmp_path.iterdir()))}"
+    writer = ReplayBundleWriter.create(final_root, run_id="path-assignment")
+    recorder = RecordingFetcher(
+        FakeFetcher(final_url=f"https://example.com/{secret_path}"), writer
+    )
+    caught: ValueError | None = None
+
+    try:
+        await recorder.fetch(
+            "https://example.com/start",
+            deadline=_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+    except ValueError as error:
+        caught = error
+    await writer.finalize()
+    finalized = (final_root / "documents.jsonl").read_bytes()
+
+    assert caught is not None
+    assert b"top-secret" not in finalized.lower()
+    assert finalized == b""
+
+
+@pytest.mark.asyncio
+async def test_finalized_bundle_allows_benign_security_words(
+    tmp_path: Path,
+) -> None:
+    final_root = tmp_path / "benign-security-words"
+    writer = ReplayBundleWriter.create(final_root, run_id="benign-security-words")
+    benign_url = (
+        "https://example.com/docs/token/usage"
+        "?topic=authorization#token-guidance"
+    )
+    benign_message = "Read /docs/token/usage?topic=authorization#token-guidance"
+
+    await RecordingFetcher(
+        FakeFetcher(
+            requested_url=benign_url,
+            final_url=benign_url,
+            headers={
+                "content-type": "text/plain",
+                "etag": 'W/"authorization-guide"',
+            },
+        ),
+        writer,
+    ).fetch(
+        benign_url,
+        deadline=_deadline(),
+        cancellation_token=CancellationToken(),
+    )
+    with pytest.raises(ProviderError):
+        await RecordingSearchProvider(
+            MessageFailureSearch(benign_message), writer
+        ).search(
+            "benign-message",
+            1,
+            None,
+            deadline=_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+    await writer.finalize()
+
+    document_bytes = (final_root / "documents.jsonl").read_bytes()
+    search_bytes = (final_root / "search.jsonl").read_bytes()
+    search_record = json.loads(search_bytes)
+    assert benign_url.encode() in document_bytes
+    assert b"authorization-guide" in document_bytes
+    assert search_record["outcome"]["public_message"] == benign_message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "public_message",
+    (
+        "upstream rejected sk-proj-ABC123 at https://user:PASS@example.com",
+        "upstream rejected api%255fkey%253DTOP-SECRET",
+    ),
+)
+async def test_finalized_failure_redacts_encoded_opaque_and_userinfo_credentials(
+    tmp_path: Path, public_message: str
+) -> None:
+    final_root = tmp_path / f"credential-message-{len(list(tmp_path.iterdir()))}"
+    writer = ReplayBundleWriter.create(final_root, run_id="credential-message")
+    recorder = RecordingSearchProvider(MessageFailureSearch(public_message), writer)
+
+    with pytest.raises(ProviderError):
+        await recorder.search(
+            "credential-message",
+            1,
+            None,
+            deadline=_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+    await writer.finalize()
+    finalized = (final_root / "search.jsonl").read_bytes()
+    record = json.loads(finalized)
+
+    assert b"top-secret" not in finalized.lower()
+    assert b"sk-proj-abc123" not in finalized.lower()
+    assert b"user:pass" not in finalized.lower()
+    assert record["outcome"]["public_message"] == "[REDACTED]"
+
+    replay = ReplaySearchProvider(ReplayBundle.load(final_root))
+    with pytest.raises(ProviderError) as replay_error:
+        await replay.search(
+            "credential-message",
+            1,
+            None,
+            deadline=_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+    assert replay_error.value.__cause__ is None
+    assert replay_error.value.__context__ is None
+
+
+@pytest.mark.asyncio
 async def test_create_marker_failure_removes_exact_staging_and_allows_same_run_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -757,6 +911,99 @@ async def test_cleanup_root_rmdir_failure_keeps_owned_tombstone_and_frees_stagin
     await writer.abort()
     await writer.abort()
     assert not tombstones[0].exists()
+
+
+async def _leave_owned_tombstone_without_marker(
+    final_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[ReplayBundleWriter, Path]:
+    writer = ReplayBundleWriter.create(final_root, run_id="same-run")
+    original_write = recording_module._write_fsynced
+    original_rmdir = Path.rmdir
+    root_failed = False
+
+    def fail_record_and_marker_restore(path: Path, payload: bytes) -> None:
+        if path.name.endswith(".jsonl"):
+            raise OSError("synthetic primary failure")
+        if path.name == ".replay-writer-owner.json" and ".cleanup." in path.parent.name:
+            raise OSError("synthetic marker restoration failure")
+        original_write(path, payload)
+
+    def fail_cleanup_root(path: Path) -> None:
+        nonlocal root_failed
+        if ".cleanup." in path.name and not root_failed:
+            root_failed = True
+            raise OSError("synthetic cleanup root failure")
+        original_rmdir(path)
+
+    monkeypatch.setattr(
+        recording_module, "_write_fsynced", fail_record_and_marker_restore
+    )
+    monkeypatch.setattr(Path, "rmdir", fail_cleanup_root)
+    with pytest.raises(OSError, match="cleanup"):
+        await writer.finalize()
+
+    tombstones = list(final_root.parent.glob(f".{final_root.name}.cleanup.*"))
+    assert len(tombstones) == 1
+    assert not (tombstones[0] / ".replay-writer-owner.json").exists()
+    return writer, tombstones[0]
+
+
+@pytest.mark.asyncio
+async def test_abort_repairs_owned_missing_tombstone_marker_and_retries_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final_root = tmp_path / "missing-cleanup-marker"
+    writer, tombstone = await _leave_owned_tombstone_without_marker(
+        final_root, monkeypatch
+    )
+
+    replacement = ReplayBundleWriter.create(final_root, run_id="same-run")
+    await replacement.abort()
+    monkeypatch.undo()
+    await writer.abort()
+    await writer.abort()
+
+    assert not tombstone.exists()
+    second_replacement = ReplayBundleWriter.create(final_root, run_id="same-run")
+    await second_replacement.abort()
+
+
+@pytest.mark.asyncio
+async def test_abort_never_repairs_or_deletes_substituted_cleanup_tombstone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final_root = tmp_path / "substituted-cleanup-marker"
+    writer, tombstone = await _leave_owned_tombstone_without_marker(
+        final_root, monkeypatch
+    )
+    monkeypatch.undo()
+    tombstone.rmdir()
+    tombstone.mkdir()
+    sentinel = tombstone / "sentinel.txt"
+    sentinel.write_text("not-owned", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="substitut|owned"):
+        await writer.abort()
+
+    assert sentinel.read_text(encoding="utf-8") == "not-owned"
+
+
+@pytest.mark.asyncio
+async def test_abort_never_overwrites_partial_cleanup_tombstone_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final_root = tmp_path / "partial-cleanup-marker"
+    writer, tombstone = await _leave_owned_tombstone_without_marker(
+        final_root, monkeypatch
+    )
+    monkeypatch.undo()
+    marker = tombstone / ".replay-writer-owner.json"
+    marker.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="marker|owned"):
+        await writer.abort()
+
+    assert marker.read_text(encoding="utf-8") == "{}"
 
 
 @pytest.mark.asyncio

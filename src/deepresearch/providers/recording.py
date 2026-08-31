@@ -10,6 +10,7 @@ import stat
 import sys
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from itertools import pairwise
 from math import isfinite
 from pathlib import Path
 from typing import Any, TypeVar, cast
@@ -72,13 +73,20 @@ _SAFE_FETCH_HEADERS = frozenset(
     }
 )
 _INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
-_CREDENTIAL_WORD = re.compile(
-    r"(?i)(?:^|[^a-z0-9])"
-    r"(?:api[_ .-]?key|access[_ .-]?key|authorization|auth|bearer|cookie|"
+_CREDENTIAL_NAME_PATTERN = (
+    r"api[_ .-]?key|access[_ .-]?key|authorization|auth|bearer|cookie|"
     r"credential|password|passwd|secret|private[_ .-]?key|"
-    r"session(?:[_ .-]?(?:id|token))?|access[_ .-]?token|token|key)"
-    r"(?:$|[^a-z0-9])"
+    r"session(?:[_ .-]?(?:id|token))?|access[_ .-]?token|token|key"
 )
+_CREDENTIAL_ASSIGNMENT = re.compile(
+    rf"(?i)(?<![a-z0-9])(?:{_CREDENTIAL_NAME_PATTERN})(?![a-z0-9])"
+    r"\s*(?:=|:)\s*[^\s&,;/#]+"
+)
+_BEARER_VALUE = re.compile(r"(?i)(?<![a-z0-9])bearer\s+[^\s,;/#]+")
+_EMBEDDED_USERINFO = re.compile(
+    r"(?i)\bhttps?://[^\s/:@]+(?::[^\s/@]+)?@"
+)
+_EMBEDDED_URL = re.compile(r"(?i)\bhttps?://[^\s<>'\"]+")
 _OPAQUE_CREDENTIAL = re.compile(
     r"(?i)(?:^|[^a-z0-9])(?:"
     r"sk[-_](?:(?:proj|live|test)[-_])?[a-z0-9_-]{6,}|"
@@ -106,6 +114,13 @@ _SECRET_PATH_NAMES = frozenset(
         "token",
     }
 )
+_STRONG_PATH_PAIR_NAMES = _SECRET_PATH_NAMES - {
+    "authorization",
+    "bearer",
+    "cookie",
+    "credential",
+    "token",
+}
 _RECORD_FILENAME: dict[ReplayOperation, str] = {
     "model.complete": "model_responses.jsonl",
     "model.structured": "model_responses.jsonl",
@@ -300,17 +315,6 @@ def _atomic_move_owned_staging(source: Path, destination: Path) -> None:
     _atomic_rename_noreplace_impl(source, destination)
 
 
-def _redact_public_message(message: str) -> str:
-    redacted = re.sub(r"(?i)\bbearer\s+[^\s,;]+", "Bearer [REDACTED]", message)
-    redacted = re.sub(
-        r"(?i)\b(api[_-]?key|authorization|cookie|password|secret|access[_-]?token)"
-        r"\s*[:=]\s*[^\s,;]+",
-        lambda match: f"{match.group(1)}=[REDACTED]",
-        redacted,
-    )
-    return redacted
-
-
 def _bounded_unquote(value: str) -> str:
     current = value
     for _ in range(6):
@@ -326,23 +330,34 @@ def _bounded_unquote(value: str) -> str:
 def _contains_credential_shape(value: str) -> bool:
     decoded = _bounded_unquote(value).casefold()
     return (
-        _CREDENTIAL_WORD.search(decoded) is not None
+        _CREDENTIAL_ASSIGNMENT.search(decoded) is not None
+        or _BEARER_VALUE.search(decoded) is not None
+        or _EMBEDDED_USERINFO.search(decoded) is not None
         or _OPAQUE_CREDENTIAL.search(decoded) is not None
     )
 
 
 def _url_metadata_is_safe(url: str) -> bool:
-    decoded_url = _bounded_unquote(url)
-    split = urlsplit(decoded_url)
+    split = urlsplit(url)
     if split.username is not None or split.password is not None:
         return False
-    if _contains_credential_shape(split.query) or _contains_credential_shape(
-        split.fragment
+    decoded_path = _bounded_unquote(split.path)
+    decoded_query = _bounded_unquote(split.query)
+    decoded_fragment = _bounded_unquote(split.fragment)
+    if _contains_credential_shape(decoded_query) or _contains_credential_shape(
+        decoded_fragment
     ):
         return False
-    for segment in split.path.split("/"):
+    segments = decoded_path.split("/")
+    for segment in segments:
+        if _contains_credential_shape(segment):
+            return False
         compact = re.sub(r"[^a-z0-9]", "", segment.casefold())
-        if compact in _SECRET_PATH_NAMES or _OPAQUE_CREDENTIAL.search(segment):
+        if _OPAQUE_CREDENTIAL.search(segment):
+            return False
+    for name, value in pairwise(segments):
+        compact = re.sub(r"[^a-z0-9]", "", name.casefold())
+        if compact in _STRONG_PATH_PAIR_NAMES and value.strip():
             return False
     canonical_url = canonicalize_url(url)
     FetchCacheKey.model_validate(
@@ -354,6 +369,19 @@ def _url_metadata_is_safe(url: str) -> bool:
         }
     )
     return True
+
+
+def _redact_public_message(message: str) -> str:
+    try:
+        if _contains_credential_shape(message):
+            return "[REDACTED]"
+        for match in _EMBEDDED_URL.finditer(_bounded_unquote(message)):
+            candidate = match.group().rstrip(".,;)")
+            if not _url_metadata_is_safe(candidate):
+                return "[REDACTED]"
+    except (TypeError, UnicodeError, ValueError):
+        return "[REDACTED]"
+    return message
 
 
 def _fetch_metadata_is_safe(
@@ -673,6 +701,7 @@ class ReplayBundleWriter:
                 self._release_lock()
 
     def _remove_owned_staging(self) -> None:
+        self._repair_missing_cleanup_marker()
         staging = self._validate_owned_staging()
         if self._cleanup_tombstone is None:
             device, inode = self._staging_identity
@@ -712,6 +741,50 @@ class ReplayBundleWriter:
             raise
         self._staging_root = None
         _fsync_directory(staging.parent)
+
+    def _repair_missing_cleanup_marker(self) -> None:
+        staging = self._staging_root
+        tombstone = self._cleanup_tombstone
+        if staging is None or tombstone is None:
+            return
+        marker_path = staging / self._MARKER_NAME
+        if marker_path.exists():
+            return
+        parent = self._final_root.parent.resolve(strict=True)
+        device, inode = self._staging_identity
+        expected_tombstone = parent / (
+            f".{self._final_root.name}.cleanup.{self._run_id}."
+            f"{device:x}.{inode:x}"
+        )
+        if staging != tombstone or staging != expected_tombstone:
+            raise ValueError("replay cleanup tombstone path does not match ownership")
+        if _is_link_or_reparse(staging):
+            raise ValueError("replay cleanup tombstone is unsafe")
+        if staging.resolve(strict=True).parent != parent:
+            raise ValueError("replay cleanup tombstone is not an owned sibling")
+        if _path_identity(staging) != self._staging_identity:
+            raise ValueError("replay cleanup tombstone object was substituted")
+        if tuple(staging.iterdir()):
+            raise ValueError("replay cleanup tombstone contains unowned contents")
+        if (
+            _is_link_or_reparse(staging)
+            or staging.resolve(strict=True) != expected_tombstone
+            or _path_identity(staging) != self._staging_identity
+            or _is_link_or_reparse(marker_path)
+        ):
+            raise ValueError("replay cleanup tombstone changed during ownership check")
+        _write_fsynced(
+            marker_path, canonical_json_bytes(self._expected_marker())
+        )
+        if (
+            _is_link_or_reparse(staging)
+            or staging.resolve(strict=True) != expected_tombstone
+            or _path_identity(staging) != self._staging_identity
+            or _is_link_or_reparse(marker_path)
+        ):
+            raise ValueError("replay cleanup tombstone changed during marker repair")
+        _fsync_directory(staging)
+        _fsync_directory(parent)
 
     def _validate_owned_staging(self) -> Path:
         staging = self._staging_root

@@ -692,8 +692,12 @@ class RunManifest(_ManifestModel):
         if self.model_ids != expected_models:
             raise ValueError("model_ids must equal model call model IDs in first-use order")
         containing_executions = self._validate_execution_history()
-        self._validate_contiguous_attempts(containing_executions)
-        self._validate_usage_reconciliation(containing_executions)
+        retries_by_execution = self._validate_contiguous_attempts(
+            containing_executions
+        )
+        self._validate_usage_reconciliation(
+            containing_executions, retries_by_execution
+        )
         self._validate_pricing()
         self._validate_budget_limits()
         parsed_ids = {record.artifact_id for record in self.parsed_artifacts}
@@ -792,7 +796,7 @@ class RunManifest(_ManifestModel):
 
     def _validate_contiguous_attempts(
         self, containing_executions: tuple[int, ...]
-    ) -> None:
+    ) -> tuple[int, ...]:
         call_groups: defaultdict[
             tuple[int, bytes], list[ProviderCallRecord]
         ] = defaultdict(list)
@@ -802,7 +806,8 @@ class RunManifest(_ManifestModel):
             call_groups[
                 (execution_index, self._provider_call_identity(call))
             ].append(call)
-        for calls in call_groups.values():
+        retries_by_execution = [0] * len(self.node_executions)
+        for (execution_index, _), calls in call_groups.items():
             previous: ProviderCallRecord | None = None
             expected_attempt = 1
             for call in calls:
@@ -818,7 +823,14 @@ class RunManifest(_ManifestModel):
                     raise ValueError(
                         "provider invocation attempts must start at one and be contiguous"
                     )
+                derived_retry = int(call.attempt > 1)
+                if call.usage.retries != derived_retry:
+                    raise ValueError(
+                        "provider call retry usage does not match invocation history"
+                    )
+                retries_by_execution[execution_index] += derived_retry
                 previous = call
+        return tuple(retries_by_execution)
 
     @staticmethod
     def _aggregate_usage(
@@ -850,12 +862,14 @@ class RunManifest(_ManifestModel):
         return charged.quantize(CostCalculator.QUANTUM, rounding=ROUND_HALF_EVEN)
 
     def _validate_usage_reconciliation(
-        self, containing_executions: tuple[int, ...]
+        self,
+        containing_executions: tuple[int, ...],
+        retries_by_execution: tuple[int, ...],
     ) -> None:
         """Reconcile calls into executions, nodes, then the run without summing wall time."""
         additive = (
             "input_tokens", "output_tokens", "reasoning_tokens", "cached_tokens",
-            "total_tokens", "search_calls", "pages", "retries",
+            "total_tokens", "search_calls", "pages",
         )
         calls_by_execution: defaultdict[int, list[ProviderCallRecord]] = defaultdict(list)
         for execution_index, call in zip(
@@ -867,6 +881,11 @@ class RunManifest(_ManifestModel):
             for field in additive:
                 if sum(getattr(call.usage, field) for call in calls) > getattr(execution.usage, field):
                     raise ValueError("provider call usage exceeds its node execution usage")
+        for index, execution in enumerate(self.node_executions):
+            if execution.usage.retries != retries_by_execution[index]:
+                raise ValueError(
+                    "node execution retry usage does not match invocation history"
+                )
 
         executions_by_node: defaultdict[str, list[NodeExecutionRecord]] = defaultdict(list)
         for execution in self.node_executions:

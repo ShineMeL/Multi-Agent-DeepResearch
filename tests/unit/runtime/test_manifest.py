@@ -298,9 +298,14 @@ def _search_call(
     request_sha256: str,
     attempt: int = 1,
     offset_ms: int = 10,
+    usage_retries: int | None = None,
 ) -> ProviderCallRecord:
     usage = ResourceUsage.zero().model_copy(
-        update={"search_calls": 1, "wall_seconds": 0.01}
+        update={
+            "search_calls": 1,
+            "retries": int(attempt > 1) if usage_retries is None else usage_retries,
+            "wall_seconds": 0.01,
+        }
     )
     call_started = started + timedelta(milliseconds=offset_ms)
     return ProviderCallRecord(
@@ -432,7 +437,7 @@ def test_provider_attempts_are_per_request_and_link_by_containing_execution(
         ),
     )
     tool_observed = ResourceUsage.zero().model_copy(
-        update={"search_calls": 4, "pages": 2, "wall_seconds": 0.1}
+        update={"search_calls": 4, "pages": 2, "retries": 1, "wall_seconds": 0.1}
     )
     tool_attributed = tool_observed.model_copy(update={"cost_usd": Decimal(0)})
     tool_execution = NodeExecutionRecord(
@@ -442,7 +447,7 @@ def test_provider_attempts_are_per_request_and_link_by_containing_execution(
         usage=tool_observed,
     )
     run_usage = base.usage.model_copy(
-        update={"search_calls": 4, "pages": 2, "wall_seconds": 1.0}
+        update={"search_calls": 4, "pages": 2, "retries": 1, "wall_seconds": 1.0}
     )
 
     manifest = RunManifest.create(
@@ -466,10 +471,12 @@ def _manifest_with_tool_history(
 ) -> RunManifest:
     search_calls = sum(item.usage.search_calls for item in executions)
     pages = sum(item.usage.pages for item in executions)
+    retries = sum(item.usage.retries for item in executions)
     tool_usage = ResourceUsage.zero(cost_known=True).model_copy(
         update={
             "search_calls": search_calls,
             "pages": pages,
+            "retries": retries,
             "wall_seconds": max(item.usage.wall_seconds for item in executions),
         }
     )
@@ -477,6 +484,7 @@ def _manifest_with_tool_history(
         update={
             "search_calls": search_calls,
             "pages": pages,
+            "retries": retries,
             "wall_seconds": 1.0,
         }
     )
@@ -487,6 +495,7 @@ def _manifest_with_tool_history(
             "node_executions": (*base.node_executions, *executions),
             "usage_by_node": {**base.usage_by_node, "Tool": tool_usage},
             "usage": run_usage,
+            "cache_hit_count": base.cache_hit_count + sum(call.cache_hit for call in calls),
         }
     )
 
@@ -498,6 +507,7 @@ def _tool_execution(
     start_ms: int,
     finish_ms: int,
     search_calls: int = 1,
+    retries: int = 0,
 ) -> NodeExecutionRecord:
     return NodeExecutionRecord(
         node="Tool",
@@ -509,7 +519,11 @@ def _tool_execution(
         input_artifact_ids=(),
         output_artifact_ids=(),
         usage=ResourceUsage.zero().model_copy(
-            update={"search_calls": search_calls, "wall_seconds": 0.05}
+            update={
+                "search_calls": search_calls,
+                "retries": retries,
+                "wall_seconds": 0.05,
+            }
         ),
     )
 
@@ -564,6 +578,7 @@ def _manifest_with_one_tool_execution(
         start_ms=0,
         finish_ms=100,
         search_calls=len(calls),
+        retries=sum(call.usage.retries for call in calls),
     )
     return _manifest_with_tool_history(
         base, calls=calls, executions=(execution,)
@@ -617,6 +632,140 @@ def test_identical_fresh_provider_invocations_can_each_start_at_attempt_one(
     manifest = _manifest_with_one_tool_execution(base, calls)
 
     assert [call.attempt for call in manifest.provider_calls[-2:]] == [1, 1]
+    assert manifest.usage.retries == 0
+
+
+def test_retry_history_rejects_hidden_retry_under_zero_budget(
+    pricing_snapshot: PricingSnapshot,
+) -> None:
+    base = _manifest(pricing_snapshot)
+    calls = (
+        _search_call(
+            base.started_at,
+            request_sha256="a" * 64,
+            attempt=1,
+            offset_ms=10,
+            usage_retries=0,
+        ),
+        _search_call(
+            base.started_at,
+            request_sha256="a" * 64,
+            attempt=2,
+            offset_ms=30,
+            usage_retries=0,
+        ),
+    )
+    zero_retry_budget = base.budget.model_copy(update={"max_retries": 0})
+
+    with pytest.raises(ValidationError, match="retry"):
+        _manifest_with_one_tool_execution(
+            base.model_copy(update={"budget": zero_retry_budget}), calls
+        )
+
+
+def test_retry_history_rejects_provider_call_double_count(
+    pricing_snapshot: PricingSnapshot,
+) -> None:
+    base = _manifest(pricing_snapshot)
+    calls = (
+        _search_call(
+            base.started_at,
+            request_sha256="a" * 64,
+            attempt=1,
+            offset_ms=10,
+            usage_retries=1,
+        ),
+    )
+
+    with pytest.raises(ValidationError, match="retry"):
+        _manifest_with_one_tool_execution(base, calls)
+
+
+def test_retry_history_reconciles_multiple_retries_and_cache_outcomes(
+    pricing_snapshot: PricingSnapshot,
+) -> None:
+    base = _manifest(pricing_snapshot)
+    calls = (
+        _search_call(
+            base.started_at,
+            request_sha256="a" * 64,
+            attempt=1,
+            offset_ms=10,
+        ).model_copy(update={"outcome_code": "NETWORK"}),
+        _search_call(
+            base.started_at,
+            request_sha256="a" * 64,
+            attempt=2,
+            offset_ms=30,
+        ).model_copy(update={"outcome_code": "RATE_LIMITED"}),
+        _search_call(
+            base.started_at,
+            request_sha256="a" * 64,
+            attempt=3,
+            offset_ms=50,
+        ).model_copy(update={"cache_hit": True}),
+    )
+    execution = _tool_execution(
+        base.started_at,
+        attempt=1,
+        start_ms=0,
+        finish_ms=100,
+        search_calls=3,
+        retries=2,
+    )
+
+    manifest = _manifest_with_tool_history(
+        base,
+        calls=calls,
+        executions=(execution,),
+    )
+
+    assert manifest.usage.retries == 2
+
+
+def test_retry_history_is_revalidated_on_manifest_copy(
+    pricing_snapshot: PricingSnapshot,
+) -> None:
+    base = _manifest(pricing_snapshot)
+    calls = (
+        _search_call(
+            base.started_at,
+            request_sha256="a" * 64,
+            attempt=1,
+            offset_ms=10,
+        ),
+        _search_call(
+            base.started_at,
+            request_sha256="a" * 64,
+            attempt=2,
+            offset_ms=30,
+        ),
+    )
+    manifest = _manifest_with_one_tool_execution(base, calls)
+    hidden_calls = tuple(
+        call.model_copy(update={"usage": call.usage.model_copy(update={"retries": 0})})
+        for call in manifest.provider_calls
+    )
+    hidden_executions = tuple(
+        execution.model_copy(
+            update={"usage": execution.usage.model_copy(update={"retries": 0})}
+        )
+        for execution in manifest.node_executions
+    )
+    hidden_by_node = {
+        node: usage.model_copy(update={"retries": 0})
+        for node, usage in manifest.usage_by_node.items()
+    }
+
+    with pytest.raises(ValidationError, match="retry"):
+        manifest.model_copy(
+            update={
+                "provider_calls": hidden_calls,
+                "node_executions": hidden_executions,
+                "usage_by_node": hidden_by_node,
+                "usage": manifest.usage.model_copy(update={"retries": 0}),
+            }
+        )
 
 
 @pytest.mark.parametrize(
