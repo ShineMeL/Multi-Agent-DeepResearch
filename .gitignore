@@ -1,0 +1,8 @@
+.superpowers/
+.worktrees/
+.venv/
+.env
+artifacts/
+.cache/deepresearch/
+models/embedding/
+__pycache__/

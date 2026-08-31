@@ -1,0 +1,65 @@
+{
+  "files": [
+    {
+      "path": "1_Pooling/config.json",
+      "sha256": "4be450dde3b0273bb9787637cfbd28fe04a7ba6ab9d36ac48e92b11e350ffc23",
+      "size_bytes": 190
+    },
+    {
+      "path": "config.json",
+      "sha256": "6300193cb75e01cf80c96decef7187dfb33094d97cc1490b7ead6ff134476e4e",
+      "size_bytes": 645
+    },
+    {
+      "path": "config_sentence_transformers.json",
+      "sha256": "b8c64b5cece00d8424b4896ea75b512b6008576088497609dfeb6bd63e6d36b8",
+      "size_bytes": 122
+    },
+    {
+      "path": "modules.json",
+      "sha256": "8f4b264b80206c830bebbdcae377e137925650a433b689343a63bdc9b3145460",
+      "size_bytes": 229
+    },
+    {
+      "path": "pytorch_model.bin",
+      "sha256": "16cc9e54df6e083272378abec2d75dc34d7a48b5276db3ccc050d18de672ac59",
+      "size_bytes": 470693617
+    },
+    {
+      "path": "sentence_bert_config.json",
+      "sha256": "70f4448f31320443fe3557cacea5abf2dcc4915dda8c80646bec9f3bb0aa5a1f",
+      "size_bytes": 53
+    },
+    {
+      "path": "sentencepiece.bpe.model",
+      "sha256": "cfc8146abe2a0488e9e2a0c56de7952f7c11ab059eca145a0a727afce0db2865",
+      "size_bytes": 5069051
+    },
+    {
+      "path": "special_tokens_map.json",
+      "sha256": "378eb3bf733eb16e65792d7e3fda5b8a4631387ca04d2015199c4d4f22ae554d",
+      "size_bytes": 239
+    },
+    {
+      "path": "tokenizer.json",
+      "sha256": "2c3387be76557bd40970cec13153b3bbf80407865484b209e655e5e4729076b8",
+      "size_bytes": 9081518
+    },
+    {
+      "path": "tokenizer_config.json",
+      "sha256": "cac868512d555e9ac37a33c28300d36931ae4b5ddff43f1ca9bdacfe6fcd9dc8",
+      "size_bytes": 480
+    },
+    {
+      "path": "unigram.json",
+      "sha256": "71b44701d7efd054205115acfa6ef126c5d2f84bd3affe0c59e48163674d19a6",
+      "size_bytes": 14763234
+    }
+  ],
+  "model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+  "normalize_embeddings": true,
+  "revision": "e62509716f15c5fd03a6fd3156a4bc5e43f83f26",
+  "schema_version": "embedding-model-lock-v1",
+  "snapshot_sha256": "98da8bb50bee1217f70975017bf79a025c8f619405e253d6896ad440eff5a605",
+  "vector_dimension": 384
+}
