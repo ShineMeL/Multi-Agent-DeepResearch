@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol
+from typing import Protocol, cast
 
 from deepresearch.domain import RunConfig, RunEvent, RunResult
 
@@ -17,11 +17,20 @@ class CheckpointRef:
     created_at: datetime
 
     def __post_init__(self) -> None:
-        if not self.checkpoint_id:
+        checkpoint_id = cast("object", self.checkpoint_id)
+        thread_id = cast("object", self.thread_id)
+        created_at = cast("object", self.created_at)
+        if type(checkpoint_id) is not str:
+            raise TypeError("checkpoint_id is invalid")
+        if not checkpoint_id:
             raise ValueError("checkpoint_id must not be empty")
-        if not self.thread_id:
+        if type(thread_id) is not str:
+            raise TypeError("thread_id is invalid")
+        if not thread_id:
             raise ValueError("thread_id must not be empty")
-        if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
+        if not isinstance(created_at, datetime):
+            raise TypeError("created_at is invalid")
+        if created_at.tzinfo is None or created_at.utcoffset() is None:
             raise ValueError("created_at must be timezone-aware")
 
 

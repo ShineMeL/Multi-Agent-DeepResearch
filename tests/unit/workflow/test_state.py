@@ -6,10 +6,17 @@ from typing import get_args, get_origin, get_type_hints
 
 import pytest
 
-from deepresearch.domain import FreshnessRequirement, ResearchRequest, RunConfig, RunEvent
+from deepresearch.domain import (
+    CoverageLedgerEntry,
+    FreshnessRequirement,
+    ResearchRequest,
+    RunConfig,
+    RunEvent,
+)
 from deepresearch.providers import ParsedDocument, RawDocument
 from deepresearch.runtime import (
     BudgetAccountant,
+    BudgetSnapshot,
     CancellationToken,
     CheckpointRef,
     ResearchRunner,
@@ -211,6 +218,7 @@ def test_state_validation_returns_fresh_tuple_preserving_copies() -> None:
         ("elapsed_wall_seconds", float("nan")),
         ("recent_marginal_gains", (float("inf"),)),
         ("pending_subquestion_ids", ["sq-1"]),
+        ("stop_reason", []),
     ),
 )
 def test_state_validation_rejects_invalid_restored_values(
@@ -232,3 +240,27 @@ def test_state_validation_rejects_extra_checkpoint_fields() -> None:
 
     with pytest.raises(StateValidationError):
         validate_baseline_state(candidate)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    (
+        ("request", ResearchRequest.model_construct(question="only field")),
+        (
+            "coverage_ledger",
+            (CoverageLedgerEntry.model_construct(subquestion_id="sq-1"),),
+        ),
+        ("budget_snapshot", BudgetSnapshot.model_construct(used_tokens=-1)),
+    ),
+)
+def test_state_validation_content_revalidates_constructed_models(
+    field: str,
+    invalid: object,
+) -> None:
+    candidate = dict(state())
+    candidate[field] = invalid
+
+    with pytest.raises(StateValidationError) as error:
+        validate_baseline_state(candidate)
+
+    assert error.value.code == "DATA_CORRUPTION"

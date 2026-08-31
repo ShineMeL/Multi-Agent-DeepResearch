@@ -4,6 +4,8 @@ import math
 from collections.abc import Mapping
 from typing import Literal, TypedDict, cast
 
+from pydantic import BaseModel
+
 from deepresearch.domain import CoverageLedgerEntry, ResearchRequest, StopReason
 from deepresearch.runtime import BudgetSnapshot
 
@@ -83,6 +85,16 @@ def _invalid() -> StateValidationError:
     return StateValidationError()
 
 
+def _revalidate_model[Model: BaseModel](value: object, model_type: type[Model]) -> Model:
+    if type(value) is not model_type:
+        raise _invalid()
+    model = cast("BaseModel", value)
+    try:
+        return model_type.model_validate(model.model_dump(round_trip=True))
+    except (AttributeError, TypeError, ValueError):
+        raise _invalid() from None
+
+
 def _validate_blocked_need(value: object) -> BaselineBlockedNeed:
     if not isinstance(value, Mapping):
         raise _invalid()
@@ -125,8 +137,7 @@ def validate_baseline_state(value: Mapping[str, object]) -> BaselineState:
         raise _invalid()
     if not isinstance(thread_id, str) or not thread_id:
         raise _invalid()
-    if not isinstance(request, ResearchRequest):
-        raise _invalid()
+    restored_request = _revalidate_model(request, ResearchRequest)
     if (
         not isinstance(config_sha256, str)
         or len(config_sha256) != 64
@@ -136,6 +147,7 @@ def validate_baseline_state(value: Mapping[str, object]) -> BaselineState:
         raise _invalid()
 
     copied = dict(value)
+    copied["request"] = restored_request
     for name in _STRING_TUPLES:
         item = value[name]
         if not isinstance(item, tuple):
@@ -153,9 +165,9 @@ def validate_baseline_state(value: Mapping[str, object]) -> BaselineState:
     if not isinstance(ledger, tuple):
         raise _invalid()
     ledger_items = cast("tuple[object, ...]", ledger)
-    if any(not isinstance(item, CoverageLedgerEntry) for item in ledger_items):
-        raise _invalid()
-    copied["coverage_ledger"] = tuple(ledger_items)
+    copied["coverage_ledger"] = tuple(
+        _revalidate_model(item, CoverageLedgerEntry) for item in ledger_items
+    )
 
     blocked = value["blocked_needs"]
     if not isinstance(blocked, tuple):
@@ -181,10 +193,13 @@ def validate_baseline_state(value: Mapping[str, object]) -> BaselineState:
         float(cast("int | float", item)) for item in gain_items
     )
 
-    if not isinstance(value["budget_snapshot"], BudgetSnapshot):
-        raise _invalid()
+    copied["budget_snapshot"] = _revalidate_model(
+        value["budget_snapshot"], BudgetSnapshot
+    )
     stop_reason = value["stop_reason"]
-    if stop_reason is not None and stop_reason not in _STOP_REASONS:
+    if stop_reason is not None and (
+        type(stop_reason) is not str or stop_reason not in _STOP_REASONS
+    ):
         raise _invalid()
     if type(value["is_partial"]) is not bool:
         raise _invalid()

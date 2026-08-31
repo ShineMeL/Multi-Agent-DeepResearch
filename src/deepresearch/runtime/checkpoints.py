@@ -67,8 +67,9 @@ def _validated_for_encoding(value: object, active: set[int]) -> object:
             raise CheckpointSerializationError()
         return value
     if type(value) in _ALLOWED_VALUE_TYPES:
-        return value
-    if isinstance(value, tuple):
+        model = cast("BaseModel", value)
+        return type(model).model_validate(model.model_dump(round_trip=True))
+    if type(value) is tuple:
         values = cast("tuple[object, ...]", value)
         identity = id(values)
         if identity in active:
@@ -116,7 +117,8 @@ def _validated_after_decoding(value: object, active: set[int]) -> object:
             raise CheckpointSerializationError()
         return value
     if type(value) in _ALLOWED_VALUE_TYPES:
-        return value
+        model = cast("BaseModel", value)
+        return type(model).model_validate(model.model_dump(round_trip=True))
     if type(value) is _TupleEnvelope:
         envelope = value
         if type(envelope.items) is not list:
@@ -165,6 +167,8 @@ class _StrictCheckpointSerializer(JsonPlusSerializer):
             return super().dumps_typed(prepared)
         except CheckpointSerializationError:
             raise
+        except MemoryError:
+            raise
         except Exception:  # noqa: BLE001 - public serializer boundary fails closed
             raise CheckpointSerializationError() from None
 
@@ -177,14 +181,13 @@ class _StrictCheckpointSerializer(JsonPlusSerializer):
             if label not in {"null", "bytes", "json", "msgpack"}:
                 raise CheckpointSerializationError()
             decoded = super().loads_typed((label, payload))
-            if label == "msgpack":
-                encoded_label, encoded_payload = JsonPlusSerializer.dumps_typed(
-                    self, decoded
-                )
-                if encoded_label != label or encoded_payload != payload:
-                    raise CheckpointSerializationError()
+            encoded_label, encoded_payload = JsonPlusSerializer.dumps_typed(self, decoded)
+            if encoded_label != label or encoded_payload != payload:
+                raise CheckpointSerializationError()
             return _validated_after_decoding(decoded, set())
         except CheckpointSerializationError:
+            raise
+        except MemoryError:
             raise
         except Exception:  # noqa: BLE001 - public serializer boundary fails closed
             raise CheckpointSerializationError() from None
