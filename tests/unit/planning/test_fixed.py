@@ -10,7 +10,13 @@ from typing import Any
 
 import pytest
 
-from deepresearch.domain import FreshnessRequirement, ResearchRequest, ResourceUsage, RunBudget
+from deepresearch.domain import (
+    FreshnessRequirement,
+    ResearchPlan,
+    ResearchRequest,
+    ResourceUsage,
+    RunBudget,
+)
 from deepresearch.planning import FixedPlanner, PlanGenerationError
 from deepresearch.providers import (
     ModelRequest,
@@ -73,6 +79,20 @@ def plan_json(*, plan_id: str = "plan-1") -> str:
     )
 
 
+def model_usage(total_tokens: int, *, cached_tokens: int = 0) -> ResourceUsage:
+    return ResourceUsage(
+        input_tokens=total_tokens,
+        output_tokens=0,
+        reasoning_tokens=0,
+        cached_tokens=cached_tokens,
+        total_tokens=total_tokens,
+        search_calls=0,
+        pages=0,
+        retries=0,
+        wall_seconds=0,
+    )
+
+
 class FakeModel:
     provider_id = "fake-provider"
 
@@ -82,10 +102,16 @@ class FakeModel:
         *,
         query_outputs: list[object] | None = None,
         on_complete: Callable[[], None] | None = None,
+        on_structured: Callable[[], None] | None = None,
+        complete_usages: list[ResourceUsage] | None = None,
+        query_usages: list[ResourceUsage] | None = None,
     ) -> None:
         self.complete_outputs = complete_outputs
         self.query_outputs = query_outputs or [["planner optimization"]]
         self.on_complete = on_complete
+        self.on_structured = on_structured
+        self.complete_usages = complete_usages or []
+        self.query_usages = query_usages or []
         self.complete_requests: list[ModelRequest] = []
         self.structured_requests: list[ModelRequest] = []
         self.complete_calls = 0
@@ -106,7 +132,11 @@ class FakeModel:
             self.on_complete()
         return ModelResult[str](
             output=output,
-            usage=ResourceUsage.zero(),
+            usage=(
+                self.complete_usages.pop(0)
+                if self.complete_usages
+                else ResourceUsage.zero()
+            ),
             provider_id=self.provider_id,
             model_id="fake-model",
             raw_response_artifact_id="sha256:" + "1" * 64,
@@ -127,10 +157,16 @@ class FakeModel:
         value = self.query_outputs.pop(0)
         if isinstance(value, Exception):
             raise value
+        if self.on_structured is not None:
+            self.on_structured()
         output = output_schema.model_validate({"queries": value})
         return StructuredModelResult[Any](
             output=output,
-            usage=ResourceUsage.zero(),
+            usage=(
+                self.query_usages.pop(0)
+                if self.query_usages
+                else ResourceUsage.zero()
+            ),
             provider_id=self.provider_id,
             model_id="fake-model",
             raw_response_artifact_id="sha256:" + "2" * 64,
@@ -168,6 +204,36 @@ class BlockingQueryModel(FakeModel):
             model_id="fake-model",
             raw_response_artifact_id="sha256:" + "2" * 64,
             output_schema_hash="3" * 64,
+        )
+
+
+class ConcurrentQueryModel(FakeModel):
+    def __init__(self, *, usage: ResourceUsage | None = None) -> None:
+        super().__init__([], query_outputs=[])
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.usage = usage or ResourceUsage.zero()
+
+    async def structured(
+        self,
+        request: ModelRequest,
+        output_schema: type[Any],
+        *,
+        deadline: float,
+        cancellation_token: CancellationToken,
+    ) -> StructuredModelResult[Any]:
+        del deadline, cancellation_token
+        self.structured_calls += 1
+        self.structured_requests.append(request)
+        self.started.set()
+        await self.release.wait()
+        return StructuredModelResult[Any](
+            output=output_schema.model_validate({"queries": ["concurrent"]}),
+            usage=self.usage,
+            provider_id=self.provider_id,
+            model_id="fake-model",
+            raw_response_artifact_id="sha256:" + "4" * 64,
+            output_schema_hash="5" * 64,
         )
 
 
@@ -800,3 +866,316 @@ async def test_non_utf8_boundary_output_is_rejected_before_prompt_publication(
     assert error.value.code == "INVALID_REQUEST"
     assert error.value.retryable is False
     assert model.complete_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_completed_initial_usage_prevents_over_budget_repair_call(
+    tmp_path: Path,
+) -> None:
+    model = FakeModel(
+        ["not json", plan_json()],
+        complete_usages=[model_usage(31_500), ResourceUsage.zero()],
+    )
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=LocalArtifactStore(tmp_path),
+        budget=RunBudget.preset("medium"),
+        content_boundary=lambda text: (
+            "x" * 30_000
+            if text == "Compare planner optimization methods."
+            else text
+        ),
+    )
+
+    with pytest.raises(ProviderError) as error:
+        await planner.create_plan(
+            research_request(),
+            deadline=future_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+
+    assert error.value.code == "INVALID_REQUEST"
+    assert model.complete_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_serial_query_usage_and_cache_are_accounted_locally(
+    tmp_path: Path,
+) -> None:
+    model = FakeModel(
+        [],
+        query_outputs=[["first"], ["must not run"]],
+        query_usages=[model_usage(3_500), ResourceUsage.zero()],
+    )
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=LocalArtifactStore(tmp_path),
+        budget=RunBudget.preset("medium").model_copy(
+            update={"max_total_tokens": 6_000}
+        ),
+    )
+    plan = ResearchPlan.model_validate_json(plan_json())
+
+    first = await planner.queries_for(
+        plan.subquestions[0],
+        plan_id="plan-a",
+        deadline=future_deadline(),
+        cancellation_token=CancellationToken(),
+    )
+    cached = await planner.queries_for(
+        plan.subquestions[0],
+        plan_id="plan-a",
+        deadline=future_deadline(),
+        cancellation_token=CancellationToken(),
+    )
+    with pytest.raises(ProviderError) as error:
+        await planner.queries_for(
+            plan.subquestions[0],
+            plan_id="plan-b",
+            deadline=future_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+
+    assert first == cached == ("first",)
+    assert error.value.code == "INVALID_REQUEST"
+    assert model.structured_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_parallel_query_keys_reserve_budget_atomically(tmp_path: Path) -> None:
+    model = ConcurrentQueryModel()
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=LocalArtifactStore(tmp_path),
+        budget=RunBudget.preset("medium").model_copy(
+            update={"max_total_tokens": 4_000}
+        ),
+    )
+    plan = ResearchPlan.model_validate_json(plan_json())
+    owner = asyncio.create_task(
+        planner.queries_for(
+            plan.subquestions[0],
+            plan_id="plan-a",
+            deadline=future_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+    )
+    await model.started.wait()
+
+    try:
+        with pytest.raises(ProviderError) as error:
+            await asyncio.wait_for(
+                planner.queries_for(
+                    plan.subquestions[0],
+                    plan_id="plan-b",
+                    deadline=future_deadline(),
+                    cancellation_token=CancellationToken(),
+                ),
+                timeout=0.2,
+            )
+        assert error.value.code == "INVALID_REQUEST"
+        assert owner.done() is False
+        assert model.structured_calls == 1
+    finally:
+        model.release.set()
+        assert await owner == ("concurrent",)
+
+
+@pytest.mark.asyncio
+async def test_usage_larger_than_reservation_is_fully_charged(tmp_path: Path) -> None:
+    model = FakeModel(
+        [],
+        query_outputs=[["first"], ["must not run"]],
+        query_usages=[model_usage(4_500), ResourceUsage.zero()],
+    )
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=LocalArtifactStore(tmp_path),
+        budget=RunBudget.preset("medium").model_copy(
+            update={"max_total_tokens": 4_000}
+        ),
+    )
+    plan = ResearchPlan.model_validate_json(plan_json())
+
+    assert await planner.queries_for(
+        plan.subquestions[0],
+        plan_id="plan-a",
+        deadline=future_deadline(),
+        cancellation_token=CancellationToken(),
+    ) == ("first",)
+    with pytest.raises(ProviderError):
+        await planner.queries_for(
+            plan.subquestions[0],
+            plan_id="plan-b",
+            deadline=future_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+
+    assert model.structured_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_usage_bearing_provider_error_is_charged_before_later_calls(
+    tmp_path: Path,
+) -> None:
+    failure = ProviderError(
+        code="NETWORK",
+        provider="fake-provider",
+        operation="structured",
+        public_message="sanitized failure",
+        retryable=True,
+        usage=model_usage(5_000),
+    )
+    model = FakeModel([], query_outputs=[failure, ["must not run"]])
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=LocalArtifactStore(tmp_path),
+        budget=RunBudget.preset("medium").model_copy(
+            update={"max_total_tokens": 6_000}
+        ),
+    )
+    plan = ResearchPlan.model_validate_json(plan_json())
+
+    with pytest.raises(ProviderError, match="sanitized failure"):
+        await planner.queries_for(
+            plan.subquestions[0],
+            plan_id="plan-a",
+            deadline=future_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+    with pytest.raises(ProviderError) as budget_error:
+        await planner.queries_for(
+            plan.subquestions[0],
+            plan_id="plan-b",
+            deadline=future_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+
+    assert budget_error.value.code == "INVALID_REQUEST"
+    assert model.structured_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_completed_cancelled_query_usage_remains_charged(tmp_path: Path) -> None:
+    token = CancellationToken()
+    model = FakeModel(
+        [],
+        query_outputs=[["cancelled"], ["must not run"]],
+        query_usages=[model_usage(5_000), ResourceUsage.zero()],
+        on_structured=token.cancel,
+    )
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=LocalArtifactStore(tmp_path),
+        budget=RunBudget.preset("medium").model_copy(
+            update={"max_total_tokens": 6_000}
+        ),
+    )
+    plan = ResearchPlan.model_validate_json(plan_json())
+
+    with pytest.raises(OperationCancelled):
+        await planner.queries_for(
+            plan.subquestions[0],
+            plan_id="plan-a",
+            deadline=future_deadline(),
+            cancellation_token=token,
+        )
+    with pytest.raises(ProviderError) as error:
+        await planner.queries_for(
+            plan.subquestions[0],
+            plan_id="plan-b",
+            deadline=future_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+
+    assert error.value.code == "INVALID_REQUEST"
+    assert model.structured_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_cached_tokens_are_not_debited_twice(tmp_path: Path) -> None:
+    model = FakeModel(
+        [],
+        query_outputs=[["first"], ["second"]],
+        query_usages=[
+            model_usage(3_000, cached_tokens=2_000),
+            ResourceUsage.zero(),
+        ],
+    )
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=LocalArtifactStore(tmp_path),
+        budget=RunBudget.preset("medium").model_copy(
+            update={"max_total_tokens": 6_500}
+        ),
+    )
+    plan = ResearchPlan.model_validate_json(plan_json())
+
+    first = await planner.queries_for(
+        plan.subquestions[0],
+        plan_id="plan-a",
+        deadline=future_deadline(),
+        cancellation_token=CancellationToken(),
+    )
+    second = await planner.queries_for(
+        plan.subquestions[0],
+        plan_id="plan-b",
+        deadline=future_deadline(),
+        cancellation_token=CancellationToken(),
+    )
+
+    assert first == ("first",)
+    assert second == ("second",)
+    assert model.structured_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_non_utf8_provider_output_is_sanitized_before_artifact_encoding(
+    tmp_path: Path,
+) -> None:
+    model = FakeModel(["\ud800"])
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=LocalArtifactStore(tmp_path),
+        budget=RunBudget.preset("medium"),
+    )
+
+    with pytest.raises(ProviderError) as error:
+        await planner.create_plan(
+            research_request(),
+            deadline=future_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+
+    assert error.value.code == "INVALID_RESPONSE"
+    assert error.value.retryable is False
+    assert "codec" not in error.value.public_message.casefold()
+    assert model.complete_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_unique_query_key_releases_its_gate(tmp_path: Path) -> None:
+    failure = ProviderError(
+        code="NETWORK",
+        provider="fake-provider",
+        operation="structured",
+        public_message="temporary failure",
+        retryable=True,
+    )
+    model = FakeModel([], query_outputs=[failure])
+    planner = FixedPlanner(
+        model=model,
+        artifact_store=LocalArtifactStore(tmp_path),
+        budget=RunBudget.preset("medium"),
+    )
+    plan = ResearchPlan.model_validate_json(plan_json())
+
+    with pytest.raises(ProviderError):
+        await planner.queries_for(
+            plan.subquestions[0],
+            plan_id="failed-key",
+            deadline=future_deadline(),
+            cancellation_token=CancellationToken(),
+        )
+
+    assert vars(planner)["_query_locks"] == {}

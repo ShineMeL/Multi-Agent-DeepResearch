@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from datetime import date
 
@@ -575,3 +576,98 @@ def test_plan_validator_rejects_non_utf8_scalar_without_leaking_encoder_error() 
 
     assert report.valid is False
     assert report.error_codes == ("INVALID_SCHEMA",)
+
+
+def test_plan_validator_never_reiterates_caller_containers_after_snapshot() -> None:
+    class SecondPassFaultList(list[object]):
+        passes = 0
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            self.passes += 1
+            if self.passes >= 2:
+                raise KeyError("candidate iterator changed")
+            return super().__iter__()
+
+    candidate = valid_candidate()
+    subquestions = SecondPassFaultList(candidate["subquestions"])  # type: ignore[arg-type]
+    candidate["subquestions"] = subquestions
+
+    report = PlanValidator().validate_candidate(candidate, request=None, budget=None)
+
+    assert report.valid is True
+    assert report.error_codes == ()
+    assert subquestions.passes == 1
+
+
+def test_plan_validator_second_pass_cannot_expand_past_snapshot_bounds() -> None:
+    class CountingList(list[object]):
+        iterations = 0
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            for item in super().__iter__():
+                self.iterations += 1
+                yield item
+
+    class ExpandingSecondPassList(list[object]):
+        passes = 0
+
+        def __init__(self, values: list[object], expansion: CountingList) -> None:
+            super().__init__(values)
+            self.expansion = expansion
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            self.passes += 1
+            if self.passes == 1:
+                return super().__iter__()
+            return iter(self.expansion)
+
+    expansion = CountingList([None] * 100_000)
+    candidate = valid_candidate()
+    subquestions = ExpandingSecondPassList(
+        candidate["subquestions"],  # type: ignore[arg-type]
+        expansion,
+    )
+    candidate["subquestions"] = subquestions
+
+    report = PlanValidator().validate_candidate(candidate, request=None, budget=None)
+
+    assert report.valid is True
+    assert subquestions.passes == 1
+    assert expansion.iterations == 0
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        OSError("synthetic OS fault"),
+        AssertionError("synthetic assertion fault"),
+        KeyboardInterrupt("synthetic interrupt"),
+        SystemExit("synthetic exit"),
+    ],
+    ids=("os-error", "assertion", "keyboard-interrupt", "system-exit"),
+)
+def test_plan_validator_propagates_system_and_programmer_faults(
+    fault: BaseException,
+) -> None:
+    class FaultList(list[object]):
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            raise fault
+
+    candidate = valid_candidate()
+    candidate["subquestions"] = FaultList(candidate["subquestions"])  # type: ignore[arg-type]
+
+    with pytest.raises(type(fault), match="synthetic"):
+        PlanValidator().validate_candidate(candidate, request=None, budget=None)
+
+
+def test_equivalent_str_and_bytes_candidates_share_the_utf8_byte_limit() -> None:
+    raw = json.dumps("界" * 350_000, ensure_ascii=False)
+    encoded = raw.encode("utf-8")
+
+    text_report = PlanValidator().validate_candidate(raw, request=None, budget=None)
+    bytes_report = PlanValidator().validate_candidate(
+        encoded, request=None, budget=None
+    )
+
+    assert len(raw) < 1_000_000 < len(encoded)
+    assert text_report.error_codes == bytes_report.error_codes == ("MALFORMED_JSON",)

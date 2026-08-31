@@ -23,7 +23,7 @@ _AMBIGUOUS_HTML_CITATION = re.compile(
     r"<\s*/?\s*[A-Za-z][^>\r\n]*\[E",
     re.IGNORECASE,
 )
-_MARKDOWN_SPECIAL = re.compile(r"([\\`*_{\[\]}<>#!|~])")
+_MARKDOWN_SPECIAL = re.compile(r"([&\\`*_{\[\]}<>#!|~])")
 _STOP_REASONS = frozenset({"SUFFICIENT", "PLATEAU", "BUDGET_EXHAUSTED", "BLOCKED"})
 _HIDDEN_HTML_TAGS = frozenset({"code", "pre", "script", "style"})
 _BIDI_CONTROLS = frozenset(
@@ -142,8 +142,10 @@ def _inline_views(children: Sequence[Token]) -> tuple[str, str]:
     eligible: list[str] = []
     link_depth = 0
     html = _HtmlVisibilityParser(collect_text=False)
+    raw_html_participated = False
     for child in children:
         if child.type == "html_inline":
+            raw_html_participated = True
             _feed_html(html, child.content)
             eligible.append(" ")
             continue
@@ -183,7 +185,7 @@ def _inline_views(children: Sequence[Token]) -> tuple[str, str]:
         raise MalformedEvidenceCitation(
             "report contains an ambiguous evidence citation"
         )
-    return "".join(visible), "".join(eligible)
+    return "".join(visible), ("" if raw_html_participated else "".join(eligible))
 
 
 def _html_block_visible(content: str) -> str:

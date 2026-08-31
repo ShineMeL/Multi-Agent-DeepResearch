@@ -74,81 +74,125 @@ def _strict_json(value: str) -> object:
     return json.loads(value, parse_constant=reject_constant)
 
 
-def _structure_is_bounded_json(value: object) -> bool:
-    stack: list[tuple[str, object, int, int | None]] = [
-        ("value", value, 0, None)
+def _attach_snapshot(
+    destination: object,
+    destination_key: object | None,
+    snapshot_value: JsonValue,
+) -> None:
+    if isinstance(destination, list):
+        cast("list[JsonValue]", destination).append(snapshot_value)
+    else:
+        cast("dict[str, JsonValue]", destination)[cast("str", destination_key)] = (
+            snapshot_value
+        )
+
+
+def _bounded_json_snapshot(value: object) -> tuple[bool, JsonValue | None]:
+    root: list[JsonValue] = []
+    stack: list[tuple[str, object, int, object, object | None]] = [
+        ("value", value, 0, root, None)
     ]
     active_containers: set[int] = set()
     node_count = 0
     string_chars = 0
     while stack:
-        kind, payload, depth, container_id = stack.pop()
+        kind, payload, depth, destination, destination_key = stack.pop()
         if kind in {"mapping", "sequence"}:
-            iterator = payload
+            iterator, source, snapshot, container_id = cast(
+                "tuple[Iterator[object], object, JsonValue, int]", payload
+            )
             try:
                 if kind == "mapping":
-                    key_iterator, mapping = cast(
-                        "tuple[Iterator[object], Mapping[object, object]]",
-                        iterator,
-                    )
-                    key = next(key_iterator)
+                    key = next(iterator)
                     if not isinstance(key, str):
-                        return False
+                        return False, None
                     string_chars += len(key)
                     if string_chars > _MAX_JSON_STRING_CHARS:
-                        return False
+                        return False, None
                     try:
                         key.encode("utf-8")
                     except UnicodeEncodeError:
-                        return False
-                    child = mapping[key]
+                        return False, None
+                    snapshot_mapping = cast("dict[str, JsonValue]", snapshot)
+                    if key in snapshot_mapping:
+                        return False, None
+                    child = cast("Mapping[object, object]", source)[key]
+                    child_destination: object = snapshot_mapping
+                    child_key: object | None = key
                 else:
-                    child = next(cast("Iterator[object]", iterator))
+                    child = next(iterator)
+                    child_destination = snapshot
+                    child_key = None
             except StopIteration:
-                assert container_id is not None
                 active_containers.remove(container_id)
                 continue
-            stack.append((kind, iterator, depth, container_id))
-            stack.append(("value", child, depth + 1, None))
+            stack.append((kind, payload, depth, destination, destination_key))
+            stack.append(
+                ("value", child, depth + 1, child_destination, child_key)
+            )
             continue
 
         item = payload
         node_count += 1
         if node_count > _MAX_JSON_NODES or depth > _MAX_JSON_DEPTH:
-            return False
+            return False, None
+
         if isinstance(item, str):
             string_chars += len(item)
             if string_chars > _MAX_JSON_STRING_CHARS:
-                return False
+                return False, None
             try:
                 item.encode("utf-8")
             except UnicodeEncodeError:
-                return False
+                return False, None
+            _attach_snapshot(destination, destination_key, item)
             continue
         if item is None or isinstance(item, (bool, int)):
+            _attach_snapshot(destination, destination_key, item)
             continue
         if isinstance(item, float):
             if not math.isfinite(item):
-                return False
+                return False, None
+            _attach_snapshot(destination, destination_key, item)
             continue
         if isinstance(item, Mapping):
             mapping = cast("Mapping[object, object]", item)
             identity = id(mapping)
             if identity in active_containers:
-                return False
+                return False, None
             active_containers.add(identity)
-            stack.append(("mapping", (iter(mapping), mapping), depth, identity))
+            snapshot_mapping: dict[str, JsonValue] = {}
+            _attach_snapshot(destination, destination_key, snapshot_mapping)
+            stack.append(
+                (
+                    "mapping",
+                    (iter(mapping), mapping, snapshot_mapping, identity),
+                    depth,
+                    destination,
+                    destination_key,
+                )
+            )
             continue
         if isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray)):
             sequence = cast("Sequence[object]", item)
             identity = id(sequence)
             if identity in active_containers:
-                return False
+                return False, None
             active_containers.add(identity)
-            stack.append(("sequence", iter(sequence), depth, identity))
+            snapshot_sequence: list[JsonValue] = []
+            _attach_snapshot(destination, destination_key, snapshot_sequence)
+            stack.append(
+                (
+                    "sequence",
+                    (iter(sequence), sequence, snapshot_sequence, identity),
+                    depth,
+                    destination,
+                    destination_key,
+                )
+            )
             continue
-        return False
-    return True
+        return False, None
+    return (len(root) == 1), (root[0] if len(root) == 1 else None)
 
 
 def _mapping(value: object) -> Mapping[str, object] | None:
@@ -509,7 +553,16 @@ class PlanValidator:
                     candidate_artifact_id=candidate_artifact_id,
                 )
         elif isinstance(candidate, str):
-            if len(candidate) > _MAX_CANDIDATE_BYTES:
+            try:
+                encoded_candidate = candidate.encode("utf-8")
+            except UnicodeEncodeError:
+                codes.add("MALFORMED_JSON")
+                return PlanValidationReport(
+                    valid=False,
+                    error_codes=_ordered(codes),
+                    candidate_artifact_id=candidate_artifact_id,
+                )
+            if len(encoded_candidate) > _MAX_CANDIDATE_BYTES:
                 codes.add("MALFORMED_JSON")
                 return PlanValidationReport(
                     valid=False,
@@ -528,8 +581,9 @@ class PlanValidator:
         else:
             raw = candidate
 
+        snapshot: JsonValue | None = None
         try:
-            structure_is_valid = _structure_is_bounded_json(raw)
+            structure_is_valid, snapshot = _bounded_json_snapshot(raw)
         except (LookupError, OverflowError, RecursionError, TypeError, ValueError):
             structure_is_valid = False
         if not structure_is_valid:
@@ -540,7 +594,7 @@ class PlanValidator:
                 candidate_artifact_id=candidate_artifact_id,
             )
 
-        raw_mapping = _mapping(raw)
+        raw_mapping = _mapping(snapshot)
         if raw_mapping is None:
             codes.add("INVALID_SCHEMA")
             return PlanValidationReport(

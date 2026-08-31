@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from markdown_it import MarkdownIt
 
 from deepresearch.domain import EvidenceSpan, HtmlLocator, SourceDocument
 from deepresearch.providers import ParsedBlock, ParsedDocument
@@ -407,13 +408,12 @@ def test_html_attributes_and_hidden_bodies_are_ignored_but_visible_html_text_is_
             selected_evidence_ids=("E-known",),
         )
 
-    report = writer.finalize_report(
-        '<span data-note="[E-other]">Visible claim</span> [E-known]. '
-        '<script>[E-other]</script>',
-        selected_evidence_ids=("E-known",),
-    )
-    assert "- [E-known] Fixture title" in report
-    assert "- [E-other]" not in report
+    with pytest.raises(EvidenceBackedClaimRequired):
+        writer.finalize_report(
+            '<span data-note="[E-other]">Visible claim</span> [E-known]. '
+            '<script>[E-other]</script>',
+            selected_evidence_ids=("E-known",),
+        )
 
 
 def test_link_destinations_and_images_are_hidden_but_visible_link_labels_are_validated(
@@ -503,3 +503,55 @@ def test_markdown_metadata_preserves_joiners_and_neutralizes_bidi_controls(
     assert "می\u200cخواهم" in report
     assert "\u202e" not in report
     assert "\u2066" not in report
+
+
+@pytest.mark.parametrize(
+    "raw_html",
+    [
+        "<span hidden>[E-known]</span>",
+        '<span style="display:none">[E-known]</span>',
+        "<textarea>[E-known]</textarea>",
+        "<template>[E-known]</template>",
+        "<script/>[E-known]",
+        "<span hidden />[E-known]",
+    ],
+)
+def test_any_inline_raw_html_makes_claim_support_fail_closed(
+    evidence_store: LocalEvidenceStore,
+    raw_html: str,
+) -> None:
+    with pytest.raises(EvidenceBackedClaimRequired):
+        MarkdownReportWriter(evidence_store).finalize_report(
+            f"Unsupported visible claim. {raw_html}",
+            selected_evidence_ids=("E-known",),
+        )
+
+
+def test_metadata_entities_remain_literal_after_commonmark_rendering(
+    tmp_path: Path,
+) -> None:
+    store = LocalEvidenceStore(tmp_path)
+    sequence = "👩\u200d💻\ufe0f"
+    add_evidence(
+        store,
+        evidence_id="E-known",
+        source_id="source-known",
+        title=f"Safe &lbrack;E-missing&rbrack; R&D {sequence}",
+    )
+
+    report = MarkdownReportWriter(store).finalize_report(
+        "Supported [E-known].",
+        selected_evidence_ids=("E-known",),
+        is_partial=True,
+        stop_reason="BUDGET_EXHAUSTED",
+        uncovered_information_needs=(
+            "Need &#91;E-missing&#93; &amp; details",
+        ),
+    )
+    rendered = MarkdownIt("commonmark").render(report)
+
+    assert "[E-missing]" not in rendered
+    assert "&amp;lbrack;E-missing&amp;rbrack;" in rendered
+    assert "&amp;#91;E-missing&amp;#93;" in rendered
+    assert sequence in rendered
+    assert "https://example.com/report?a=1&amp;b=2" in rendered

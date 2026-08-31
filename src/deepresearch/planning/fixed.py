@@ -5,7 +5,9 @@ import hashlib
 import json
 import math
 import time
+from dataclasses import dataclass
 from decimal import Decimal
+from threading import Lock
 from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
@@ -54,6 +56,12 @@ class _QueryOutput(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     queries: tuple[str, ...] = Field(min_length=1)
+
+
+@dataclass
+class _QueryGate:
+    lock: asyncio.Lock
+    users: int = 0
 
 
 def _sha256_text(value: str) -> str:
@@ -271,7 +279,48 @@ class FixedPlanner:
         self.content_boundary = content_boundary
         self.validator = PlanValidator(search_depth=search_depth)
         self._query_cache: dict[tuple[str, str, str], tuple[str, ...]] = {}
-        self._query_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
+        self._query_locks: dict[tuple[str, str, str], _QueryGate] = {}
+        self._initial_model_tokens = sum(
+            usage.total_tokens for usage in budget.used_by_node.values()
+        )
+        self._model_tokens_used = 0
+        self._model_tokens_reserved = 0
+        self._token_lock = Lock()
+
+    def _reserve_request(self, request: ModelRequest) -> int:
+        try:
+            reservation = _request_token_upper_bound(request)
+        except UnicodeEncodeError:
+            raise ProviderError(
+                code="INVALID_REQUEST",
+                provider=self.model.provider_id,
+                operation="model",
+                public_message="model request contains invalid text",
+                retryable=False,
+            ) from None
+        with self._token_lock:
+            remaining = (
+                self.budget.max_total_tokens
+                - self._initial_model_tokens
+                - self._model_tokens_used
+                - self._model_tokens_reserved
+            )
+            if reservation > remaining:
+                raise ProviderError(
+                    code="INVALID_REQUEST",
+                    provider=self.model.provider_id,
+                    operation="model",
+                    public_message="model request exceeds remaining token budget",
+                    retryable=False,
+                )
+            self._model_tokens_reserved += reservation
+        return reservation
+
+    def _settle_request(self, reservation: int, actual_tokens: int | None) -> None:
+        with self._token_lock:
+            self._model_tokens_reserved -= reservation
+            if actual_tokens is not None:
+                self._model_tokens_used += actual_tokens
 
     def _plan_request(self, request: ResearchRequest) -> ModelRequest:
         raw = request.model_dump(mode="json")
@@ -352,18 +401,48 @@ class FixedPlanner:
             deadline=deadline,
             cancellation_token=cancellation_token,
         )
-        result = await self.model.complete(
-            request,
-            deadline=deadline,
-            cancellation_token=cancellation_token,
-        )
+        reservation = self._reserve_request(request)
+        try:
+            _check_call_boundary(
+                provider=self.model.provider_id,
+                deadline=deadline,
+                cancellation_token=cancellation_token,
+            )
+        except BaseException:
+            self._settle_request(reservation, None)
+            raise
+        try:
+            result = await self.model.complete(
+                request,
+                deadline=deadline,
+                cancellation_token=cancellation_token,
+            )
+        except ProviderError as error:
+            self._settle_request(
+                reservation,
+                None if error.usage is None else error.usage.total_tokens,
+            )
+            raise
+        except BaseException:
+            self._settle_request(reservation, None)
+            raise
+        self._settle_request(reservation, result.usage.total_tokens)
         _check_call_boundary(
             provider=self.model.provider_id,
             deadline=deadline,
             cancellation_token=cancellation_token,
         )
         raw = result.output
-        data = raw.encode("utf-8")
+        try:
+            data = raw.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ProviderError(
+                code="INVALID_RESPONSE",
+                provider=self.model.provider_id,
+                operation="complete",
+                public_message="model response contains invalid text",
+                retryable=False,
+            ) from None
         _check_call_boundary(
             provider=self.model.provider_id,
             deadline=deadline,
@@ -511,13 +590,16 @@ class FixedPlanner:
                 cancellation_token=cancellation_token,
             )
             return cached
-        lock = self._query_locks.setdefault(key, asyncio.Lock())
-        await self._acquire_query_lock(
-            lock,
-            deadline=deadline,
-            cancellation_token=cancellation_token,
-        )
+        gate = self._query_locks.setdefault(key, _QueryGate(lock=asyncio.Lock()))
+        gate.users += 1
+        acquired = False
         try:
+            await self._acquire_query_lock(
+                gate.lock,
+                deadline=deadline,
+                cancellation_token=cancellation_token,
+            )
+            acquired = True
             _check_call_boundary(
                 provider=self.model.provider_id,
                 deadline=deadline,
@@ -532,12 +614,33 @@ class FixedPlanner:
                 deadline=deadline,
                 cancellation_token=cancellation_token,
             )
-            result = await self.model.structured(
-                request,
-                _QueryOutput,
-                deadline=deadline,
-                cancellation_token=cancellation_token,
-            )
+            reservation = self._reserve_request(request)
+            try:
+                _check_call_boundary(
+                    provider=self.model.provider_id,
+                    deadline=deadline,
+                    cancellation_token=cancellation_token,
+                )
+            except BaseException:
+                self._settle_request(reservation, None)
+                raise
+            try:
+                result = await self.model.structured(
+                    request,
+                    _QueryOutput,
+                    deadline=deadline,
+                    cancellation_token=cancellation_token,
+                )
+            except ProviderError as error:
+                self._settle_request(
+                    reservation,
+                    None if error.usage is None else error.usage.total_tokens,
+                )
+                raise
+            except BaseException:
+                self._settle_request(reservation, None)
+                raise
+            self._settle_request(reservation, result.usage.total_tokens)
             _check_call_boundary(
                 provider=self.model.provider_id,
                 deadline=deadline,
@@ -579,7 +682,11 @@ class FixedPlanner:
                 raise
             return value
         finally:
-            lock.release()
+            if acquired:
+                gate.lock.release()
+            gate.users -= 1
+            if gate.users == 0 and self._query_locks.get(key) is gate:
+                self._query_locks.pop(key, None)
 
 
 __all__ = ["FixedPlanner", "PlanGenerationError"]
