@@ -9,13 +9,14 @@ import re
 import time
 import uuid
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from copy import deepcopy
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Self, cast
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
@@ -51,6 +52,7 @@ from deepresearch.runtime import (
     BudgetExceeded,
     CancellationToken,
     CheckpointRef,
+    OperationCancelled,
     ResourceEstimate,
 )
 from deepresearch.runtime.checkpoints import (
@@ -79,6 +81,7 @@ from deepresearch.storage import (
     ModelCacheKey,
     ParseCacheKey,
     SearchCacheKey,
+    cache_key_sha256,
 )
 from deepresearch.workflow import baseline_graph as baseline_graph_module
 from deepresearch.workflow.baseline_graph import (
@@ -342,6 +345,189 @@ class OneShotReadbackFailureSink(MemoryEventSink):
         if self.target_key == (run_id, seq) and not self.failed:
             self.failed = True
             raise OSError("one-shot durable event readback failure")
+        return await super().get_event(run_id=run_id, seq=seq)
+
+
+class OneShotPreWriteFailureSink(MemoryEventSink):
+    def __init__(self, *, target_node: str) -> None:
+        super().__init__()
+        self.target_node = target_node
+        self.attempts: list[RunEvent] = []
+        self.target_key: tuple[str, int] | None = None
+        self.authoritative_reads: list[RunEvent | None] = []
+        self.failed = False
+
+    async def __call__(self, event: RunEvent) -> None:
+        self.attempts.append(event)
+        if (
+            event.node == self.target_node
+            and event.error_code is None
+            and not self.failed
+        ):
+            self.target_key = (event.run_id, event.seq)
+            self.failed = True
+            raise OSError("one-shot durable event pre-write failure")
+        await super().__call__(event)
+
+    async def get_event(self, *, run_id: str, seq: int) -> RunEvent | None:
+        event = await super().get_event(run_id=run_id, seq=seq)
+        if self.failed and self.target_key == (run_id, seq):
+            self.authoritative_reads.append(event)
+        return event
+
+
+class ClassifiedPreWriteFailureSink(OneShotPreWriteFailureSink):
+    def __init__(
+        self,
+        *,
+        target_node: str,
+        mode: str,
+        primary: BaseException | None = None,
+    ) -> None:
+        super().__init__(target_node=target_node)
+        self.mode = mode
+        self.primary = primary
+        self.boundary_reads = 0
+
+    async def __call__(self, event: RunEvent) -> None:
+        if (
+            event.node == self.target_node
+            and event.error_code is None
+            and not self.failed
+            and self.mode == "initial-call-hard"
+        ):
+            self.attempts.append(event)
+            assert self.primary is not None
+            raise self.primary
+        if (
+            self.failed
+            and self.target_key == (event.run_id, event.seq)
+            and event.error_code == "DATA_CORRUPTION"
+        ):
+            if self.mode == "replacement-call-hard":
+                self.attempts.append(event)
+                assert self.primary is not None
+                raise self.primary
+            if self.mode == "replacement-call-ordinary-stored":
+                self.attempts.append(event)
+                await MemoryEventSink.__call__(self, event)
+                raise OSError("replacement failed after durable write")
+            if self.mode == "replacement-call-ordinary-absent":
+                self.attempts.append(event)
+                raise OSError("replacement failed before durable write")
+        await super().__call__(event)
+
+    async def get_event(self, *, run_id: str, seq: int) -> RunEvent | None:
+        if self.failed and self.target_key == (run_id, seq):
+            self.boundary_reads += 1
+            if self.boundary_reads == 1:
+                if self.mode == "conflict":
+                    attempted = self.attempts[-1]
+                    return attempted.model_copy(
+                        update={"timestamp": attempted.timestamp + timedelta(seconds=1)}
+                    )
+                if self.mode == "constructed-corruption":
+                    corrupt_usage = cast(
+                        "ResourceUsage",
+                        BaseModel.model_copy(
+                            self.attempts[-1].usage_delta,
+                            update={"wall_seconds": 0},
+                        ),
+                    )
+                    return cast(
+                        "RunEvent",
+                        BaseModel.model_copy(
+                            self.attempts[-1],
+                            update={"usage_delta": corrupt_usage},
+                        ),
+                    )
+                if self.mode == "unreadable":
+                    raise OSError("authoritative durable read failed")
+                if self.mode == "authoritative-read-hard":
+                    assert self.primary is not None
+                    raise self.primary
+            if self.boundary_reads == 2:
+                if self.mode == "replacement-readback-hard":
+                    assert self.primary is not None
+                    raise self.primary
+                if self.mode == "replacement-readback-ordinary":
+                    raise OSError("replacement immediate readback failed")
+        return await super().get_event(run_id=run_id, seq=seq)
+
+
+class FailedEventPreWriteFailureSink(MemoryEventSink):
+    def __init__(
+        self,
+        *,
+        target_node: str,
+        error_code: str,
+        store_before_failure: bool,
+    ) -> None:
+        super().__init__()
+        self.target_node = target_node
+        self.error_code = error_code
+        self.store_before_failure = store_before_failure
+        self.attempts: list[RunEvent] = []
+        self.target_key: tuple[str, int] | None = None
+        self.authoritative_reads: list[RunEvent | None] = []
+        self.failed = False
+
+    async def __call__(self, event: RunEvent) -> None:
+        if event.node == self.target_node:
+            self.attempts.append(event)
+        if (
+            event.node == self.target_node
+            and event.error_code == self.error_code
+            and not self.failed
+        ):
+            self.target_key = (event.run_id, event.seq)
+            self.failed = True
+            if self.store_before_failure:
+                await super().__call__(event)
+            raise OSError("failed event did not reach durable storage")
+        await super().__call__(event)
+
+    async def get_event(self, *, run_id: str, seq: int) -> RunEvent | None:
+        event = await super().get_event(run_id=run_id, seq=seq)
+        if self.failed and self.target_key == (run_id, seq):
+            self.authoritative_reads.append(event)
+        return event
+
+
+class ImmediateConstructedReadbackSink(MemoryEventSink):
+    def __init__(self, *, target_node: str, wall_seconds: object) -> None:
+        super().__init__()
+        self.target_node = target_node
+        self.wall_seconds = wall_seconds
+        self.target_key: tuple[str, int] | None = None
+        self.target_event: RunEvent | None = None
+        self.boundary_reads = 0
+
+    async def __call__(self, event: RunEvent) -> None:
+        await super().__call__(event)
+        if event.node == self.target_node and event.error_code is None:
+            self.target_key = (event.run_id, event.seq)
+            self.target_event = event
+
+    async def get_event(self, *, run_id: str, seq: int) -> RunEvent | None:
+        if self.target_key == (run_id, seq):
+            self.boundary_reads += 1
+            if self.boundary_reads == 1:
+                assert self.target_event is not None
+                corrupt_usage = cast(
+                    "ResourceUsage",
+                    BaseModel.model_copy(
+                        self.target_event.usage_delta,
+                        update={"wall_seconds": self.wall_seconds},
+                    ),
+                )
+                return cast(
+                    "RunEvent",
+                    BaseModel.model_copy(
+                        self.target_event,
+                        update={"usage_delta": corrupt_usage},
+                    ),
+                )
         return await super().get_event(run_id=run_id, seq=seq)
 
 
@@ -1153,6 +1339,34 @@ class SegmentClock:
         return self._utc
 
 
+class ControlledSegmentClock:
+    def __init__(
+        self,
+        *,
+        monotonic_start: float,
+        utc_offset_seconds: float,
+    ) -> None:
+        self.monotonic_start = monotonic_start
+        self.value = monotonic_start
+        self.utc_offset_seconds = utc_offset_seconds
+        self.utc_calls = 0
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+    def monotonic(self) -> float:
+        return self.value
+
+    def utc_now(self) -> datetime:
+        self.utc_calls += 1
+        return datetime(2026, 9, 1, tzinfo=UTC) + timedelta(
+            seconds=(
+                self.utc_offset_seconds + self.value - self.monotonic_start
+            ),
+            microseconds=self.utc_calls,
+        )
+
+
 def _usage(*, tokens: int) -> ResourceUsage:
     return ResourceUsage(
         input_tokens=tokens,
@@ -1184,6 +1398,17 @@ def _runtime_context(
     thread_id: str = "thread-usage",
 ) -> BaselineRuntimeContext:
     current = run_config or config()
+    tick_iterator = cast("Iterator[float]", ticks)
+    last_tick = 0.0
+
+    def monotonic() -> float:
+        nonlocal last_tick
+        try:
+            last_tick = next(tick_iterator)
+        except StopIteration:
+            pass
+        return last_tick
+
     return BaselineRuntimeContext(
         run_id=run_id,
         thread_id=thread_id,
@@ -1195,10 +1420,1214 @@ def _runtime_context(
         run_started_monotonic=0.0,
         run_started_at=datetime(2026, 9, 1, tzinfo=UTC),
         elapsed_base_seconds=0.0,
-        monotonic=lambda: next(cast("Any", ticks)),
+        monotonic=monotonic,
         utc_now=lambda: datetime(2026, 9, 1, tzinfo=UTC),
         new_id=lambda prefix: prefix,
     )
+
+
+class MutableMonotonic:
+    def __init__(self, value: float) -> None:
+        self.value = value
+
+    def __call__(self) -> float:
+        return self.value
+
+
+class InstrumentedAsyncLock:
+    def __init__(self, inner: asyncio.Lock) -> None:
+        self.inner = inner
+        self.queued = asyncio.Event()
+        self.acquired = asyncio.Event()
+
+    async def __aenter__(self) -> Self:
+        self.queued.set()
+        await self.inner.acquire()
+        self.acquired.set()
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        self.inner.release()
+
+
+def _model_request(*, content: str) -> ModelRequest:
+    return ModelRequest(
+        model_id="offline-model-v1",
+        messages=(ModelMessage(role="user", content=content),),
+        temperature=Decimal(0),
+        seed=0,
+        max_output_tokens=1,
+        prompt_version="fixed-planner-v1",
+        system_prompt_hash=hashlib.sha256(b"system").hexdigest(),
+        tool_schema_hash=hashlib.sha256(b"[]").hexdigest(),
+        output_schema_hash=hashlib.sha256(b"").hexdigest(),
+    )
+
+
+def _model_cache_key(provider: object, request_value: ModelRequest) -> ModelCacheKey:
+    return ModelCacheKey(
+        provider_id=cast("Any", provider).provider_id,
+        endpoint_type="complete",
+        model_id=request_value.model_id,
+        prompt_version=request_value.prompt_version,
+        system_prompt_hash=request_value.system_prompt_hash,
+        tool_schema_hash=request_value.tool_schema_hash,
+        output_schema_hash=request_value.output_schema_hash,
+        temperature=request_value.temperature,
+        seed=request_value.seed,
+        canonical_request_hash=_canonical_sha256(
+            request_value.model_dump(mode="json")
+        ),
+    )
+
+
+@pytest.mark.parametrize("gate", ["cache", "provider"])
+@pytest.mark.parametrize("stop", ["timeout", "cancel"])
+async def test_waiting_provider_rechecks_stop_before_any_second_side_effect(
+    tmp_path: Path,
+    gate: str,
+    stop: str,
+) -> None:
+    handlers = _owned_handlers(tmp_path)
+    run_config = config(
+        budget=RunBudget.preset("low").model_copy(update={"max_cost_usd": None})
+    )
+
+    class ObservedProvider(OfflineModel):
+        def __init__(self) -> None:
+            super().__init__(_offline_plan())
+            self.observer_consumptions = 0
+
+        def consume_invocation_usage(self) -> ResourceUsage | None:
+            self.observer_consumptions += 1
+            return None
+
+    provider = ObservedProvider()
+    first_request = _model_request(content="first cache identity")
+    second_request = (
+        first_request
+        if gate == "cache"
+        else _model_request(content="different cache identity")
+    )
+    first_clock = MutableMonotonic(0.0)
+    second_clock = MutableMonotonic(0.0)
+
+    def make_context(
+        *,
+        run_id: str,
+        thread_id: str,
+        clock: MutableMonotonic,
+        deadline: float,
+    ) -> BaselineRuntimeContext:
+        base = _runtime_context(
+            ticks=iter(()),
+            run_config=run_config,
+            run_id=run_id,
+            thread_id=thread_id,
+        )
+        context = replace(
+            base,
+            budget_accountant=BudgetAccountant(
+                run_config.budget,
+                run_scope=run_id,
+            ),
+            deadline=deadline,
+            monotonic=clock,
+        )
+        context.audit.begin(graph_node="Plan", node_attempt=1)
+        return context
+
+    first_context = make_context(
+        run_id="run-lock-first",
+        thread_id="thread-lock-first",
+        clock=first_clock,
+        deadline=100.0,
+    )
+    second_context = make_context(
+        run_id="run-lock-second",
+        thread_id="thread-lock-second",
+        clock=second_clock,
+        deadline=1.0,
+    )
+    second_before = second_context.budget_accountant.snapshot()
+    task_contexts: dict[object, BaselineRuntimeContext] = {}
+    cast("Any", handlers)._runtime = lambda: task_contexts[asyncio.current_task()]
+    provider_calls: Counter[str] = Counter()
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def invoke_provider(
+        *,
+        label: str,
+        request_value: ModelRequest,
+    ) -> ModelResult[str]:
+        provider_calls[label] += 1
+        if label == "first":
+            first_entered.set()
+            await asyncio.wait_for(release_first.wait(), timeout=5.0)
+        return await provider.complete(request_value)
+
+    async def run_call(
+        *,
+        context: BaselineRuntimeContext,
+        label: str,
+        request_value: ModelRequest,
+    ) -> object:
+        task_contexts[asyncio.current_task()] = context
+        return await cast("Any", handlers)._cached_model_call(
+            provider=provider,
+            request=request_value,
+            output_schema=None,
+            invoke=lambda: invoke_provider(label=label, request_value=request_value),
+        )
+
+    first_task = asyncio.create_task(
+        run_call(
+            context=first_context,
+            label="first",
+            request_value=first_request,
+        )
+    )
+    await asyncio.wait_for(first_entered.wait(), timeout=5.0)
+    lock_digest = (
+        cache_key_sha256(_model_cache_key(provider, first_request))
+        if gate == "cache"
+        else cast("Any", baseline_graph_module)._hash_json(
+            {"provider": provider.provider_id}
+        )
+    )
+    original_lock = cast("Any", handlers)._locks[lock_digest]
+    instrumented_lock = InstrumentedAsyncLock(original_lock)
+    cast("Any", handlers)._locks[lock_digest] = instrumented_lock
+    second_task = asyncio.create_task(
+        run_call(
+            context=second_context,
+            label="second",
+            request_value=second_request,
+        )
+    )
+    await asyncio.wait_for(instrumented_lock.queued.wait(), timeout=5.0)
+    assert not second_task.done()
+    assert not instrumented_lock.acquired.is_set()
+    if stop == "timeout":
+        second_clock.value = 1.0
+    else:
+        second_context.cancellation_token.cancel()
+    release_first.set()
+
+    first_result = await first_task
+    expected_error = ProviderError if stop == "timeout" else OperationCancelled
+    with pytest.raises(expected_error) as caught:
+        await second_task
+
+    if stop == "timeout":
+        assert cast("ProviderError", caught.value).code == "TIMEOUT"
+    assert instrumented_lock.acquired.is_set()
+    assert first_result.output
+    assert provider_calls == Counter({"first": 1})
+    assert provider.observer_consumptions == 2
+    assert second_context.budget_accountant.snapshot() == second_before
+    assert second_context.audit.provider_calls == []
+    assert second_context.audit.provider_receipt_ids == []
+    assert second_context.audit.result_artifact_ids == []
+
+    second_key = _model_cache_key(provider, second_request)
+    entry = handlers.cache.get(second_key)
+    if gate == "cache":
+        assert entry is not None
+        assert entry.metadata["producer_run_id"] == first_context.run_id
+    else:
+        assert entry is None
+
+
+@pytest.mark.parametrize("cache_state", ["miss", "hit"])
+@pytest.mark.parametrize("stop", ["timeout", "cancel"])
+async def test_model_cache_lock_waiter_rechecks_stop_for_hit_and_miss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cache_state: str,
+    stop: str,
+) -> None:
+    handlers = _owned_handlers(tmp_path)
+    current_config = config(
+        budget=RunBudget.preset("low").model_copy(update={"max_cost_usd": None})
+    )
+    clock = MutableMonotonic(0.0)
+    run_id = f"run-model-{cache_state}-cache-waiter"
+    context = replace(
+        _runtime_context(
+            ticks=iter(()),
+            run_config=current_config,
+            run_id=run_id,
+            thread_id=f"thread-model-{cache_state}-cache-waiter",
+        ),
+        budget_accountant=BudgetAccountant(
+            current_config.budget,
+            run_scope=run_id,
+        ),
+        deadline=1.0,
+        monotonic=clock,
+    )
+    _bind_handler_runtime(handlers, context, graph_node="Plan")
+    provider = OfflineModel(_offline_plan())
+    request_value = _model_request(content="model cache waiter")
+    provider_calls = 0
+
+    async def invoke_provider() -> ModelResult[str]:
+        nonlocal provider_calls
+        provider_calls += 1
+        return await provider.complete(request_value)
+
+    if cache_state == "hit":
+        await cast("Any", handlers)._cached_model_call(
+            provider=provider,
+            request=request_value,
+            output_schema=None,
+            invoke=invoke_provider,
+        )
+        context.audit.reset()
+        context.audit.begin(graph_node="Plan", node_attempt=1)
+    key = _model_cache_key(provider, request_value)
+    seeded_entry = handlers.cache.get(key)
+    assert (seeded_entry is not None) is (cache_state == "hit")
+    provider_calls_before = provider_calls
+    before = context.budget_accountant.snapshot()
+    inner_lock = asyncio.Lock()
+    await inner_lock.acquire()
+    instrumented_lock = InstrumentedAsyncLock(inner_lock)
+    cast("Any", handlers)._locks[cache_key_sha256(key)] = instrumented_lock
+    cache_gets = 0
+    original_cache_get = handlers.cache.get
+
+    def observed_cache_get(key_value: object) -> CacheEntry | None:
+        nonlocal cache_gets
+        cache_gets += 1
+        return original_cache_get(cast("Any", key_value))
+
+    monkeypatch.setattr(handlers.cache, "get", observed_cache_get)
+    cached_observations = 0
+    original_observe_cached = cast("Any", handlers)._observe_cached
+
+    async def observed_cached(*args: object, **kwargs: object) -> object:
+        nonlocal cached_observations
+        cached_observations += 1
+        return await original_observe_cached(*args, **kwargs)
+
+    monkeypatch.setattr(handlers, "_observe_cached", observed_cached)
+    task = asyncio.create_task(
+        cast("Any", handlers)._cached_model_call(
+            provider=provider,
+            request=request_value,
+            output_schema=None,
+            invoke=invoke_provider,
+        )
+    )
+    await asyncio.wait_for(instrumented_lock.queued.wait(), timeout=5.0)
+    if stop == "timeout":
+        clock.value = 1.0
+    else:
+        context.cancellation_token.cancel()
+    inner_lock.release()
+
+    expected_error = ProviderError if stop == "timeout" else OperationCancelled
+    with pytest.raises(expected_error) as caught:
+        await task
+
+    if stop == "timeout":
+        assert cast("ProviderError", caught.value).code == "TIMEOUT"
+    assert instrumented_lock.acquired.is_set()
+    assert cache_gets == 0
+    assert cached_observations == 0
+    assert provider_calls == provider_calls_before
+    assert context.budget_accountant.snapshot() == before
+    assert context.audit.provider_calls == []
+    assert context.audit.provider_receipt_ids == []
+    assert context.audit.result_artifact_ids == []
+    assert original_cache_get(key) == seeded_entry
+
+
+@pytest.mark.parametrize("operation", ["embed", "search", "fetch", "parse"])
+@pytest.mark.parametrize("stop", ["timeout", "cancel"])
+@pytest.mark.parametrize("cache_state", ["miss", "hit"])
+async def test_non_model_cache_lock_waiter_rechecks_stop_before_cache_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    stop: str,
+    cache_state: str,
+) -> None:
+    handlers = _owned_handlers(tmp_path)
+    current_config = config(
+        budget=RunBudget.preset("low").model_copy(update={"max_cost_usd": None})
+    )
+    clock = MutableMonotonic(0.0)
+    context = replace(
+        _runtime_context(
+            ticks=iter(()),
+            run_config=current_config,
+            run_id=f"run-{operation}-{cache_state}-cache-waiter",
+            thread_id=f"thread-{operation}-{cache_state}-cache-waiter",
+        ),
+        budget_accountant=BudgetAccountant(
+            current_config.budget,
+            run_scope=f"run-{operation}-{cache_state}-cache-waiter",
+        ),
+        deadline=1.0,
+        monotonic=clock,
+    )
+    graph_node = {
+        "embed": "RankEvidence",
+        "search": "Search",
+        "fetch": "Fetch",
+        "parse": "ParseAndNormalize",
+    }[operation]
+    _bind_handler_runtime(
+        handlers,
+        context,
+        graph_node=graph_node,
+    )
+    inner_lock = asyncio.Lock()
+    await inner_lock.acquire()
+    instrumented_lock = InstrumentedAsyncLock(inner_lock)
+
+    async def fixed_lock(_digest: str) -> InstrumentedAsyncLock:
+        return instrumented_lock
+
+    original_lock_for = handlers._lock_for
+    monkeypatch.setattr(handlers, "_lock_for", fixed_lock)
+    cache_gets = 0
+    original_cache_get = handlers.cache.get
+
+    def observed_cache_get(key: object) -> CacheEntry | None:
+        nonlocal cache_gets
+        cache_gets += 1
+        return original_cache_get(cast("Any", key))
+
+    monkeypatch.setattr(handlers.cache, "get", observed_cache_get)
+
+    async def invoke_operation() -> object:
+        if operation == "embed":
+            proxy = cast("Any", handlers.ranker).embedder
+            provider = proxy._inner
+            return await cast("Any", handlers)._cached_embed_call(
+                provider=provider,
+                texts=("offline proof",),
+                invoke=lambda: provider.embed(
+                    ("offline proof",),
+                    deadline=999.0,
+                    cancellation_token=CancellationToken(),
+                ),
+            )
+        if operation == "search":
+            async def fixed_queries(
+                _context: object,
+                _invoke: object,
+            ) -> tuple[str, ...]:
+                return ("offline baseline query",)
+
+            monkeypatch.setattr(
+                handlers,
+                "_isolated_planner_call",
+                fixed_queries,
+            )
+            plan = handlers.artifact_store.put_bytes(
+                json.dumps(
+                    _offline_plan(),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode(),
+                media_type="application/vnd.deepresearch.plan+json",
+            )
+            return await handlers.search(
+                cast(
+                    "Any",
+                    {
+                        "run_id": context.run_id,
+                        "plan_artifact_id": plan.artifact_id,
+                        "active_subquestion_id": "sq-offline",
+                        "baseline_work_artifact_ids": (),
+                    },
+                )
+            )
+        if operation == "fetch":
+            search_work = handlers.artifact_store.put_bytes(
+                json.dumps(
+                    {
+                        "hits": [
+                            SearchHit(
+                                url="https://cache-wait.example.test/doc",
+                                title="Cache wait",
+                                snippet="offline",
+                                rank=1,
+                            ).model_dump(mode="json")
+                        ],
+                        "kind": "search",
+                    },
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode(),
+                media_type="application/vnd.deepresearch.baseline-work+json",
+            )
+            return await handlers.fetch(
+                cast(
+                    "Any",
+                    {
+                        "run_id": context.run_id,
+                        "baseline_work_artifact_ids": (search_work.artifact_id,),
+                    },
+                )
+            )
+        raw = RawDocument(
+            requested_url="https://cache-wait.example.test/doc",
+            final_url="https://cache-wait.example.test/doc",
+            status=200,
+            headers={"content-type": "text/html"},
+            content_type="text/html",
+            body_bytes=b"offline cache wait",
+            retrieved_at=datetime(2026, 9, 1, tzinfo=UTC),
+        )
+        raw_work = handlers.artifact_store.put_bytes(
+            json.dumps(
+                {
+                    "documents": [raw.model_dump(mode="json")],
+                    "kind": "raw",
+                },
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode(),
+            media_type="application/vnd.deepresearch.baseline-work+json",
+        )
+        return await handlers.parse_and_normalize(
+            cast(
+                "Any",
+                {
+                    "run_id": context.run_id,
+                    "baseline_work_artifact_ids": (raw_work.artifact_id,),
+                },
+            )
+        )
+
+    if cache_state == "hit":
+        inner_lock.release()
+        monkeypatch.setattr(handlers, "_lock_for", original_lock_for)
+        await invoke_operation()
+        monkeypatch.setattr(handlers, "_lock_for", fixed_lock)
+        context.audit.reset()
+        context.audit.begin(graph_node=graph_node, node_attempt=1)
+        await inner_lock.acquire()
+        instrumented_lock = InstrumentedAsyncLock(inner_lock)
+        cache_gets = 0
+    cached_observations = 0
+    original_observe_cached = cast("Any", handlers)._observe_cached
+
+    async def observed_cached(*args: object, **kwargs: object) -> object:
+        nonlocal cached_observations
+        cached_observations += 1
+        return await original_observe_cached(*args, **kwargs)
+
+    monkeypatch.setattr(handlers, "_observe_cached", observed_cached)
+    provider_invocations = 0
+    if operation == "embed":
+        provider_owner = cast("Any", handlers.ranker).embedder._inner
+        provider_method_name = "embed"
+    elif operation == "search":
+        provider_owner = handlers.search_provider
+        provider_method_name = "search_with_usage"
+    elif operation == "fetch":
+        provider_owner = handlers.fetcher
+        provider_method_name = "fetch_with_usage"
+    else:
+        provider_owner = handlers.parser
+        provider_method_name = "parse"
+    original_provider_invoke = getattr(provider_owner, provider_method_name)
+
+    async def observed_provider(*args: object, **kwargs: object) -> object:
+        nonlocal provider_invocations
+        provider_invocations += 1
+        return await original_provider_invoke(*args, **kwargs)
+
+    monkeypatch.setattr(
+        provider_owner,
+        provider_method_name,
+        observed_provider,
+    )
+    cache_files_before = tuple(
+        sorted(
+            path.relative_to(tmp_path).as_posix()
+            for path in (tmp_path / "cache").rglob("*.json")
+        )
+    )
+    assert bool(cache_files_before) is (cache_state == "hit")
+    before = context.budget_accountant.snapshot()
+    task = asyncio.create_task(invoke_operation())
+    await asyncio.wait_for(instrumented_lock.queued.wait(), timeout=5.0)
+    assert not task.done()
+    assert not instrumented_lock.acquired.is_set()
+    if stop == "timeout":
+        clock.value = 1.0
+    else:
+        context.cancellation_token.cancel()
+    inner_lock.release()
+
+    expected_error = ProviderError if stop == "timeout" else OperationCancelled
+    with pytest.raises(expected_error) as caught:
+        await task
+
+    if stop == "timeout":
+        assert cast("ProviderError", caught.value).code == "TIMEOUT"
+    assert instrumented_lock.acquired.is_set()
+    assert cache_gets == 0
+    assert cached_observations == 0
+    assert provider_invocations == 0
+    assert context.budget_accountant.snapshot() == before
+    assert context.audit.provider_calls == []
+    assert context.audit.provider_receipt_ids == []
+    assert context.audit.result_artifact_ids == []
+    cache_files_after = tuple(
+        sorted(
+            path.relative_to(tmp_path).as_posix()
+            for path in (tmp_path / "cache").rglob("*.json")
+        )
+    )
+    assert cache_files_after == cache_files_before
+
+
+@pytest.mark.parametrize("stop", ["timeout", "cancel"])
+async def test_waiting_planner_rechecks_stop_before_mutating_shared_state(
+    tmp_path: Path,
+    stop: str,
+) -> None:
+    handlers = _owned_handlers(tmp_path)
+    current_config = config(
+        budget=RunBudget.preset("low").model_copy(update={"max_cost_usd": None})
+    )
+    first_clock = MutableMonotonic(0.0)
+    second_clock = MutableMonotonic(0.0)
+    first_context = replace(
+        _runtime_context(ticks=iter(()), run_config=current_config),
+        deadline=100.0,
+        monotonic=first_clock,
+    )
+    second_context = replace(
+        _runtime_context(
+            ticks=iter(()),
+            run_config=current_config,
+            run_id="run-planner-waiter",
+            thread_id="thread-planner-waiter",
+        ),
+        budget_accountant=BudgetAccountant(
+            current_config.budget,
+            run_scope="run-planner-waiter",
+        ),
+        deadline=1.0,
+        monotonic=second_clock,
+    )
+    planner = cast("Any", handlers.initial_plan_generator)
+    planner_before = (
+        planner.budget,
+        planner._initial_model_tokens,
+        planner._model_tokens_used,
+        planner._model_tokens_reserved,
+        planner._query_cache,
+        planner._query_locks,
+    )
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    invocations: Counter[str] = Counter()
+
+    async def first_invoke() -> str:
+        invocations["first"] += 1
+        first_entered.set()
+        await asyncio.wait_for(release_first.wait(), timeout=5.0)
+        return "first"
+
+    async def second_invoke() -> str:
+        invocations["second"] += 1
+        return "second"
+
+    first_task = asyncio.create_task(
+        cast("Any", handlers)._isolated_planner_call(first_context, first_invoke)
+    )
+    await asyncio.wait_for(first_entered.wait(), timeout=5.0)
+    planner_lock = InstrumentedAsyncLock(cast("Any", handlers)._planner_lock)
+    cast("Any", handlers)._planner_lock = planner_lock
+    second_task = asyncio.create_task(
+        cast("Any", handlers)._isolated_planner_call(second_context, second_invoke)
+    )
+    await asyncio.wait_for(planner_lock.queued.wait(), timeout=5.0)
+    assert not second_task.done()
+    assert not planner_lock.acquired.is_set()
+    if stop == "timeout":
+        second_clock.value = 1.0
+    else:
+        second_context.cancellation_token.cancel()
+    release_first.set()
+
+    assert await first_task == "first"
+    expected_error = ProviderError if stop == "timeout" else OperationCancelled
+    with pytest.raises(expected_error) as caught:
+        await second_task
+    if stop == "timeout":
+        assert cast("ProviderError", caught.value).code == "TIMEOUT"
+    assert planner_lock.acquired.is_set()
+    assert invocations == Counter({"first": 1})
+    planner_after = (
+        planner.budget,
+        planner._initial_model_tokens,
+        planner._model_tokens_used,
+        planner._model_tokens_reserved,
+        planner._query_cache,
+        planner._query_locks,
+    )
+    assert planner_after == planner_before
+    assert planner_after[4] is planner_before[4]
+    assert planner_after[5] is planner_before[5]
+    assert second_context.audit.provider_calls == []
+    assert second_context.audit.provider_receipt_ids == []
+
+
+@pytest.mark.parametrize("stop", ["timeout", "cancel", "cancel-and-timeout"])
+async def test_final_preinvoke_gate_releases_reservation_without_a_call(
+    monkeypatch: pytest.MonkeyPatch,
+    stop: str,
+) -> None:
+    handlers = _bare_handlers()
+    clock = MutableMonotonic(0.0)
+    context = replace(
+        _runtime_context(ticks=iter(())),
+        deadline=1.0,
+        monotonic=clock,
+    )
+    context.audit.begin(graph_node="ParseAndNormalize", node_attempt=1)
+    before = context.budget_accountant.snapshot()
+    original_reserve = context.budget_accountant.reserve
+    original_release = context.budget_accountant.release
+    release_calls = 0
+
+    def stop_after_reserve(*args: Any, **kwargs: Any) -> object:
+        reservation = original_reserve(*args, **kwargs)
+        if stop in {"timeout", "cancel-and-timeout"}:
+            clock.value = 1.0
+        if stop in {"cancel", "cancel-and-timeout"}:
+            context.cancellation_token.cancel()
+        return reservation
+
+    def observed_release(reservation: object) -> None:
+        nonlocal release_calls
+        release_calls += 1
+        original_release(cast("Any", reservation))
+
+    monkeypatch.setattr(context.budget_accountant, "reserve", stop_after_reserve)
+    monkeypatch.setattr(context.budget_accountant, "release", observed_release)
+    provider_calls = 0
+
+    async def invoke() -> str:
+        nonlocal provider_calls
+        provider_calls += 1
+        return "unexpected"
+
+    expected_error = ProviderError if stop == "timeout" else OperationCancelled
+    with pytest.raises(expected_error) as caught:
+        await cast("Any", handlers)._invoke_metered(
+            context=context,
+            provider=object(),
+            provider_id="post-reservation-provider",
+            model_id=None,
+            operation="parse",
+            node="Tool",
+            operation_id="post-reservation-timeout",
+            invoke=invoke,
+            result_usage=lambda _result: ResourceUsage.zero(cost_known=True),
+            fallback_usage=ResourceUsage.zero(cost_known=True),
+        )
+
+    if stop == "timeout":
+        assert cast("ProviderError", caught.value).code == "TIMEOUT"
+    assert provider_calls == 0
+    assert release_calls == 1
+    assert context.budget_accountant.snapshot() == before
+    assert context.audit.provider_calls == []
+    assert context.audit.provider_receipt_ids == []
+    assert context.audit.result_artifact_ids == []
+
+
+async def test_final_preinvoke_gate_propagates_hard_release_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handlers = _bare_handlers()
+    clock = MutableMonotonic(0.0)
+    context = replace(
+        _runtime_context(ticks=iter(())),
+        deadline=1.0,
+        monotonic=clock,
+    )
+    context.audit.begin(graph_node="ParseAndNormalize", node_attempt=1)
+    before = context.budget_accountant.snapshot()
+    original_reserve = context.budget_accountant.reserve
+    original_release = context.budget_accountant.release
+    primary = MemoryError("hard reservation release failure")
+    release_calls = 0
+
+    def stop_after_reserve(*args: Any, **kwargs: Any) -> object:
+        reservation = original_reserve(*args, **kwargs)
+        clock.value = 1.0
+        return reservation
+
+    def hard_release(reservation: object) -> None:
+        nonlocal release_calls
+        release_calls += 1
+        original_release(cast("Any", reservation))
+        raise primary
+
+    monkeypatch.setattr(context.budget_accountant, "reserve", stop_after_reserve)
+    monkeypatch.setattr(context.budget_accountant, "release", hard_release)
+    provider_calls = 0
+
+    async def invoke() -> str:
+        nonlocal provider_calls
+        provider_calls += 1
+        return "unexpected"
+
+    with pytest.raises(MemoryError) as caught:
+        await cast("Any", handlers)._invoke_metered(
+            context=context,
+            provider=object(),
+            provider_id="post-reservation-provider",
+            model_id=None,
+            operation="parse",
+            node="Tool",
+            operation_id="post-reservation-hard-release",
+            invoke=invoke,
+            result_usage=lambda _result: ResourceUsage.zero(cost_known=True),
+            fallback_usage=ResourceUsage.zero(cost_known=True),
+        )
+
+    assert caught.value is primary
+    assert provider_calls == 0
+    assert release_calls == 1
+    assert context.budget_accountant.snapshot() == before
+    assert context.audit.provider_calls == []
+    assert context.audit.provider_receipt_ids == []
+    assert context.audit.result_artifact_ids == []
+
+
+async def test_final_preinvoke_gate_runs_after_timestamp_hooks_at_deadline() -> None:
+    handlers = _bare_handlers()
+    context = replace(
+        _runtime_context(ticks=iter((0.0, 1.0))),
+        deadline=1.0,
+    )
+    context.audit.begin(graph_node="ParseAndNormalize", node_attempt=1)
+    before = context.budget_accountant.snapshot()
+    provider_calls = 0
+
+    async def invoke() -> str:
+        nonlocal provider_calls
+        provider_calls += 1
+        return "unexpected"
+
+    with pytest.raises(ProviderError) as caught:
+        await cast("Any", handlers)._invoke_metered(
+            context=context,
+            provider=object(),
+            provider_id="timestamp-boundary-provider",
+            model_id=None,
+            operation="parse",
+            node="Tool",
+            operation_id="timestamp-boundary-timeout",
+            invoke=invoke,
+            result_usage=lambda _result: ResourceUsage.zero(cost_known=True),
+            fallback_usage=ResourceUsage.zero(cost_known=True),
+        )
+
+    assert caught.value.code == "TIMEOUT"
+    assert provider_calls == 0
+    assert context.budget_accountant.snapshot() == before
+    assert context.audit.provider_calls == []
+    assert context.audit.provider_receipt_ids == []
+    assert context.audit.result_artifact_ids == []
+
+
+async def test_final_preinvoke_gate_now_starts_provider_wall_measurement() -> None:
+    handlers = _bare_handlers()
+
+    class HookAdvancingClock:
+        def __init__(self) -> None:
+            self.value = 0.0
+
+        def monotonic(self) -> float:
+            return self.value
+
+        def utc_now(self) -> datetime:
+            self.value += 1.0
+            return datetime(2026, 9, 1, tzinfo=UTC) + timedelta(
+                seconds=self.value
+            )
+
+    clock = HookAdvancingClock()
+    context = replace(
+        _runtime_context(ticks=iter(())),
+        deadline=10.0,
+        monotonic=clock.monotonic,
+        utc_now=clock.utc_now,
+    )
+    context.audit.begin(graph_node="ParseAndNormalize", node_attempt=1)
+
+    async def invoke() -> str:
+        clock.value += 1.0
+        return "ok"
+
+    result, usage = await cast("Any", handlers)._invoke_metered(
+        context=context,
+        provider=object(),
+        provider_id="provider-wall-boundary",
+        model_id=None,
+        operation="parse",
+        node="Tool",
+        operation_id="provider-wall-boundary",
+        invoke=invoke,
+        result_usage=lambda _result: None,
+        fallback_usage=ResourceUsage.zero(cost_known=True),
+    )
+
+    assert result == "ok"
+    assert usage.wall_seconds == 1.0
+
+
+async def test_cached_model_final_gate_releases_once_without_cache_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handlers = _owned_handlers(tmp_path)
+    current_config = config(
+        budget=RunBudget.preset("low").model_copy(update={"max_cost_usd": None})
+    )
+    clock = MutableMonotonic(0.0)
+    run_id = "run-cached-final-gate"
+    context = replace(
+        _runtime_context(
+            ticks=iter(()),
+            run_config=current_config,
+            run_id=run_id,
+            thread_id="thread-cached-final-gate",
+        ),
+        budget_accountant=BudgetAccountant(
+            current_config.budget,
+            run_scope=run_id,
+        ),
+        deadline=1.0,
+        monotonic=clock,
+    )
+    _bind_handler_runtime(handlers, context, graph_node="Plan")
+    provider = OfflineModel(_offline_plan())
+    request_value = _model_request(content="cached final gate")
+    key = _model_cache_key(provider, request_value)
+    assert handlers.cache.get(key) is None
+    original_reserve = context.budget_accountant.reserve
+    original_release = context.budget_accountant.release
+    release_calls = 0
+
+    def expire_after_reserve(*args: Any, **kwargs: Any) -> object:
+        reservation = original_reserve(*args, **kwargs)
+        clock.value = 1.0
+        return reservation
+
+    def observed_release(reservation: object) -> None:
+        nonlocal release_calls
+        release_calls += 1
+        original_release(cast("Any", reservation))
+
+    monkeypatch.setattr(context.budget_accountant, "reserve", expire_after_reserve)
+    monkeypatch.setattr(context.budget_accountant, "release", observed_release)
+    provider_calls = 0
+
+    async def invoke_provider() -> ModelResult[str]:
+        nonlocal provider_calls
+        provider_calls += 1
+        return await provider.complete(request_value)
+
+    with pytest.raises(ProviderError) as caught:
+        await cast("Any", handlers)._cached_model_call(
+            provider=provider,
+            request=request_value,
+            output_schema=None,
+            invoke=invoke_provider,
+        )
+
+    assert caught.value.code == "TIMEOUT"
+    assert release_calls == 1
+    assert provider_calls == 0
+    assert handlers.cache.get(key) is None
+    assert tuple((tmp_path / "cache").rglob("*.json")) == ()
+    assert context.audit.provider_calls == []
+    assert context.audit.provider_receipt_ids == []
+    assert context.audit.result_artifact_ids == []
+
+
+async def test_safe_node_prefers_cancellation_when_deadline_is_also_expired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deepresearch.workflow import runner as runner_module
+
+    current_config = config(
+        budget=RunBudget.preset("low").model_copy(update={"max_cost_usd": None})
+    )
+    run_id = "run-cancel-timeout-precedence"
+    thread_id = "thread-cancel-timeout-precedence"
+    accountant = BudgetAccountant(current_config.budget, run_scope=run_id)
+    token = CancellationToken()
+    token.cancel()
+    sink = MemoryEventSink()
+    fixed_now = datetime(2026, 9, 1, tzinfo=UTC)
+    context = BaselineRuntimeContext(
+        run_id=run_id,
+        thread_id=thread_id,
+        config=current_config,
+        emit=sink,
+        cancellation_token=token,
+        budget_accountant=accountant,
+        deadline=1.0,
+        run_started_monotonic=0.0,
+        run_started_at=fixed_now,
+        elapsed_base_seconds=0.0,
+        monotonic=lambda: 1.0,
+        utc_now=lambda: fixed_now,
+        new_id=lambda prefix: f"{prefix}-fixed",
+    )
+    state = cast("Any", runner_module)._initial_state(
+        run_id=run_id,
+        thread_id=thread_id,
+        config=current_config,
+        accountant=accountant,
+    )
+    before = accountant.snapshot()
+    monkeypatch.setattr(
+        baseline_graph_module,
+        "get_runtime",
+        lambda _schema: SimpleNamespace(context=context),
+    )
+    handler_calls = 0
+
+    async def forbidden_handler(_state: BaselineState) -> dict[str, object]:
+        nonlocal handler_calls
+        handler_calls += 1
+        return {}
+
+    safe = cast("Any", baseline_graph_module)._safe_node(
+        "ValidateRequest",
+        forbidden_handler,
+        audit_composition=None,
+    )
+    update = await safe(state)
+    event = await sink.get_event(run_id=run_id, seq=1)
+
+    assert handler_calls == 0
+    assert update["error_code"] == "CANCELLED"
+    assert update["failed_node"] == "ValidateRequest"
+    assert update["next_event_seq"] == 2
+    assert event is not None
+    assert event.error_code == "CANCELLED"
+    assert event.status == "cancelled"
+    assert accountant.snapshot() == before
+    assert context.audit.provider_calls == []
+    assert context.audit.provider_receipt_ids == []
+    assert context.audit.result_artifact_ids == []
+
+
+async def test_provider_gate_uses_recovered_offset_at_exact_effective_deadline() -> None:
+    handlers = _bare_handlers()
+    context = replace(
+        _runtime_context(ticks=iter(())),
+        deadline=273.0,
+        monotonic=MutableMonotonic(253.0),
+    )
+    context.elapsed_tracker.recover(
+        elapsed_wall_seconds=20.0,
+        elapsed_base_seconds=0.0,
+    )
+    context.audit.begin(graph_node="ParseAndNormalize", node_attempt=1)
+    before = context.budget_accountant.snapshot()
+    provider_calls = 0
+
+    async def invoke() -> str:
+        nonlocal provider_calls
+        provider_calls += 1
+        return "unexpected"
+
+    with pytest.raises(ProviderError) as caught:
+        await cast("Any", handlers)._invoke_metered(
+            context=context,
+            provider=object(),
+            provider_id="recovered-offset-provider",
+            model_id=None,
+            operation="parse",
+            node="Tool",
+            operation_id="recovered-offset-timeout",
+            invoke=invoke,
+            result_usage=lambda _result: ResourceUsage.zero(cost_known=True),
+            fallback_usage=ResourceUsage.zero(cost_known=True),
+        )
+
+    assert caught.value.code == "TIMEOUT"
+    assert provider_calls == 0
+    assert context.budget_accountant.snapshot() == before
+    assert context.audit.provider_calls == []
+    assert context.audit.provider_receipt_ids == []
+    assert context.audit.result_artifact_ids == []
+
+
+@pytest.mark.parametrize("operation", ["search", "fetch"])
+async def test_untyped_provider_receives_recovered_effective_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    handlers = _owned_handlers(tmp_path)
+    current_config = config(
+        budget=RunBudget.preset("low").model_copy(update={"max_cost_usd": None})
+    )
+    context = replace(
+        _runtime_context(
+            ticks=iter(()),
+            run_config=current_config,
+            run_id=f"run-untyped-{operation}-deadline",
+            thread_id=f"thread-untyped-{operation}-deadline",
+        ),
+        budget_accountant=BudgetAccountant(
+            current_config.budget,
+            run_scope=f"run-untyped-{operation}-deadline",
+        ),
+        deadline=273.0,
+        monotonic=MutableMonotonic(252.0),
+    )
+    context.elapsed_tracker.recover(
+        elapsed_wall_seconds=20.0,
+        elapsed_base_seconds=0.0,
+    )
+    _bind_handler_runtime(
+        handlers,
+        context,
+        graph_node="Search" if operation == "search" else "Fetch",
+    )
+    observed_deadlines: list[float] = []
+
+    if operation == "search":
+        class UntypedSearch:
+            provider_id = "untyped-search"
+
+            async def search(
+                self,
+                _query: str,
+                _limit: int,
+                _filters: object,
+                *,
+                deadline: float,
+                cancellation_token: CancellationToken,
+            ) -> list[SearchHit]:
+                cancellation_token.raise_if_cancelled()
+                observed_deadlines.append(deadline)
+                return [
+                    SearchHit(
+                        url="https://untyped.example.test/doc",
+                        title="Untyped search",
+                        snippet="offline",
+                        rank=1,
+                    )
+                ]
+
+        handlers.search_provider = cast("Any", UntypedSearch())
+
+        async def fixed_queries(
+            _context: object,
+            _invoke: object,
+        ) -> tuple[str, ...]:
+            return ("offline baseline query",)
+
+        monkeypatch.setattr(handlers, "_isolated_planner_call", fixed_queries)
+        plan = handlers.artifact_store.put_bytes(
+            json.dumps(
+                _offline_plan(),
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode(),
+            media_type="application/vnd.deepresearch.plan+json",
+        )
+        await handlers.search(
+            cast(
+                "Any",
+                {
+                    "run_id": context.run_id,
+                    "plan_artifact_id": plan.artifact_id,
+                    "active_subquestion_id": "sq-offline",
+                    "baseline_work_artifact_ids": (),
+                },
+            )
+        )
+    else:
+        class UntypedFetcher:
+            provider_id = "untyped-fetch"
+
+            async def fetch(
+                self,
+                url: str,
+                *,
+                deadline: float,
+                cancellation_token: CancellationToken,
+            ) -> RawDocument:
+                cancellation_token.raise_if_cancelled()
+                observed_deadlines.append(deadline)
+                return RawDocument(
+                    requested_url=url,
+                    final_url=url,
+                    status=200,
+                    headers={"content-type": "text/html"},
+                    content_type="text/html",
+                    body_bytes=b"untyped fetch",
+                    retrieved_at=datetime(2026, 9, 1, tzinfo=UTC),
+                )
+
+        handlers.fetcher = cast("Any", UntypedFetcher())
+        search_work = handlers.artifact_store.put_bytes(
+            json.dumps(
+                {
+                    "hits": [
+                        SearchHit(
+                            url="https://untyped.example.test/doc",
+                            title="Untyped fetch",
+                            snippet="offline",
+                            rank=1,
+                        ).model_dump(mode="json")
+                    ],
+                    "kind": "search",
+                },
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode(),
+            media_type="application/vnd.deepresearch.baseline-work+json",
+        )
+        await handlers.fetch(
+            cast(
+                "Any",
+                {
+                    "run_id": context.run_id,
+                    "baseline_work_artifact_ids": (search_work.artifact_id,),
+                },
+            )
+        )
+
+    assert observed_deadlines == [253.0]
+    assert len(context.audit.provider_calls) == 1
+    assert context.audit.provider_calls[0].outcome_code == "SUCCESS"
 
 
 async def test_usage_observer_mismatch_settles_inner_usage_once_then_fails() -> None:
@@ -1312,7 +2741,7 @@ async def test_hard_primary_is_not_masked_by_observer_cleanup_failure() -> None:
 
 
 async def test_untyped_usage_measures_injected_elapsed_time() -> None:
-    context = _runtime_context(ticks=iter((4.0, 6.5)))
+    context = _runtime_context(ticks=iter((0.0, 4.0, 6.5)))
     result, usage = await cast("Any", _bare_handlers())._invoke_metered(
         context=context,
         provider=object(),
@@ -3480,7 +4909,10 @@ async def _run_failure_after_evidence(
         cast("Any", mutate)(handlers)
     saver = InMemorySaver(serde=checkpoint_serializer())
     graph = build_baseline_graph(handlers.as_dependencies(checkpointer=saver))
-    clock = SegmentClock(0)
+    clock = ControlledSegmentClock(
+        monotonic_start=time.monotonic(),
+        utc_offset_seconds=0.0,
+    )
     runner = LangGraphResearchRunner(
         baseline_graph=graph,
         runtime_hooks=BaselineRuntimeHooks(
@@ -3553,6 +4985,788 @@ async def test_failure_after_evidence_event_readback_routes_once_to_persistence(
     )
 
 
+@pytest.mark.parametrize(
+    ("target_node", "target_seq", "keeps_report"),
+    [
+        ("DraftReport", 10, False),
+        ("FinalizeCitations", 11, True),
+    ],
+)
+async def test_prewrite_event_failure_after_evidence_persists_once_at_same_seq(
+    tmp_path: Path,
+    target_node: str,
+    target_seq: int,
+    keeps_report: bool,
+) -> None:
+    sink = OneShotPreWriteFailureSink(target_node=target_node)
+    result_value, handlers, invocations, persist_entries, returned_sink = (
+        await _run_failure_after_evidence(tmp_path, sink=sink)
+    )
+    result = cast("Any", result_value)
+
+    assert returned_sink is sink
+    assert sink.failed is True
+    attempted_success = next(
+        event
+        for event in sink.attempts
+        if event.node == target_node and event.error_code is None
+    )
+    assert sink.authoritative_reads
+    assert sink.authoritative_reads[0] is None
+    stored_target_events = [
+        event for event in sink.events.values() if event.node == target_node
+    ]
+    assert len(stored_target_events) == 1
+    failure_event = stored_target_events[0]
+    assert attempted_success.seq == target_seq
+    assert failure_event.seq == attempted_success.seq
+    assert failure_event.status == "failed"
+    assert failure_event.error_code == "DATA_CORRUPTION"
+    assert not any(
+        event.node == target_node and event.error_code is None
+        for event in sink.events.values()
+    )
+    assert sink.authoritative_reads[-1] == failure_event
+
+    node_receipts = [
+        (artifact_id, receipt)
+        for artifact_id in failure_event.artifact_ids
+        if (
+            receipt := cast("Any", baseline_graph_module)._load_audit_receipt(
+                handlers.artifact_store,
+                artifact_id,
+            )
+        )
+        is not None
+        and receipt.kind == "node-execution"
+    ]
+    assert len(node_receipts) == 1
+    failure_receipt_id, failure_receipt = node_receipts[0]
+    receipt_state = cast("Any", baseline_graph_module)._state_from_payload(
+        failure_receipt.payload["state"]
+    )
+    execution = NodeExecutionRecord.model_validate_json(
+        json.dumps(
+            failure_receipt.payload["record"],
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        strict=True,
+    )
+    receipt_event = cast("Any", baseline_graph_module)._run_event_from_receipt_payload(
+        failure_receipt.payload["event"]
+    )
+    assert receipt_state["next_event_seq"] == target_seq
+    assert receipt_state["error_code"] == "DATA_CORRUPTION"
+    assert receipt_state["failed_node"] == target_node
+    assert execution.attempt == 1
+    assert execution.status == "failed"
+    assert execution.error_code == "DATA_CORRUPTION"
+    assert execution.output_artifact_ids == receipt_event.artifact_ids
+    assert failure_event.artifact_ids == tuple(
+        dict.fromkeys((*receipt_event.artifact_ids, failure_receipt_id))
+    )
+    provider_receipt_ids = failure_receipt.payload["provider_receipt_ids"]
+    child_receipt_ids = failure_receipt.payload["child_receipt_ids"]
+    assert type(provider_receipt_ids) is list
+    assert type(child_receipt_ids) is list
+    assert len(provider_receipt_ids) == (1 if target_node == "DraftReport" else 0)
+    assert len(set(cast("list[str]", child_receipt_ids))) == len(child_receipt_ids)
+    assert set(cast("list[str]", child_receipt_ids)).issubset(
+        receipt_state["baseline_work_artifact_ids"]
+    )
+    terminal_receipts = [
+        receipt
+        for artifact_id in cast("list[str]", child_receipt_ids)
+        if (
+            receipt := cast("Any", baseline_graph_module)._load_audit_receipt(
+                handlers.artifact_store,
+                artifact_id,
+            )
+        )
+        is not None
+        and receipt.kind == "terminal"
+    ]
+    assert len(terminal_receipts) == 1
+    terminal = terminal_receipts[0]
+    assert terminal.payload == {
+        "error_code": "DATA_CORRUPTION",
+        "elapsed_wall_seconds": receipt_state["elapsed_wall_seconds"],
+        "finished_at": execution.finished_at.isoformat(),
+        "terminal_event_seq": target_seq,
+    }
+    assert receipt_event.seq == target_seq
+    assert receipt_event.timestamp == execution.finished_at
+    assert receipt_event.error_code == execution.error_code
+    assert receipt_event.usage_delta == attempted_success.usage_delta
+    provisional_receipt_ids = [
+        artifact_id
+        for artifact_id in attempted_success.artifact_ids
+        if (
+            receipt := cast("Any", baseline_graph_module)._load_audit_receipt(
+                handlers.artifact_store,
+                artifact_id,
+            )
+        )
+        is not None
+        and receipt.kind == "node-execution"
+    ]
+    assert len(provisional_receipt_ids) == 1
+    assert provisional_receipt_ids[0] != failure_receipt_id
+    assert provisional_receipt_ids[0] not in receipt_state["baseline_work_artifact_ids"]
+    provisional_receipt = cast("Any", baseline_graph_module)._load_audit_receipt(
+        handlers.artifact_store,
+        provisional_receipt_ids[0],
+    )
+    assert provisional_receipt is not None
+    provisional_terminal_ids = [
+        artifact_id
+        for artifact_id in provisional_receipt.payload["child_receipt_ids"]
+        if (
+            child := cast("Any", baseline_graph_module)._load_audit_receipt(
+                handlers.artifact_store,
+                artifact_id,
+            )
+        )
+        is not None
+        and child.kind == "terminal"
+    ]
+    assert len(provisional_terminal_ids) == (
+        1 if target_node == "FinalizeCitations" else 0
+    )
+    assert set(provisional_terminal_ids).isdisjoint(child_receipt_ids)
+    assert set(provisional_terminal_ids).isdisjoint(
+        receipt_state["baseline_work_artifact_ids"]
+    )
+    for provider_receipt_id in cast("list[str]", provider_receipt_ids):
+        provider_receipt = cast("Any", baseline_graph_module)._load_audit_receipt(
+            handlers.artifact_store,
+            provider_receipt_id,
+        )
+        assert provider_receipt is not None
+        assert provider_receipt.kind == "provider-call"
+        for result_id in provider_receipt.payload["result_artifact_ids"]:
+            assert result_id in execution.output_artifact_ids
+            assert result_id in receipt_event.artifact_ids
+            assert result_id in failure_event.artifact_ids
+
+    persist_events = [
+        event for event in sink.events.values() if event.node == "PersistResults"
+    ]
+    assert len(persist_events) == 1
+    assert persist_events[0].seq == target_seq + 1
+    persist_receipt = next(
+        receipt
+        for artifact_id in persist_events[0].artifact_ids
+        if (
+            receipt := cast("Any", baseline_graph_module)._load_audit_receipt(
+                handlers.artifact_store,
+                artifact_id,
+            )
+        )
+        is not None
+        and receipt.kind == "node-execution"
+    )
+    persist_state = cast("Any", baseline_graph_module)._state_from_payload(
+        persist_receipt.payload["state"]
+    )
+    assert set(provisional_terminal_ids).isdisjoint(
+        persist_state["baseline_work_artifact_ids"]
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "DATA_CORRUPTION"
+    assert sum(invocations.values()) == 9
+    assert invocations["model:baseline-writer-v1"] == 1
+    assert persist_entries == Counter({"persist-results": 1})
+    assert result.evidence_graph_artifact_id is not None
+    assert result.manifest_artifact_id is not None
+    assert (result.report_artifact_id is not None) is keeps_report
+    handlers.artifact_store.get_bytes(result.evidence_graph_artifact_id)
+    if result.report_artifact_id is not None:
+        handlers.artifact_store.get_bytes(result.report_artifact_id)
+
+    manifest = RunManifest.model_validate_json(
+        handlers.artifact_store.get_bytes(result.manifest_artifact_id),
+        strict=True,
+    )
+    executions = [
+        execution
+        for execution in manifest.node_executions
+        if execution.node == target_node
+    ]
+    assert len(executions) == 1
+    assert executions[0].attempt == 1
+    assert executions[0].status == "failed"
+    assert executions[0].error_code == "DATA_CORRUPTION"
+    assert manifest.failure_codes == ("DATA_CORRUPTION",)
+    assert manifest.run_event_count == target_seq
+    assert set(provisional_terminal_ids).isdisjoint(manifest.artifact_ids)
+    assert len(
+        [call for call in manifest.provider_calls if call.node == "DraftReport"]
+    ) == 1
+    assert len(
+        [call for call in manifest.provider_calls if call.node == target_node]
+    ) == (1 if target_node == "DraftReport" else 0)
+    durable_events = [
+        sink.events[("run-failure-after-evidence", seq)]
+        for seq in range(1, target_seq + 1)
+    ]
+    assert FilesystemEventSink._bytes(durable_events[-1]) == (
+        FilesystemEventSink._bytes(failure_event)
+    )
+    assert manifest.run_events_sha256 == hashlib.sha256(
+        json.dumps(
+            [event.model_dump(mode="json") for event in durable_events],
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    graph_payload = json.loads(
+        handlers.artifact_store.get_bytes(result.evidence_graph_artifact_id)
+    )
+    assert {
+        item["evidence_id"] for item in graph_payload["evidence"]
+    } == {item.evidence_id for item in manifest.evidence_hashes}
+    assert {item["source_id"] for item in graph_payload["sources"]} == {
+        item.source_id for item in manifest.parsed_artifacts
+    }
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["conflict", "constructed-corruption", "unreadable"],
+)
+async def test_prewrite_event_failure_requires_authoritative_exact_absence(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    sink = ClassifiedPreWriteFailureSink(
+        target_node="DraftReport",
+        mode=mode,
+    )
+    result_value, _, invocations, persist_entries, _ = (
+        await _run_failure_after_evidence(tmp_path, sink=sink)
+    )
+    result = cast("Any", result_value)
+
+    target_attempts = [
+        event for event in sink.attempts if event.node == "DraftReport"
+    ]
+    assert len(target_attempts) == 1
+    assert target_attempts[0].error_code is None
+    assert sink.boundary_reads == 1
+    assert not any(event.node == "DraftReport" for event in sink.events.values())
+    assert not any(
+        event.error_code == "DATA_CORRUPTION" for event in sink.attempts
+    )
+    assert result.status == "failed"
+    assert result.error_code == "DATA_CORRUPTION"
+    assert sum(invocations.values()) == 9
+    assert persist_entries == Counter()
+    assert result.evidence_graph_artifact_id is None
+    assert result.manifest_artifact_id is None
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_boundary_reads"),
+    [
+        ("replacement-call-ordinary-stored", 3),
+        ("replacement-readback-ordinary", 4),
+    ],
+)
+async def test_prewrite_replacement_ordinary_failure_accepts_bounded_exact_reread(
+    tmp_path: Path,
+    mode: str,
+    expected_boundary_reads: int,
+) -> None:
+    sink = ClassifiedPreWriteFailureSink(
+        target_node="DraftReport",
+        mode=mode,
+    )
+    result_value, _, invocations, persist_entries, _ = (
+        await _run_failure_after_evidence(tmp_path, sink=sink)
+    )
+    result = cast("Any", result_value)
+
+    assert sink.boundary_reads == expected_boundary_reads
+    target_attempts = [
+        event for event in sink.attempts if event.node == "DraftReport"
+    ]
+    assert len(target_attempts) == 2
+    assert target_attempts[0].error_code is None
+    assert target_attempts[1].error_code == "DATA_CORRUPTION"
+    assert sink.events[(target_attempts[1].run_id, target_attempts[1].seq)] == (
+        target_attempts[1]
+    )
+    assert result.status == "failed"
+    assert result.error_code == "DATA_CORRUPTION"
+    assert sum(invocations.values()) == 9
+    assert persist_entries == Counter({"persist-results": 1})
+    assert result.evidence_graph_artifact_id is not None
+    assert result.manifest_artifact_id is not None
+
+
+async def test_prewrite_replacement_ordinary_failure_without_durable_event_fails_closed(
+    tmp_path: Path,
+) -> None:
+    sink = ClassifiedPreWriteFailureSink(
+        target_node="DraftReport",
+        mode="replacement-call-ordinary-absent",
+    )
+    result_value, _, invocations, persist_entries, _ = (
+        await _run_failure_after_evidence(tmp_path, sink=sink)
+    )
+    result = cast("Any", result_value)
+
+    assert sink.boundary_reads == 2
+    target_attempts = [
+        event for event in sink.attempts if event.node == "DraftReport"
+    ]
+    assert len(target_attempts) == 2
+    assert target_attempts[1].error_code == "DATA_CORRUPTION"
+    assert not any(event.node == "DraftReport" for event in sink.events.values())
+    assert result.status == "failed"
+    assert result.error_code == "DATA_CORRUPTION"
+    assert sum(invocations.values()) == 9
+    assert persist_entries == Counter()
+    assert result.evidence_graph_artifact_id is None
+    assert result.manifest_artifact_id is None
+
+
+@pytest.mark.parametrize(
+    ("store_before_failure", "expected_attempts"),
+    [(False, 2), (True, 1)],
+)
+async def test_prewrite_existing_primary_accepts_exact_failed_event_at_same_slot(
+    tmp_path: Path,
+    store_before_failure: bool,
+    expected_attempts: int,
+) -> None:
+    def fail_draft(handlers: BaselineNodeHandlers) -> None:
+        def fail_render_prompt(**_kwargs: object) -> str:
+            raise OSError("draft dependency failed")
+
+        handlers.writer.render_prompt = cast("Any", fail_render_prompt)
+
+    sink = FailedEventPreWriteFailureSink(
+        target_node="DraftReport",
+        error_code="INTERNAL_ERROR",
+        store_before_failure=store_before_failure,
+    )
+    result_value, _, invocations, persist_entries, _ = (
+        await _run_failure_after_evidence(
+            tmp_path,
+            mutate=fail_draft,
+            sink=sink,
+        )
+    )
+    result = cast("Any", result_value)
+
+    assert (sink.authoritative_reads[0] is None) is not store_before_failure
+    assert len(sink.attempts) == expected_attempts
+    assert all(event == sink.attempts[0] for event in sink.attempts)
+    assert sink.attempts[0].seq == 10
+    assert sink.attempts[0].error_code == "INTERNAL_ERROR"
+    assert sink.events[(sink.attempts[0].run_id, 10)] == sink.attempts[0]
+    assert result.status == "failed"
+    assert result.error_code == "INTERNAL_ERROR"
+    assert sum(invocations.values()) == 8
+    assert persist_entries == Counter({"persist-results": 1})
+    assert result.evidence_graph_artifact_id is not None
+    assert result.manifest_artifact_id is not None
+
+
+@pytest.mark.parametrize(
+    "wall_seconds",
+    [pytest.param(0, id="coercion-equal-int"), pytest.param(-0.0, id="negative-zero")],
+)
+async def test_immediate_non_none_constructed_event_fails_closed_without_reread(
+    tmp_path: Path,
+    wall_seconds: object,
+) -> None:
+    sink = ImmediateConstructedReadbackSink(
+        target_node="DraftReport",
+        wall_seconds=wall_seconds,
+    )
+    result_value, _, invocations, persist_entries, _ = (
+        await _run_failure_after_evidence(tmp_path, sink=sink)
+    )
+    result = cast("Any", result_value)
+
+    assert sink.boundary_reads == 1
+    assert result.status == "failed"
+    assert result.error_code == "DATA_CORRUPTION"
+    assert sum(invocations.values()) == 9
+    assert persist_entries == Counter()
+    assert result.evidence_graph_artifact_id is None
+    assert result.manifest_artifact_id is None
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "initial-call-hard",
+        "authoritative-read-hard",
+        "replacement-call-hard",
+        "replacement-readback-hard",
+    ],
+)
+async def test_prewrite_failure_transition_preserves_hard_exception_identity(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    primary = MemoryError(f"hard {mode}")
+    sink = ClassifiedPreWriteFailureSink(
+        target_node="DraftReport",
+        mode=mode,
+        primary=primary,
+    )
+
+    with pytest.raises(MemoryError) as caught:
+        await _run_failure_after_evidence(tmp_path, sink=sink)
+
+    assert caught.value is primary
+    target_attempts = [
+        event for event in sink.attempts if event.node == "DraftReport"
+    ]
+    assert len(target_attempts) == (
+        1
+        if mode in {"initial-call-hard", "authoritative-read-hard"}
+        else 2
+    )
+    assert target_attempts[0].error_code is None
+    assert not any(event.node == "PersistResults" for event in sink.events.values())
+    if mode == "replacement-readback-hard":
+        assert sink.events[(target_attempts[-1].run_id, target_attempts[-1].seq)] == (
+            target_attempts[-1]
+        )
+    else:
+        assert not any(
+            event.node == "DraftReport" for event in sink.events.values()
+        )
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "initial-call-hard",
+        "authoritative-read-hard",
+        "replacement-call-hard",
+        "replacement-readback-hard",
+    ],
+)
+async def test_prewrite_failure_transition_preserves_cancelled_identity_at_runner(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    primary = asyncio.CancelledError(f"hard {mode}")
+    sink = ClassifiedPreWriteFailureSink(
+        target_node="DraftReport",
+        mode=mode,
+        primary=primary,
+    )
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await _run_failure_after_evidence(tmp_path, sink=sink)
+
+    assert caught.value is primary
+    assert not any(event.node == "PersistResults" for event in sink.events.values())
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ["call", "immediate-read", "authoritative-read"],
+)
+@pytest.mark.parametrize(
+    "hard_type",
+    [asyncio.CancelledError, MemoryError, KeyboardInterrupt, SystemExit],
+)
+async def test_event_publication_classifier_preserves_hard_exception_identity(
+    boundary: str,
+    hard_type: type[BaseException],
+) -> None:
+    primary = hard_type(f"hard publication {boundary}")
+
+    class HardBoundarySink:
+        async def __call__(self, _event: RunEvent) -> None:
+            if boundary == "call":
+                raise primary
+            if boundary == "authoritative-read":
+                raise OSError("ordinary create failure")
+
+        async def get_event(self, *, run_id: str, seq: int) -> RunEvent | None:
+            del run_id, seq
+            if boundary == "immediate-read":
+                raise primary
+            if boundary == "authoritative-read":
+                raise primary
+            raise AssertionError("unexpected durable event read")
+
+    event = cast("Any", baseline_graph_module)._EVENT_PAYLOAD_PROBE
+    with pytest.raises(hard_type) as caught:
+        await cast("Any", baseline_graph_module)._publish_event_with_bounded_recovery(
+            sink=HardBoundarySink(),
+            event=event,
+        )
+
+    assert caught.value is primary
+
+
+@pytest.mark.parametrize("receipt_boundary", ["terminal", "node-execution"])
+@pytest.mark.parametrize(
+    "hard_type",
+    [asyncio.CancelledError, MemoryError, KeyboardInterrupt, SystemExit],
+)
+async def test_replacement_receipt_storage_preserves_hard_exception_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    receipt_boundary: str,
+    hard_type: type[BaseException],
+) -> None:
+    sink = OneShotPreWriteFailureSink(target_node="DraftReport")
+    captured: dict[str, object] = {}
+    capture_primary = MemoryError("capture replacement transition inputs")
+    original_transition = cast(
+        "Any",
+        baseline_graph_module,
+    )._publish_missing_event_failure_transition
+
+    async def capture_transition(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        raise capture_primary
+
+    monkeypatch.setattr(
+        baseline_graph_module,
+        "_publish_missing_event_failure_transition",
+        capture_transition,
+    )
+    with pytest.raises(MemoryError) as captured_error:
+        await _run_failure_after_evidence(tmp_path, sink=sink)
+    assert captured_error.value is capture_primary
+    assert captured
+    audit = cast("Any", captured["audit"])
+    provider_calls_before = tuple(audit.provider_calls)
+    provider_receipts_before = tuple(audit.provider_receipt_ids)
+    assert len(provider_calls_before) == 1
+    assert len(provider_receipts_before) == 1
+    monkeypatch.setattr(
+        baseline_graph_module,
+        "_publish_missing_event_failure_transition",
+        original_transition,
+    )
+    original_put = cast("Any", baseline_graph_module)._put_audit_receipt
+    primary = hard_type(f"hard replacement {receipt_boundary} receipt")
+
+    def hard_receipt_put(*args: object, **kwargs: object) -> str:
+        kind = kwargs.get("kind")
+        payload = cast("Mapping[str, object]", kwargs.get("payload"))
+        record = payload.get("record")
+        is_failure_node = (
+            kind == "node-execution"
+            and isinstance(record, dict)
+            and record.get("error_code") == "DATA_CORRUPTION"
+        )
+        if (
+            receipt_boundary == "terminal"
+            and kind == "terminal"
+            and payload.get("error_code") == "DATA_CORRUPTION"
+        ) or (receipt_boundary == "node-execution" and is_failure_node):
+            raise primary
+        return cast("str", original_put(*args, **kwargs))
+
+    monkeypatch.setattr(
+        baseline_graph_module,
+        "_put_audit_receipt",
+        hard_receipt_put,
+    )
+    with pytest.raises(hard_type) as caught:
+        await original_transition(**captured)
+
+    assert caught.value is primary
+    assert tuple(audit.provider_calls) == provider_calls_before
+    assert tuple(audit.provider_receipt_ids) == provider_receipts_before
+    assert not any(
+        event.error_code == "DATA_CORRUPTION" for event in sink.attempts
+    )
+    assert not any(event.node == "PersistResults" for event in sink.events.values())
+    restored = cast("Mapping[str, object]", captured["restored"])
+    assert restored["next_event_seq"] == 10
+
+
+async def test_sqlite_resume_reuses_prewrite_replacement_without_writer_repeat(
+    tmp_path: Path,
+) -> None:
+    root = (tmp_path / "prewrite-replacement-resume").resolve()
+    event_root = (root / "events").resolve()
+    checkpoint_path = (root / "checkpoints.sqlite3").resolve()
+    run_id = "run-prewrite-replacement-resume"
+    thread_id = "thread-prewrite-replacement-resume"
+    invocations: Counter[str] = Counter()
+    persist_entries: Counter[str] = Counter()
+    primary = MemoryError("crash after replacement event publication")
+
+    class CrashAfterReplacementSink(FilesystemEventSink):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.target_key: tuple[str, int] | None = None
+            self.prewrite_failed = False
+            self.absence_reads = 0
+            self.replacement: RunEvent | None = None
+
+        async def __call__(self, event: RunEvent) -> None:
+            if (
+                event.node == "DraftReport"
+                and event.error_code is None
+                and not self.prewrite_failed
+            ):
+                self.target_key = (event.run_id, event.seq)
+                self.prewrite_failed = True
+                raise OSError("draft event failed before write")
+            await super().__call__(event)
+            if (
+                self.target_key == (event.run_id, event.seq)
+                and event.error_code == "DATA_CORRUPTION"
+                and self.replacement is None
+            ):
+                self.replacement = event
+                raise primary
+
+        async def get_event(self, *, run_id: str, seq: int) -> RunEvent | None:
+            event = await super().get_event(run_id=run_id, seq=seq)
+            if (
+                self.prewrite_failed
+                and self.target_key == (run_id, seq)
+                and event is None
+            ):
+                self.absence_reads += 1
+            return event
+
+    handlers_a = _recovery_composition(
+        root,
+        invocations=invocations,
+        persist_entries=persist_entries,
+    )
+    current_config = _recovery_config(handlers_a)
+    sink_a = CrashAfterReplacementSink(event_root)
+    clock_a = ControlledSegmentClock(
+        monotonic_start=time.monotonic(),
+        utc_offset_seconds=0.0,
+    )
+    async with open_sqlite_checkpointer(checkpoint_path) as saver_a:
+        graph_a = build_baseline_graph(
+            handlers_a.as_dependencies(checkpointer=saver_a)
+        )
+        runner_a = LangGraphResearchRunner(
+            baseline_graph=graph_a,
+            runtime_hooks=BaselineRuntimeHooks(
+                monotonic=clock_a.monotonic,
+                utc_now=clock_a.utc_now,
+            ),
+        )
+        with pytest.raises(MemoryError) as caught:
+            await runner_a.run(
+                run_id=run_id,
+                thread_id=thread_id,
+                config=current_config,
+                checkpoint=None,
+                emit=sink_a,
+                cancellation_token=CancellationToken(),
+            )
+        assert caught.value is primary
+        saved_a = await saver_a.aget_tuple(
+            {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+        )
+        assert saved_a is not None
+        checkpoint = checkpoint_ref_from_tuple(saved_a)
+        saved_values = cast("Any", saved_a).checkpoint["channel_values"]
+        assert saved_values["next_event_seq"] == 10
+
+    assert sink_a.absence_reads == 1
+    assert sink_a.replacement is not None
+    replacement = sink_a.replacement
+    assert replacement.seq == 10
+    assert replacement.error_code == "DATA_CORRUPTION"
+    replacement_bytes = FilesystemEventSink._bytes(replacement)
+    assert sum(invocations.values()) == 9
+    assert invocations["model:baseline-writer-v1"] == 1
+    assert persist_entries == Counter()
+    replacement_receipt = next(
+        receipt
+        for artifact_id in replacement.artifact_ids
+        if (
+            receipt := cast("Any", baseline_graph_module)._load_audit_receipt(
+                handlers_a.artifact_store,
+                artifact_id,
+            )
+        )
+        is not None
+        and receipt.kind == "node-execution"
+    )
+    replacement_state = cast("Any", baseline_graph_module)._state_from_payload(
+        replacement_receipt.payload["state"]
+    )
+    assert replacement_state["next_event_seq"] == 10
+
+    handlers_b = _recovery_composition(
+        root,
+        invocations=invocations,
+        persist_entries=persist_entries,
+    )
+    sink_b = FilesystemEventSink(event_root)
+    clock_b = ControlledSegmentClock(
+        monotonic_start=time.monotonic(),
+        utc_offset_seconds=10.0,
+    )
+    async with open_sqlite_checkpointer(checkpoint_path) as saver_b:
+        exact = await saver_b.aget_tuple(checkpoint_config(checkpoint))
+        assert exact is not None
+        assert checkpoint_ref_from_tuple(exact) == checkpoint
+        graph_b = build_baseline_graph(
+            handlers_b.as_dependencies(checkpointer=saver_b)
+        )
+        result = await LangGraphResearchRunner(
+            baseline_graph=graph_b,
+            runtime_hooks=BaselineRuntimeHooks(
+                monotonic=clock_b.monotonic,
+                utc_now=clock_b.utc_now,
+            ),
+        ).run(
+            run_id=run_id,
+            thread_id=thread_id,
+            config=current_config,
+            checkpoint=checkpoint,
+            emit=sink_b,
+            cancellation_token=CancellationToken(),
+        )
+
+    reread = await sink_b.get_event(run_id=run_id, seq=10)
+    assert reread == replacement
+    assert FilesystemEventSink._bytes(cast("RunEvent", reread)) == replacement_bytes
+    persist_event = await sink_b.get_event(run_id=run_id, seq=11)
+    assert persist_event is not None
+    assert persist_event.node == "PersistResults"
+    assert result.status == "failed"
+    assert result.error_code == "DATA_CORRUPTION"
+    assert sum(invocations.values()) == 9
+    assert invocations["model:baseline-writer-v1"] == 1
+    assert persist_entries == Counter({"persist-results": 1})
+    assert result.evidence_graph_artifact_id is not None
+    assert result.manifest_artifact_id is not None
+    manifest = RunManifest.model_validate_json(
+        handlers_b.artifact_store.get_bytes(result.manifest_artifact_id),
+        strict=True,
+    )
+    assert manifest.failure_codes == ("DATA_CORRUPTION",)
+    assert len(
+        [call for call in manifest.provider_calls if call.node == "DraftReport"]
+    ) == 1
+
+
 async def _clean_ledger_checkpoint(
     tmp_path: Path,
     *,
@@ -3569,7 +5783,10 @@ async def _clean_ledger_checkpoint(
     saver = InMemorySaver(serde=checkpoint_serializer())
     graph = build_baseline_graph(handlers.as_dependencies(checkpointer=saver))
     sink = MemoryEventSink()
-    clock = SegmentClock(0)
+    clock = ControlledSegmentClock(
+        monotonic_start=time.monotonic(),
+        utc_offset_seconds=0.0,
+    )
     result = await LangGraphResearchRunner(
         baseline_graph=graph,
         runtime_hooks=BaselineRuntimeHooks(
@@ -3995,7 +6212,10 @@ async def test_manifest_two_loop_shared_sources_have_one_typed_owner_per_identit
     saver = InMemorySaver(serde=checkpoint_serializer())
     graph = build_baseline_graph(handlers.as_dependencies(checkpointer=saver))
     sink = MemoryEventSink()
-    clock = SegmentClock(0)
+    clock = ControlledSegmentClock(
+        monotonic_start=time.monotonic(),
+        utc_offset_seconds=0.0,
+    )
     result = await LangGraphResearchRunner(
         baseline_graph=graph,
         runtime_hooks=BaselineRuntimeHooks(
@@ -4165,7 +6385,10 @@ async def test_manifest_missing_or_changed_immediate_readback_is_not_published(
     monkeypatch.setattr(handlers.artifact_store, "get_bytes", selective_get)
     saver = InMemorySaver(serde=checkpoint_serializer())
     graph = build_baseline_graph(handlers.as_dependencies(checkpointer=saver))
-    clock = SegmentClock(0)
+    clock = ControlledSegmentClock(
+        monotonic_start=time.monotonic(),
+        utc_offset_seconds=0.0,
+    )
     result = await LangGraphResearchRunner(
         baseline_graph=graph,
         runtime_hooks=BaselineRuntimeHooks(
@@ -4229,7 +6452,10 @@ async def test_real_sqlite_filesystem_recovery_reuses_operation_and_event(
     )
     config_a = _recovery_config(handlers_a)
     sink_a = FilesystemEventSink(event_root)
-    clock_a = SegmentClock(0)
+    clock_a = ControlledSegmentClock(
+        monotonic_start=time.monotonic(),
+        utc_offset_seconds=0.0,
+    )
     async with open_sqlite_checkpointer(checkpoint_path) as saver_a:
         graph_a = build_baseline_graph(
             handlers_a.as_dependencies(checkpointer=saver_a)
@@ -4282,7 +6508,10 @@ async def test_real_sqlite_filesystem_recovery_reuses_operation_and_event(
     config_b = _recovery_config(handlers_b)
     assert config_b == config_a
     sink_b = FilesystemEventSink(event_root, crash_after_node=event_node)
-    clock_b = SegmentClock(1)
+    clock_b = ControlledSegmentClock(
+        monotonic_start=time.monotonic(),
+        utc_offset_seconds=5.0,
+    )
     async with open_sqlite_checkpointer(checkpoint_path) as saver_b:
         exact_a = await saver_b.aget_tuple(checkpoint_config(ref_a))
         assert exact_a is not None
@@ -4339,7 +6568,10 @@ async def test_real_sqlite_filesystem_recovery_reuses_operation_and_event(
         persist_entries=persist_entries,
     )
     sink_c = FilesystemEventSink(event_root)
-    clock_c = SegmentClock(2)
+    clock_c = ControlledSegmentClock(
+        monotonic_start=time.monotonic(),
+        utc_offset_seconds=10.0,
+    )
     async with open_sqlite_checkpointer(checkpoint_path) as saver_c:
         exact_c = await saver_c.aget_tuple(checkpoint_config(ref_a))
         assert exact_c is not None
@@ -4419,6 +6651,440 @@ async def test_real_sqlite_filesystem_recovery_reuses_operation_and_event(
     ):
         assert artifact_id is not None
         assert reopened_store.get_bytes(artifact_id)
+
+
+@pytest.mark.parametrize(
+    ("second_segment_seconds", "expect_completed"),
+    [(20.0, True), (173.0, False)],
+)
+async def test_recovered_durable_wall_shortens_every_provider_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    second_segment_seconds: float,
+    expect_completed: bool,
+) -> None:
+    root = (tmp_path / f"wall-{second_segment_seconds}").resolve()
+    event_root = (root / "events").resolve()
+    checkpoint_path = (root / "checkpoints.sqlite3").resolve()
+    run_id = f"run-wall-{second_segment_seconds}"
+    thread_id = f"thread-wall-{second_segment_seconds}"
+    first_segment_seconds = 7.0
+    max_wall_seconds = 180.0
+    recovered_active_wall = first_segment_seconds + second_segment_seconds
+    invocations: Counter[str] = Counter()
+    persist_entries: Counter[str] = Counter()
+    observed_deadlines: dict[str, list[float]] = {}
+
+    def capture_deadline(
+        owner: object,
+        method_name: str,
+        label: str,
+        *,
+        advance_clock: ControlledSegmentClock | None = None,
+        advance_seconds: float = 0.0,
+    ) -> None:
+        original = getattr(owner, method_name)
+
+        async def wrapped(*args: Any, **kwargs: Any) -> object:
+            deadline = kwargs.get("deadline")
+            assert type(deadline) is float
+            observed_deadlines.setdefault(label, []).append(deadline)
+            if advance_clock is not None:
+                advance_clock.advance(advance_seconds)
+            return await original(*args, **kwargs)
+
+        setattr(owner, method_name, wrapped)
+
+    handlers_a = _recovery_composition(
+        root,
+        invocations=invocations,
+        persist_entries=persist_entries,
+    )
+    current_config = _recovery_config(handlers_a)
+    assert float(current_config.budget.max_wall_time_seconds) == max_wall_seconds
+    clock_a = ControlledSegmentClock(
+        monotonic_start=time.monotonic(),
+        utc_offset_seconds=0.0,
+    )
+    original_validate = handlers_a.validate_request
+
+    async def advance_validate(state: BaselineState) -> object:
+        update = await original_validate(state)
+        clock_a.advance(first_segment_seconds)
+        return update
+
+    handlers_a.validate_request = cast("Any", advance_validate)
+    sink_a = FilesystemEventSink(
+        event_root,
+        crash_after_node="ValidateRequest",
+    )
+    async with open_sqlite_checkpointer(checkpoint_path) as saver_a:
+        graph_a = build_baseline_graph(
+            handlers_a.as_dependencies(checkpointer=saver_a)
+        )
+        runner_a = LangGraphResearchRunner(
+            baseline_graph=graph_a,
+            runtime_hooks=BaselineRuntimeHooks(
+                monotonic=clock_a.monotonic,
+                utc_now=clock_a.utc_now,
+            ),
+        )
+        with pytest.raises(
+            MemoryError,
+            match="crash after filesystem event publication",
+        ):
+            await runner_a.run(
+                run_id=run_id,
+                thread_id=thread_id,
+                config=current_config,
+                checkpoint=None,
+                emit=sink_a,
+                cancellation_token=CancellationToken(),
+            )
+        saved_a = await saver_a.aget_tuple(
+            {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+        )
+        assert saved_a is not None
+        ref_a = checkpoint_ref_from_tuple(saved_a)
+        values_a = cast("Any", saved_a).checkpoint["channel_values"]
+        assert values_a["next_event_seq"] == 1
+        assert values_a["elapsed_wall_seconds"] == 0.0
+
+    validate_event_a = await sink_a.get_event(run_id=run_id, seq=1)
+    assert validate_event_a is not None
+    validate_bytes_a = FilesystemEventSink._bytes(validate_event_a)
+
+    handlers_b = _recovery_composition(
+        root,
+        invocations=invocations,
+        persist_entries=persist_entries,
+    )
+    assert _recovery_config(handlers_b) == current_config
+    clock_b = ControlledSegmentClock(
+        monotonic_start=time.monotonic(),
+        utc_offset_seconds=first_segment_seconds + 50.0,
+    )
+    planner_model_b = cast(
+        "Any",
+        cast("Any", handlers_b.initial_plan_generator.model)._inner,
+    )
+    capture_deadline(
+        planner_model_b,
+        "complete",
+        "plan-model",
+        advance_clock=clock_b,
+        advance_seconds=second_segment_seconds,
+    )
+    sink_b = FilesystemEventSink(event_root, crash_after_node="Plan")
+    async with open_sqlite_checkpointer(checkpoint_path) as saver_b:
+        exact_b = await saver_b.aget_tuple(checkpoint_config(ref_a))
+        assert exact_b is not None
+        assert checkpoint_ref_from_tuple(exact_b) == ref_a
+        graph_b = build_baseline_graph(
+            handlers_b.as_dependencies(checkpointer=saver_b)
+        )
+        runner_b = LangGraphResearchRunner(
+            baseline_graph=graph_b,
+            runtime_hooks=BaselineRuntimeHooks(
+                monotonic=clock_b.monotonic,
+                utc_now=clock_b.utc_now,
+            ),
+        )
+        with pytest.raises(
+            MemoryError,
+            match="crash after filesystem event publication",
+        ):
+            await runner_b.run(
+                run_id=run_id,
+                thread_id=thread_id,
+                config=current_config,
+                checkpoint=ref_a,
+                emit=sink_b,
+                cancellation_token=CancellationToken(),
+            )
+
+    validate_event_b = await sink_b.get_event(run_id=run_id, seq=1)
+    plan_event_b = await sink_b.get_event(run_id=run_id, seq=2)
+    assert validate_event_b == validate_event_a
+    assert FilesystemEventSink._bytes(cast("RunEvent", validate_event_b)) == validate_bytes_a
+    assert plan_event_b is not None
+    plan_receipt = next(
+        receipt
+        for artifact_id in plan_event_b.artifact_ids
+        if (
+            receipt := cast("Any", baseline_graph_module)._load_audit_receipt(
+                handlers_b.artifact_store,
+                artifact_id,
+            )
+        )
+        is not None
+        and receipt.kind == "node-execution"
+    )
+    assert plan_receipt.payload["state"]["elapsed_wall_seconds"] == (
+        recovered_active_wall
+    ), (
+        observed_deadlines,
+        invocations,
+        clock_b.value,
+        plan_event_b.error_code,
+    )
+    provider_receipt_ids_before_c = tuple(
+        cast("list[str]", plan_receipt.payload["provider_receipt_ids"])
+    )
+    assert len(provider_receipt_ids_before_c) == 1
+    provider_result_ids_before_c: set[str] = set()
+    plan_provider_receipt = cast("Any", baseline_graph_module)._load_audit_receipt(
+        handlers_b.artifact_store,
+        provider_receipt_ids_before_c[0],
+    )
+    assert plan_provider_receipt is not None
+    assert plan_provider_receipt.kind == "provider-call"
+    plan_provider_record = ProviderCallRecord.model_validate_json(
+        json.dumps(
+            plan_provider_receipt.payload["record"],
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        strict=True,
+    )
+    assert plan_provider_record.usage.wall_seconds == 0.0
+    provider_result_ids_before_c.update(
+        cast("list[str]", plan_provider_receipt.payload["result_artifact_ids"])
+    )
+    assert len(provider_result_ids_before_c) == 1
+    for result_id in provider_result_ids_before_c:
+        handlers_b.artifact_store.get_bytes(result_id)
+    state_before_c = cast("Any", baseline_graph_module)._state_from_payload(
+        plan_receipt.payload["state"]
+    )
+    budget_before_c = state_before_c["budget_snapshot"]
+    assert budget_before_c.reserved_search_calls == 0
+    assert budget_before_c.reserved_pages == 0
+    assert budget_before_c.reserved_tokens == 0
+    assert budget_before_c.reserved_wall_seconds == 0.0
+    assert budget_before_c.reserved_retries == 0
+    assert budget_before_c.reserved_cost_usd in {None, Decimal(0)}
+    calls_before_c = invocations.copy()
+    cache_files_before_c = tuple(
+        sorted(
+            path.relative_to(root).as_posix()
+            for path in (root / "cache").rglob("*")
+            if path.is_file()
+        )
+    )
+
+    handlers_c = _recovery_composition(
+        root,
+        invocations=invocations,
+        persist_entries=persist_entries,
+    )
+    provider_receipt_writes_c = 0
+    original_put_receipt = cast("Any", baseline_graph_module)._put_audit_receipt
+
+    def observed_put_receipt(*args: object, **kwargs: object) -> str:
+        nonlocal provider_receipt_writes_c
+        if kwargs.get("kind") == "provider-call":
+            provider_receipt_writes_c += 1
+        return cast("str", original_put_receipt(*args, **kwargs))
+
+    monkeypatch.setattr(
+        baseline_graph_module,
+        "_put_audit_receipt",
+        observed_put_receipt,
+    )
+    provider_result_media_types = {
+        "application/vnd.deepresearch.model-result+json",
+        "application/vnd.deepresearch.embeddings+json",
+        "application/vnd.deepresearch.search-results+json",
+        "application/vnd.deepresearch.raw-document+json",
+        "application/vnd.deepresearch.parsed-document+json",
+        "application/vnd.deepresearch.evidence-span+json",
+    }
+    provider_result_writes_c: list[str] = []
+    original_put_bytes_c = handlers_c.artifact_store.put_bytes
+
+    def observed_put_bytes_c(data: bytes, *, media_type: str):  # type: ignore[no-untyped-def]
+        if media_type in provider_result_media_types:
+            provider_result_writes_c.append(media_type)
+        return original_put_bytes_c(data, media_type=media_type)
+
+    monkeypatch.setattr(
+        handlers_c.artifact_store,
+        "put_bytes",
+        observed_put_bytes_c,
+    )
+    clock_c = ControlledSegmentClock(
+        monotonic_start=time.monotonic(),
+        utc_offset_seconds=recovered_active_wall + 100.0,
+    )
+    planner_model_c = cast(
+        "Any",
+        cast("Any", handlers_c.initial_plan_generator.model)._inner,
+    )
+    writer_model_c = cast("Any", cast("Any", handlers_c.writer.model)._inner)
+    embedder_c = cast("Any", cast("Any", handlers_c.ranker).embedder)
+    inner_embedder_c = cast("Any", embedder_c._inner)
+    capture_deadline(planner_model_c, "structured", "query-model")
+    capture_deadline(handlers_c.search_provider, "search_with_usage", "search")
+    capture_deadline(handlers_c.fetcher, "fetch_with_usage", "fetch")
+    capture_deadline(handlers_c.parser, "parse", "parse")
+    capture_deadline(handlers_c.ranker, "score", "ranker")
+    capture_deadline(inner_embedder_c, "embed", "embed")
+    capture_deadline(writer_model_c, "complete", "writer-model")
+    sink_c = FilesystemEventSink(event_root)
+    async with open_sqlite_checkpointer(checkpoint_path) as saver_c:
+        exact_c = await saver_c.aget_tuple(checkpoint_config(ref_a))
+        assert exact_c is not None
+        assert checkpoint_ref_from_tuple(exact_c) == ref_a
+        graph_c = build_baseline_graph(
+            handlers_c.as_dependencies(checkpointer=saver_c)
+        )
+        runner_c = LangGraphResearchRunner(
+            baseline_graph=graph_c,
+            runtime_hooks=BaselineRuntimeHooks(
+                monotonic=clock_c.monotonic,
+                utc_now=clock_c.utc_now,
+            ),
+        )
+        result = await runner_c.run(
+            run_id=run_id,
+            thread_id=thread_id,
+            config=current_config,
+            checkpoint=ref_a,
+            emit=sink_c,
+            cancellation_token=CancellationToken(),
+        )
+
+    assert await sink_c.get_event(run_id=run_id, seq=1) == validate_event_a
+    assert await sink_c.get_event(run_id=run_id, seq=2) == plan_event_b
+    expected_plan_deadline = (
+        clock_b.monotonic_start
+        + max_wall_seconds
+        - first_segment_seconds
+    )
+    assert observed_deadlines["plan-model"] == [expected_plan_deadline]
+    expected_c_deadline = (
+        clock_c.monotonic_start + max_wall_seconds - recovered_active_wall
+    )
+
+    assert result.final_usage.wall_seconds == recovered_active_wall
+    assert result.manifest_artifact_id is not None
+    manifest = RunManifest.model_validate_json(
+        handlers_c.artifact_store.get_bytes(result.manifest_artifact_id),
+        strict=True,
+    )
+    assert manifest.usage.wall_seconds == recovered_active_wall
+    expected_provider_wall = 1.25 if expect_completed else 0.0
+    assert sum(
+        call.usage.wall_seconds for call in manifest.provider_calls
+    ) == expected_provider_wall
+    assert (manifest.finished_at - manifest.started_at).total_seconds() > (
+        manifest.usage.wall_seconds
+    )
+    assert len(
+        [call for call in manifest.provider_calls if call.node == "Plan"]
+    ) == 1
+
+    if expect_completed:
+        assert result.status == "completed", result.error_code
+        expected_deadlines = {
+            "query-model": [expected_c_deadline],
+            "search": [expected_c_deadline],
+            "fetch": [expected_c_deadline, expected_c_deadline],
+            "parse": [expected_c_deadline, expected_c_deadline],
+            "ranker": [expected_c_deadline],
+            "embed": [expected_c_deadline],
+            "writer-model": [expected_c_deadline],
+        }
+        assert {
+            key: observed_deadlines[key] for key in expected_deadlines
+        } == expected_deadlines
+        assert sum(invocations.values()) == 9
+    else:
+        assert recovered_active_wall == max_wall_seconds
+        assert result.status == "failed"
+        assert result.error_code == "TIMEOUT"
+        assert invocations == calls_before_c
+        assert set(observed_deadlines) == {"plan-model"}
+        cache_files_after_c = tuple(
+            sorted(
+                path.relative_to(root).as_posix()
+                for path in (root / "cache").rglob("*")
+                if path.is_file()
+            )
+        )
+        assert cache_files_after_c == cache_files_before_c
+        assert len(manifest.provider_calls) == 1
+        assert provider_receipt_writes_c == 0
+        assert provider_result_writes_c == []
+        reachable_provider_receipt_ids: set[str] = set()
+        for seq in range(1, manifest.run_event_count + 1):
+            event = await sink_c.get_event(run_id=run_id, seq=seq)
+            assert event is not None
+            node_receipt = next(
+                receipt
+                for artifact_id in event.artifact_ids
+                if (
+                    receipt := cast(
+                        "Any",
+                        baseline_graph_module,
+                    )._load_audit_receipt(
+                        handlers_c.artifact_store,
+                        artifact_id,
+                    )
+                )
+                is not None
+                and receipt.kind == "node-execution"
+            )
+            reachable_provider_receipt_ids.update(
+                cast("list[str]", node_receipt.payload["provider_receipt_ids"])
+            )
+        assert reachable_provider_receipt_ids == set(
+            provider_receipt_ids_before_c
+        )
+        reachable_provider_result_ids: set[str] = set()
+        for receipt_id in reachable_provider_receipt_ids:
+            provider_receipt = cast(
+                "Any",
+                baseline_graph_module,
+            )._load_audit_receipt(handlers_c.artifact_store, receipt_id)
+            assert provider_receipt is not None
+            assert provider_receipt.kind == "provider-call"
+            reachable_provider_result_ids.update(
+                cast("list[str]", provider_receipt.payload["result_artifact_ids"])
+            )
+        assert reachable_provider_result_ids == provider_result_ids_before_c
+        persist_event = await sink_c.get_event(
+            run_id=run_id,
+            seq=manifest.run_event_count + 1,
+        )
+        assert persist_event is not None
+        assert persist_event.node == "PersistResults"
+        persist_receipt = next(
+            receipt
+            for artifact_id in persist_event.artifact_ids
+            if (
+                receipt := cast("Any", baseline_graph_module)._load_audit_receipt(
+                    handlers_c.artifact_store,
+                    artifact_id,
+                )
+            )
+            is not None
+            and receipt.kind == "node-execution"
+        )
+        state_after_c = cast("Any", baseline_graph_module)._state_from_payload(
+            persist_receipt.payload["state"]
+        )
+        budget_after_c = state_after_c["budget_snapshot"]
+        assert budget_after_c == budget_before_c
+        assert budget_after_c.reserved_search_calls == 0
+        assert budget_after_c.reserved_pages == 0
+        assert budget_after_c.reserved_tokens == 0
+        assert budget_after_c.reserved_wall_seconds == 0.0
+        assert budget_after_c.reserved_retries == 0
+        assert budget_after_c.reserved_cost_usd in {None, Decimal(0)}
 
 
 def _owned_handlers(tmp_path: Path) -> BaselineNodeHandlers:
@@ -4556,8 +7222,13 @@ async def test_resume_reuses_durable_event_receipt_after_pre_checkpoint_crash(
     assert result.final_usage.total_tokens == 60
 
 
+@pytest.mark.parametrize(
+    "receipt_corruption",
+    ["state-extra-field", "event-seq-float"],
+)
 async def test_resume_rejects_corrupt_durable_state_receipt_without_handler_reexecution(
     tmp_path: Path,
+    receipt_corruption: str,
 ) -> None:
     from copy import deepcopy
 
@@ -4610,7 +7281,12 @@ async def test_resume_rejects_corrupt_durable_state_receipt_without_handler_reex
         and receipt.kind == "node-execution"
     )
     corrupt_payload = deepcopy(completion.payload)
-    cast("dict[str, object]", corrupt_payload["state"])["ignored_collision"] = True
+    if receipt_corruption == "state-extra-field":
+        cast("dict[str, object]", corrupt_payload["state"])[
+            "ignored_collision"
+        ] = True
+    else:
+        cast("dict[str, object]", corrupt_payload["event"])["seq"] = 2.0
     corrupt_receipt_id = cast("Any", baseline_graph_module)._put_audit_receipt(
         handlers.artifact_store,
         kind="node-execution",
@@ -4866,6 +7542,252 @@ async def test_planner_state_is_restored_after_hard_cancellation(tmp_path: Path)
     assert after[5] is before[5]
 
 
+async def test_invocation_audit_uses_only_each_runtime_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deepresearch.workflow import runner as runner_module
+
+    current_config = config(
+        budget=RunBudget.preset("low").model_copy(update={"max_cost_usd": None})
+    )
+    sink = MemoryEventSink()
+    fixed_now = datetime(2026, 9, 1, tzinfo=UTC)
+    accountants: dict[str, BudgetAccountant] = {}
+
+    def make_context(run_id: str, thread_id: str) -> BaselineRuntimeContext:
+        accountant = BudgetAccountant(current_config.budget, run_scope=run_id)
+        accountants[run_id] = accountant
+        return BaselineRuntimeContext(
+            run_id=run_id,
+            thread_id=thread_id,
+            config=current_config,
+            emit=sink,
+            cancellation_token=CancellationToken(),
+            budget_accountant=accountant,
+            deadline=100.0,
+            run_started_monotonic=0.0,
+            run_started_at=fixed_now,
+            elapsed_base_seconds=0.0,
+            monotonic=lambda: 0.0,
+            utc_now=lambda: fixed_now,
+            new_id=lambda prefix: f"{prefix}-fixed",
+        )
+
+    context_a = make_context("run-audit-hard", "thread-audit-hard")
+    context_b = make_context("run-audit-survivor", "thread-audit-survivor")
+    assert context_a.audit is not context_b.audit
+    for context in (context_a, context_b):
+        context.audit.provider_receipt_ids.append("stale-receipt")
+        context.audit.result_artifact_ids.append("sha256:" + "f" * 64)
+        context.audit.identity_counts["stale"] = 1
+        context.audit.operation_counts["stale"] = 1
+
+    state_a = cast("Any", runner_module)._initial_state(
+        run_id=context_a.run_id,
+        thread_id=context_a.thread_id,
+        config=current_config,
+        accountant=accountants[context_a.run_id],
+    )
+    state_b = cast("Any", runner_module)._initial_state(
+        run_id=context_b.run_id,
+        thread_id=context_b.thread_id,
+        config=current_config,
+        accountant=accountants[context_b.run_id],
+    )
+    task_contexts: dict[object, BaselineRuntimeContext] = {}
+
+    def fake_runtime(_schema: object) -> object:
+        return SimpleNamespace(context=task_contexts[asyncio.current_task()])
+
+    monkeypatch.setattr(baseline_graph_module, "get_runtime", fake_runtime)
+    arrivals = 0
+    both_arrived = asyncio.Event()
+    observations: dict[str, tuple[bool, tuple[object, ...]]] = {}
+    hard_primary = MemoryError("hard audit isolation probe")
+
+    async def handler(_state: BaselineState) -> dict[str, object]:
+        nonlocal arrivals
+        context = task_contexts[asyncio.current_task()]
+        arrivals += 1
+        if arrivals == 2:
+            both_arrived.set()
+        await asyncio.wait_for(both_arrived.wait(), timeout=5.0)
+        resolved = cast("Any", baseline_graph_module)._audit_buffer(context)
+        observations[context.run_id] = (
+            resolved is context.audit,
+            (
+                *resolved.provider_receipt_ids,
+                *resolved.result_artifact_ids,
+                *resolved.identity_counts,
+                *resolved.operation_counts,
+            ),
+        )
+        if context is context_a:
+            raise hard_primary
+        return {}
+
+    safe = cast("Any", baseline_graph_module)._safe_node(
+        "ValidateRequest",
+        handler,
+        audit_composition=None,
+    )
+    accountant_attributes_before = {
+        run_id: set(vars(accountant)) for run_id, accountant in accountants.items()
+    }
+
+    async def invoke(
+        context: BaselineRuntimeContext,
+        current_state: BaselineState,
+    ) -> object:
+        task_contexts[asyncio.current_task()] = context
+        return await safe(current_state)
+
+    results = await asyncio.gather(
+        invoke(context_a, state_a),
+        invoke(context_b, state_b),
+        return_exceptions=True,
+    )
+
+    assert results[0] is hard_primary
+    assert cast("dict[str, object]", results[1])["next_event_seq"] == 2
+    assert observations == {
+        "run-audit-hard": (True, ()),
+        "run-audit-survivor": (True, ()),
+    }
+    assert {
+        run_id: set(vars(accountant)) for run_id, accountant in accountants.items()
+    } == accountant_attributes_before
+    assert cast("Any", baseline_graph_module)._audit_buffer(context_a) is context_a.audit
+    assert cast("Any", baseline_graph_module)._audit_buffer(context_b) is context_b.audit
+
+
+async def test_invocation_audit_resets_before_existing_event_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deepresearch.workflow import runner as runner_module
+
+    current_config = config(
+        budget=RunBudget.preset("low").model_copy(update={"max_cost_usd": None})
+    )
+    run_id = "run-audit-recovery"
+    thread_id = "thread-audit-recovery"
+    accountant = BudgetAccountant(current_config.budget, run_scope=run_id)
+    sink = MemoryEventSink()
+    fixed_now = datetime(2026, 9, 1, tzinfo=UTC)
+    context = BaselineRuntimeContext(
+        run_id=run_id,
+        thread_id=thread_id,
+        config=current_config,
+        emit=sink,
+        cancellation_token=CancellationToken(),
+        budget_accountant=accountant,
+        deadline=100.0,
+        run_started_monotonic=0.0,
+        run_started_at=fixed_now,
+        elapsed_base_seconds=0.0,
+        monotonic=lambda: 0.0,
+        utc_now=lambda: fixed_now,
+        new_id=lambda prefix: f"{prefix}-fixed",
+    )
+    state = cast("Any", runner_module)._initial_state(
+        run_id=run_id,
+        thread_id=thread_id,
+        config=current_config,
+        accountant=accountant,
+    )
+    monkeypatch.setattr(
+        baseline_graph_module,
+        "get_runtime",
+        lambda _schema: SimpleNamespace(context=context),
+    )
+
+    normal_calls = 0
+
+    async def normal_handler(_state: BaselineState) -> dict[str, object]:
+        nonlocal normal_calls
+        normal_calls += 1
+        return {}
+
+    normal_safe = cast("Any", baseline_graph_module)._safe_node(
+        "ValidateRequest",
+        normal_handler,
+        audit_composition=None,
+    )
+    first_update = await normal_safe(state)
+    recovered_input = cast("Any", baseline_graph_module).validate_baseline_state(
+        {**state, **first_update}
+    )
+    assert recovered_input["next_event_seq"] == 2
+    assert normal_calls == 1
+
+    existing = RunEvent(
+        seq=2,
+        run_id=run_id,
+        timestamp=fixed_now,
+        node="Plan",
+        kind="node_completed",
+        status="running",
+        public_payload={"is_partial": False, "stop_reason": None},
+        usage_delta=ResourceUsage.zero(cost_known=True),
+        artifact_ids=(),
+        error_code=None,
+    )
+    await sink(existing)
+    context.audit.graph_node = "stale-node"
+    context.audit.node_attempt = 99
+    context.audit.provider_calls.append(cast("Any", object()))
+    context.audit.provider_receipt_ids.append("stale-provider")
+    context.audit.result_artifact_ids.append("stale-result")
+    context.audit.child_receipt_ids.append("stale-child")
+    context.audit.identity_counts["stale"] = 1
+    context.audit.operation_counts["stale"] = 1
+    context.audit.pending_provider_call = cast("Any", object())
+    recovery_observations: list[tuple[object, ...]] = []
+
+    async def inspect_recovery(**kwargs: object) -> dict[str, object]:
+        assert kwargs["event"] == existing
+        audit = context.audit
+        recovery_observations.append(
+            (
+                audit.graph_node,
+                audit.node_attempt,
+                tuple(audit.provider_calls),
+                tuple(audit.provider_receipt_ids),
+                tuple(audit.result_artifact_ids),
+                tuple(audit.child_receipt_ids),
+                dict(audit.identity_counts),
+                dict(audit.operation_counts),
+                audit.pending_provider_call,
+            )
+        )
+        return {"next_event_seq": 3}
+
+    monkeypatch.setattr(
+        baseline_graph_module,
+        "_recover_durable_node_event",
+        inspect_recovery,
+    )
+    recovered_handler_calls = 0
+
+    async def forbidden_handler(_state: BaselineState) -> dict[str, object]:
+        nonlocal recovered_handler_calls
+        recovered_handler_calls += 1
+        return {}
+
+    recovery_safe = cast("Any", baseline_graph_module)._safe_node(
+        "Plan",
+        forbidden_handler,
+        audit_composition=cast("Any", object()),
+    )
+    recovered_update = await recovery_safe(recovered_input)
+
+    assert recovered_update == {"next_event_seq": 3}
+    assert recovered_handler_calls == 0
+    assert recovery_observations == [
+        (None, 0, (), (), (), (), {}, {}, None)
+    ]
+
+
 async def test_concurrent_runs_share_graph_without_context_or_receipt_leakage(
     tmp_path: Path,
 ) -> None:
@@ -4906,7 +7828,10 @@ async def test_concurrent_runs_share_graph_without_context_or_receipt_leakage(
     saver = InMemorySaver(serde=checkpoint_serializer())
     graph = build_baseline_graph(handlers.as_dependencies(checkpointer=saver))
     sink = ConcurrentPlanBarrierSink()
-    clock = SegmentClock(0)
+    clock = ControlledSegmentClock(
+        monotonic_start=time.monotonic(),
+        utc_offset_seconds=0.0,
+    )
     runner = LangGraphResearchRunner(
         baseline_graph=graph,
         runtime_hooks=BaselineRuntimeHooks(

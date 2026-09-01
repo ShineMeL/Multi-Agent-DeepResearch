@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.errors import NodeCancelledError
 from langgraph.graph.state import (  # pyright: ignore[reportMissingTypeStubs]
     CompiledStateGraph,
 )
@@ -453,6 +454,12 @@ class LangGraphResearchRunner:
         except (asyncio.CancelledError, KeyboardInterrupt, MemoryError, SystemExit):
             raise
         except Exception as error:  # noqa: BLE001 - stable workflow result boundary
+            cancellation_primary = error.__cause__
+            if isinstance(error, NodeCancelledError) and isinstance(
+                cancellation_primary,
+                asyncio.CancelledError,
+            ):
+                raise cancellation_primary
             code = _exception_code(error)
             return _failed_result(
                 run_id=run_id,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import inspect
 import json
@@ -8,6 +9,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -830,6 +832,41 @@ def test_baseline_dependencies_constructor_has_no_private_audit_composition() ->
 
     assert "audit_composition" not in parameters
     assert not any(name.startswith("_") for name in parameters)
+
+
+def test_invocation_audit_has_no_process_or_accountant_carrier() -> None:
+    source_path = Path(baseline_graph_module.__file__)
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    contextvar_imports = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        and "contextvars" in ast.unparse(node)
+    ]
+    accountant_carriers = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and node.attr == "_baseline_audit_buffer"
+    ]
+    audit_resolvers = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_audit_buffer"
+    ]
+
+    assert contextvar_imports == []
+    assert accountant_carriers == []
+    assert len(audit_resolvers) == 1
+    resolver = audit_resolvers[0]
+    assert len(resolver.body) == 1
+    statement = resolver.body[0]
+    assert isinstance(statement, ast.Return)
+    assert isinstance(statement.value, ast.Attribute)
+    assert statement.value.attr == "audit"
+    assert isinstance(statement.value.value, ast.Name)
+    assert statement.value.value.id == "context"
 
 
 async def test_provider_agnostic_graph_has_exact_successful_node_order() -> None:

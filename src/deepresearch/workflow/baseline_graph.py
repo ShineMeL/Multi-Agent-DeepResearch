@@ -5,7 +5,6 @@ import hashlib
 import json
 import math
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -180,9 +179,9 @@ class _AuditBuffer:
     )
     pending_provider_call: _PendingProviderCall | None = None
 
-    def begin(self, *, graph_node: str, node_attempt: int) -> None:
-        self.graph_node = graph_node
-        self.node_attempt = node_attempt
+    def reset(self) -> None:
+        self.graph_node = None
+        self.node_attempt = 0
         self.provider_calls.clear()
         self.provider_receipt_ids.clear()
         self.child_receipt_ids.clear()
@@ -191,20 +190,14 @@ class _AuditBuffer:
         self.operation_counts.clear()
         self.pending_provider_call = None
 
-
-_ACTIVE_AUDIT: ContextVar[_AuditBuffer | None] = ContextVar(
-    "baseline_active_audit",
-    default=None,
-)
+    def begin(self, *, graph_node: str, node_attempt: int) -> None:
+        self.reset()
+        self.graph_node = graph_node
+        self.node_attempt = node_attempt
 
 
 def _audit_buffer(context: BaselineRuntimeContext) -> _AuditBuffer:
-    accountant = cast("Any", context.budget_accountant)
-    try:
-        attached = accountant._baseline_audit_buffer
-    except AttributeError:
-        attached = None
-    return attached if isinstance(attached, _AuditBuffer) else (_ACTIVE_AUDIT.get() or context.audit)
+    return context.audit
 
 
 @dataclass
@@ -235,6 +228,38 @@ class BaselineRuntimeContext:
     new_id: Callable[[str], str]
     audit: _AuditBuffer = field(default_factory=_AuditBuffer)
     elapsed_tracker: _ElapsedTracker = field(default_factory=_ElapsedTracker)
+
+
+def _effective_deadline(context: BaselineRuntimeContext) -> float:
+    effective = context.deadline - context.elapsed_tracker.recovered_offset_seconds
+    if not math.isfinite(effective):
+        raise ProviderError(
+            code="TIMEOUT",
+            provider="workflow",
+            operation="deadline",
+            public_message="workflow deadline expired",
+            retryable=False,
+        )
+    return effective
+
+
+def _ensure_operation_active(
+    context: BaselineRuntimeContext,
+    *,
+    operation: str,
+) -> float:
+    context.cancellation_token.raise_if_cancelled()
+    effective = _effective_deadline(context)
+    now = context.monotonic()
+    if not math.isfinite(now) or now >= effective:
+        raise ProviderError(
+            code="TIMEOUT",
+            provider="workflow",
+            operation=operation,
+            public_message="workflow deadline expired",
+            retryable=False,
+        )
+    return now
 
 
 _AUDIT_SCHEMA = "baseline-audit-receipt-v1"
@@ -798,6 +823,29 @@ def _strict_run_event(value: object) -> RunEvent:
     return event
 
 
+def _run_events_match_exact(value: object, expected: RunEvent) -> bool:
+    try:
+        exact = _strict_run_event(value)
+        exact_expected = _strict_run_event(expected)
+    except ArtifactIntegrityError:
+        return False
+    return _canonical_bytes(exact.model_dump(mode="json")) == _canonical_bytes(
+        exact_expected.model_dump(mode="json")
+    )
+
+
+def _run_event_from_receipt_payload(value: object) -> RunEvent:
+    try:
+        payload_bytes = _canonical_bytes(value)
+        event = RunEvent.model_validate_json(payload_bytes, strict=True)
+        exact = _strict_run_event(event)
+    except (TypeError, ValueError, ArtifactIntegrityError):
+        raise ArtifactIntegrityError("durable event receipt is corrupt") from None
+    if payload_bytes != _canonical_bytes(exact.model_dump(mode="json")):
+        raise ArtifactIntegrityError("durable event receipt is corrupt")
+    return exact
+
+
 def _validate_exact_json_value(value: object) -> None:
     if value is None or type(value) in (str, int, bool):
         return
@@ -1099,12 +1147,7 @@ class _AuditComposition:
                 "durable event node receipt is missing or ambiguous"
             )
         receipt_id, receipt = matches[0]
-        try:
-            base_event = RunEvent.model_validate(receipt.payload.get("event"))
-        except (TypeError, ValueError):
-            raise ArtifactIntegrityError(
-                "durable event node receipt is corrupt"
-            ) from None
+        base_event = _run_event_from_receipt_payload(receipt.payload.get("event"))
         expected_event = base_event.model_copy(
             update={
                 "artifact_ids": tuple(
@@ -1112,7 +1155,7 @@ class _AuditComposition:
                 )
             }
         )
-        if expected_event != event:
+        if not _run_events_match_exact(event, expected_event):
             raise ArtifactIntegrityError("durable event bytes conflict with node receipt")
         recovered = _state_from_payload(receipt.payload.get("state"))
         if (
@@ -1599,6 +1642,7 @@ class BaselineNodeHandlers:
         invoke: Callable[[], Awaitable[Result]],
     ) -> Result:
         async with self._planner_lock:
+            _ensure_operation_active(context, operation="planner")
             planner = cast("Any", self.initial_plan_generator)
             saved = (
                 planner.budget,
@@ -1620,6 +1664,7 @@ class BaselineNodeHandlers:
             planner._query_cache = {}
             planner._query_locks = {}
             try:
+                _ensure_operation_active(context, operation="planner")
                 return await invoke()
             finally:
                 (
@@ -2544,6 +2589,7 @@ class BaselineNodeHandlers:
             )
         provider_lock = await self._lock_for(_hash_json({"provider": provider_id}))
         async with provider_lock:
+            _ensure_operation_active(context, operation=operation)
             observer = provider if isinstance(provider, InvocationUsageObserver) else None
             if observer is not None and observer.consume_invocation_usage() is not None:
                 raise UsageIntegrityError
@@ -2575,8 +2621,18 @@ class BaselineNodeHandlers:
                 retries=retries,
                 wall_seconds=wall_seconds,
             )
-            started = context.monotonic()
-            started_at = context.utc_now()
+            try:
+                started_at = context.utc_now()
+                started = _ensure_operation_active(context, operation=operation)
+            except Exception:
+                context.budget_accountant.release(reservation)
+                raise
+            except BaseException:
+                try:
+                    context.budget_accountant.release(reservation)
+                except BaseException:  # noqa: BLE001, S110 - gate primary must win
+                    pass
+                raise
             try:
                 result = await invoke()
             except (asyncio.CancelledError, KeyboardInterrupt, MemoryError, SystemExit):
@@ -2895,6 +2951,7 @@ class BaselineNodeHandlers:
 
         lock = await self._lock_for(cache_key_sha256(key))
         async with lock:
+            _ensure_operation_active(context, operation="model")
             cached = self.cache.get(key)
             if cached is not None:
                 cached_result = load_result(cached)
@@ -3002,6 +3059,7 @@ class BaselineNodeHandlers:
         token_estimate = sum(len(item.encode("utf-8")) for item in texts)
         lock = await self._lock_for(cache_key_sha256(key))
         async with lock:
+            _ensure_operation_active(context, operation="embed")
             cached = self.cache.get(key)
             if cached is not None:
                 cached_vectors = load_result(cached)
@@ -3088,7 +3146,7 @@ class BaselineNodeHandlers:
             context,
             lambda: self.initial_plan_generator.create_plan(
                 state["request"],
-                deadline=context.deadline,
+                deadline=_effective_deadline(context),
                 cancellation_token=context.cancellation_token,
             ),
         )
@@ -3121,7 +3179,7 @@ class BaselineNodeHandlers:
             lambda: self.initial_plan_generator.queries_for(
                 subquestion,
                 plan_id=plan.plan_id,
-                deadline=context.deadline,
+                deadline=_effective_deadline(context),
                 cancellation_token=context.cancellation_token,
             ),
         )
@@ -3167,6 +3225,7 @@ class BaselineNodeHandlers:
 
             lock = await self._lock_for(cache_key_sha256(key))
             async with lock:
+                _ensure_operation_active(context, operation="search")
                 cached = self.cache.get(key)
                 if cached is not None:
                     validated_hits = load_result(cached)
@@ -3199,7 +3258,7 @@ class BaselineNodeHandlers:
                             query,
                             10,
                             None,
-                            deadline=context.deadline,
+                            deadline=_effective_deadline(context),
                             cancellation_token=context.cancellation_token,
                         )
 
@@ -3228,7 +3287,7 @@ class BaselineNodeHandlers:
                             query,
                             10,
                             None,
-                            deadline=context.deadline,
+                            deadline=_effective_deadline(context),
                             cancellation_token=context.cancellation_token,
                         )
 
@@ -3333,6 +3392,7 @@ class BaselineNodeHandlers:
 
             lock = await self._lock_for(cache_key_sha256(key))
             async with lock:
+                _ensure_operation_active(context, operation="fetch")
                 cached = self.cache.get(key)
                 if cached is not None:
                     validated_raw = load_result(cached)
@@ -3361,7 +3421,7 @@ class BaselineNodeHandlers:
                     ) -> ProviderUsageResult[RawDocument]:
                         return await provider.fetch_with_usage(
                             url,
-                            deadline=context.deadline,
+                            deadline=_effective_deadline(context),
                             cancellation_token=context.cancellation_token,
                         )
 
@@ -3388,7 +3448,7 @@ class BaselineNodeHandlers:
                     ) -> RawDocument:
                         return await provider.fetch(
                             url,
-                            deadline=context.deadline,
+                            deadline=_effective_deadline(context),
                             cancellation_token=context.cancellation_token,
                         )
 
@@ -3499,6 +3559,7 @@ class BaselineNodeHandlers:
 
             lock = await self._lock_for(cache_key_sha256(key))
             async with lock:
+                _ensure_operation_active(context, operation="parse")
                 cached = self.cache.get(key)
                 if cached is not None:
                     validated_parsed = load_result(cached)
@@ -3525,7 +3586,7 @@ class BaselineNodeHandlers:
                 ) -> ParsedDocument:
                     return await provider.parse(
                         raw_document,
-                        deadline=context.deadline,
+                        deadline=_effective_deadline(context),
                         cancellation_token=context.cancellation_token,
                     )
 
@@ -3811,7 +3872,7 @@ class BaselineNodeHandlers:
                 ranked = await self.ranker.score(
                     need.text,
                     evidence,
-                    deadline=context.deadline,
+                    deadline=_effective_deadline(context),
                     cancellation_token=context.cancellation_token,
                 )
                 scores[need.need_id] = ranked
@@ -3876,7 +3937,7 @@ class BaselineNodeHandlers:
         )
         result = await model.complete(
             request,
-            deadline=context.deadline,
+            deadline=_effective_deadline(context),
             cancellation_token=context.cancellation_token,
         )
         ref = self.artifact_store.put_bytes(
@@ -4016,11 +4077,8 @@ class BaselineNodeHandlers:
             event = await sink.get_event(run_id=state["run_id"], seq=seq)
             if event is None:
                 raise ArtifactIntegrityError("durable event sequence has a gap")
-            try:
-                exact_event = RunEvent.model_validate(event.model_dump(round_trip=True))
-            except (AttributeError, TypeError, ValueError):
-                raise ArtifactIntegrityError("durable event is corrupt") from None
-            if type(event) is not RunEvent or exact_event != event or event.seq != seq:
+            exact_event = _strict_run_event(event)
+            if exact_event != event or event.seq != seq:
                 raise ArtifactIntegrityError("durable event is corrupt")
             candidates = [
                 artifact_id
@@ -4041,9 +4099,9 @@ class BaselineNodeHandlers:
                 execution = NodeExecutionRecord.model_validate(
                     receipt.payload.get("record")
                 )
-                base_event = RunEvent.model_validate(receipt.payload.get("event"))
             except (TypeError, ValueError):
                 raise ArtifactIntegrityError("node completion receipt is corrupt") from None
+            base_event = _run_event_from_receipt_payload(receipt.payload.get("event"))
             expected_event = base_event.model_copy(
                 update={
                     "artifact_ids": tuple(
@@ -4051,7 +4109,10 @@ class BaselineNodeHandlers:
                     )
                 }
             )
-            if expected_event != event or execution.node != event.node:
+            if (
+                not _run_events_match_exact(event, expected_event)
+                or execution.node != event.node
+            ):
                 raise ArtifactIntegrityError("event and node completion receipt disagree")
             provider_ids_value = receipt.payload.get("provider_receipt_ids")
             child_ids_value = receipt.payload.get("child_receipt_ids")
@@ -5025,9 +5086,9 @@ async def _recover_durable_node_event(
     node_receipt_id, payload = matches[0]
     try:
         execution = NodeExecutionRecord.model_validate(payload.get("record"))
-        base_event = RunEvent.model_validate(payload.get("event"))
     except (TypeError, ValueError):
         raise ArtifactIntegrityError("durable event node receipt is corrupt") from None
+    base_event = _run_event_from_receipt_payload(payload.get("event"))
     if execution.node != node or base_event.node != node:
         raise ArtifactIntegrityError("durable event node receipt conflicts with graph state")
     expected_event = base_event.model_copy(
@@ -5037,7 +5098,7 @@ async def _recover_durable_node_event(
             )
         }
     )
-    if expected_event != event:
+    if not _run_events_match_exact(event, expected_event):
         raise ArtifactIntegrityError("durable event bytes conflict with node receipt")
     recovered = _state_from_payload(payload.get("state"))
     if (
@@ -5069,7 +5130,7 @@ async def _recover_durable_node_event(
     )
     await sink(event)
     verified = await sink.get_event(run_id=event.run_id, seq=event.seq)
-    if verified != event:
+    if not _run_events_match_exact(verified, event):
         raise ArtifactIntegrityError("durable event sink failed exact verification")
     work_ids = tuple(
         dict.fromkeys((*recovered["baseline_work_artifact_ids"], node_receipt_id))
@@ -5107,6 +5168,171 @@ def _node_error_code(error: Exception, *, node: str) -> str:
     return "INTERNAL_ERROR"
 
 
+type _EventPublicationStatus = Literal[
+    "clean_exact",
+    "recovered_exact",
+    "absent",
+]
+
+
+async def _publish_event_with_bounded_recovery(
+    *,
+    sink: DurableRunEventSink,
+    event: RunEvent,
+) -> _EventPublicationStatus:
+    try:
+        await sink(event)
+        immediate = await sink.get_event(run_id=event.run_id, seq=event.seq)
+    except (asyncio.CancelledError, KeyboardInterrupt, MemoryError, SystemExit):
+        raise
+    except Exception:  # noqa: BLE001 - public-safe durable sink boundary
+        immediate = None
+    else:
+        if immediate is not None:
+            if not _run_events_match_exact(immediate, event):
+                raise ArtifactIntegrityError(
+                    "durable event verification failed"
+                )
+            return "clean_exact"
+    try:
+        recovered = await sink.get_event(run_id=event.run_id, seq=event.seq)
+    except (asyncio.CancelledError, KeyboardInterrupt, MemoryError, SystemExit):
+        raise
+    except Exception:  # noqa: BLE001 - public-safe durable sink boundary
+        raise ArtifactIntegrityError("durable event publication failed") from None
+    if recovered is None:
+        return "absent"
+    if not _run_events_match_exact(recovered, event):
+        raise ArtifactIntegrityError("durable event verification failed")
+    return "recovered_exact"
+
+
+async def _publish_missing_event_failure_transition(
+    *,
+    composition: _AuditComposition,
+    context: BaselineRuntimeContext,
+    sink: DurableRunEventSink,
+    restored: BaselineState,
+    node: str,
+    update: Mapping[str, object],
+    work_ids: Sequence[str],
+    audit: _AuditBuffer,
+    execution: NodeExecutionRecord,
+    base_event: RunEvent,
+) -> StateUpdate:
+    failure_monotonic = context.monotonic()
+    failure_finished_at = context.utc_now()
+    latency_seconds = (failure_finished_at - execution.started_at).total_seconds()
+    if latency_seconds < 0.0:
+        raise ArtifactIntegrityError("node audit clock moved backwards")
+    failure_elapsed = max(
+        cast("float", update["elapsed_wall_seconds"]),
+        context.elapsed_base_seconds
+        + context.elapsed_tracker.recovered_offset_seconds
+        + max(0.0, failure_monotonic - context.run_started_monotonic),
+    )
+    terminal_receipt_id = _put_audit_receipt(
+        composition.artifact_store,
+        kind="terminal",
+        run_id=restored["run_id"],
+        thread_id=restored["thread_id"],
+        receipt_key="terminal",
+        payload={
+            "error_code": "DATA_CORRUPTION",
+            "elapsed_wall_seconds": failure_elapsed,
+            "finished_at": failure_finished_at.isoformat(),
+            "terminal_event_seq": restored["next_event_seq"],
+        },
+    )
+    child_receipt_ids = list(
+        dict.fromkeys(
+            (
+                *audit.provider_receipt_ids,
+                *audit.child_receipt_ids,
+                terminal_receipt_id,
+            )
+        )
+    )
+    failure_update = {
+        **update,
+        "baseline_work_artifact_ids": tuple(
+            dict.fromkeys((*work_ids, *child_receipt_ids))
+        ),
+        "elapsed_wall_seconds": failure_elapsed,
+        "error_code": "DATA_CORRUPTION",
+        "failed_node": node,
+        "next_event_seq": restored["next_event_seq"],
+    }
+    failure_state = validate_baseline_state({**restored, **failure_update})
+    failure_execution = NodeExecutionRecord(
+        node=node,
+        attempt=execution.attempt,
+        started_at=execution.started_at,
+        finished_at=failure_finished_at,
+        latency_ms=round(latency_seconds * 1000),
+        status="failed",
+        input_artifact_ids=execution.input_artifact_ids,
+        output_artifact_ids=execution.output_artifact_ids,
+        usage=_audit_usage(
+            tuple(audit.provider_calls),
+            wall_seconds=latency_seconds,
+            pricing_status=composition.pricing_status,
+        ),
+        error_code="DATA_CORRUPTION",
+    )
+    failure_base_event = base_event.model_copy(
+        update={
+            "timestamp": failure_finished_at,
+            "kind": "node_failed",
+            "status": "failed",
+            "public_payload": {
+                "is_partial": failure_state["is_partial"],
+                "stop_reason": failure_state["stop_reason"],
+            },
+            "error_code": "DATA_CORRUPTION",
+        }
+    )
+    failure_receipt_id = _put_audit_receipt(
+        composition.artifact_store,
+        kind="node-execution",
+        run_id=restored["run_id"],
+        thread_id=restored["thread_id"],
+        receipt_key=f"node:{node}:{failure_execution.attempt}",
+        payload={
+            "event": failure_base_event.model_dump(mode="json"),
+            "input_state_sha256": _hash_json(_state_payload(restored)),
+            "provider_receipt_ids": list(audit.provider_receipt_ids),
+            "child_receipt_ids": child_receipt_ids,
+            "record": failure_execution.model_dump(mode="json"),
+            "state": _state_payload(failure_state),
+        },
+    )
+    failure_event = failure_base_event.model_copy(
+        update={
+            "artifact_ids": tuple(
+                dict.fromkeys(
+                    (*failure_base_event.artifact_ids, failure_receipt_id)
+                )
+            )
+        }
+    )
+    publication = await _publish_event_with_bounded_recovery(
+        sink=sink,
+        event=failure_event,
+    )
+    if publication == "absent":
+        raise ArtifactIntegrityError("durable event failure transition failed")
+    return {
+        **failure_update,
+        "baseline_work_artifact_ids": tuple(
+            dict.fromkeys(
+                (*failure_state["baseline_work_artifact_ids"], failure_receipt_id)
+            )
+        ),
+        "next_event_seq": failure_event.seq + 1,
+    }
+
+
 def _safe_node(
     node: str,
     handler: BaselineNode,
@@ -5119,9 +5345,8 @@ def _safe_node(
         context = cast("BaselineRuntimeContext | None", runtime.context)
         if context is None:
             return await handler(restored)
-        audit = _AuditBuffer()
-        _ACTIVE_AUDIT.set(audit)
-        cast("Any", context.budget_accountant)._baseline_audit_buffer = audit
+        audit = context.audit
+        audit.reset()
         if not isinstance(context.emit, DurableRunEventSink):
             raise WorkflowInvariantError(code="INVALID_EVENT_SINK")
         sink = context.emit
@@ -5150,28 +5375,19 @@ def _safe_node(
                 except Exception:  # noqa: BLE001 - public-safe durable sink boundary
                     raise ArtifactIntegrityError("durable event recovery failed") from None
         node_started_at = context.utc_now()
-        if audit_composition is not None:
-            audit.begin(
-                graph_node=node,
-                node_attempt=_next_node_attempt(audit_composition, restored, node),
-            )
+        audit.begin(
+            graph_node=node,
+            node_attempt=(
+                _next_node_attempt(audit_composition, restored, node)
+                if audit_composition is not None
+                else 1
+            ),
+        )
         before = context.budget_accountant.snapshot()
         update: dict[str, object]
         try:
             if node != "PersistResults":
-                context.cancellation_token.raise_if_cancelled()
-                if (
-                    context.monotonic()
-                    + context.elapsed_tracker.recovered_offset_seconds
-                    >= context.deadline
-                ):
-                    raise ProviderError(
-                        code="TIMEOUT",
-                        provider="workflow",
-                        operation=node,
-                        public_message="workflow deadline expired",
-                        retryable=False,
-                    )
+                _ensure_operation_active(context, operation=node)
             update = dict(await handler(restored))
         except BudgetExceeded as error:
             update = {
@@ -5296,16 +5512,16 @@ def _safe_node(
             error_code=error_code,
         )
         event = base_event
-        if audit_composition is not None:
-            work_ids = tuple(
-                cast(
-                    "tuple[str, ...]",
-                    update.get(
-                        "baseline_work_artifact_ids",
-                        restored["baseline_work_artifact_ids"],
-                    ),
-                )
+        work_ids = tuple(
+            cast(
+                "tuple[str, ...]",
+                update.get(
+                    "baseline_work_artifact_ids",
+                    restored["baseline_work_artifact_ids"],
+                ),
             )
+        )
+        if audit_composition is not None:
             child_receipt_ids = [
                 *audit.provider_receipt_ids,
                 *audit.child_receipt_ids,
@@ -5355,34 +5571,39 @@ def _safe_node(
                     )
                 }
             )
-        publication_failed = False
-        try:
-            await sink(event)
-            verified_event = await sink.get_event(
-                run_id=event.run_id,
-                seq=event.seq,
-            )
-        except (asyncio.CancelledError, KeyboardInterrupt, MemoryError, SystemExit):
-            raise
-        except Exception:  # noqa: BLE001 - public-safe durable sink boundary
-            publication_failed = True
-            verified_event = None
-        if verified_event != event:
-            publication_failed = True
-        if publication_failed:
-            try:
-                recovered_event = await sink.get_event(
-                    run_id=event.run_id,
-                    seq=event.seq,
+        publication = await _publish_event_with_bounded_recovery(
+            sink=sink,
+            event=event,
+        )
+        if publication == "absent":
+            if (
+                audit_composition is None
+                or execution is None
+                or node_receipt_id is None
+                or not restored["evidence_ids"]
+                or node not in {"DraftReport", "FinalizeCitations"}
+            ):
+                raise ArtifactIntegrityError("durable event publication failed")
+            if merged["error_code"] is None:
+                return await _publish_missing_event_failure_transition(
+                    composition=audit_composition,
+                    context=context,
+                    sink=sink,
+                    restored=restored,
+                    node=node,
+                    update=update,
+                    work_ids=work_ids,
+                    audit=audit,
+                    execution=execution,
+                    base_event=base_event,
                 )
-            except (asyncio.CancelledError, KeyboardInterrupt, MemoryError, SystemExit):
-                raise
-            except Exception:  # noqa: BLE001 - public-safe durable sink boundary
-                raise ArtifactIntegrityError(
-                    "durable event publication failed"
-                ) from None
-            if recovered_event != event:
-                raise ArtifactIntegrityError("durable event verification failed")
+            retry_publication = await _publish_event_with_bounded_recovery(
+                sink=sink,
+                event=event,
+            )
+            if retry_publication == "absent":
+                raise ArtifactIntegrityError("durable event publication failed")
+        elif publication == "recovered_exact" and merged["error_code"] is None:
             if (
                 audit_composition is None
                 or execution is None
@@ -5498,7 +5719,7 @@ def _safe_node(
                 raise ArtifactIntegrityError(
                     "durable event failure transition failed"
                 ) from None
-            if verified_failure != failure_event:
+            if not _run_events_match_exact(verified_failure, failure_event):
                 raise ArtifactIntegrityError(
                     "durable event failure transition is corrupt"
                 )
