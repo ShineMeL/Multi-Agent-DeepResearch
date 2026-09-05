@@ -1,20 +1,42 @@
+from __future__ import annotations
+
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
 import stat
 import subprocess
+import tempfile
+import uuid
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Self, cast
 from urllib.parse import urlsplit
 
 import typer
+from click import ClickException
 
-from deepresearch.config import Settings
-from deepresearch.domain import FreshnessRequirement, ResearchRequest, RunBudget, RunConfig
-from deepresearch.providers.embeddings import EmbeddingModelLock
+from deepresearch.domain import (
+    FreshnessRequirement,
+    ResearchRequest,
+    RunBudget,
+    RunConfig,
+    RunEvent,
+    RunResult,
+)
+from deepresearch.evidence.similarity import SimilarityRanker
+from deepresearch.planning import FixedPlanner
+from deepresearch.providers import (
+    Fetcher,
+    ModelProvider,
+    Parser,
+    SearchProvider,
+    TextEmbedder,
+)
+from deepresearch.providers.parsers import HtmlParser, PdfParser
 from deepresearch.providers.replay_schema import (
     REPLAY_BUNDLE_SCHEMA_VERSION,
     REPLAY_FILES,
@@ -22,7 +44,30 @@ from deepresearch.providers.replay_schema import (
     ReplayProviderSnapshot,
     canonical_json_bytes,
 )
+from deepresearch.reporting import MarkdownReportWriter
 from deepresearch.retrieval import URLSecurityError, canonicalize_url
+from deepresearch.runtime import (
+    CancellationToken,
+    CheckpointRef,
+    open_sqlite_checkpointer,
+)
+from deepresearch.runtime.checkpoints import checkpoint_ref_from_tuple
+from deepresearch.storage import (
+    ArtifactIntegrityError,
+    FileCache,
+    LocalArtifactStore,
+    LocalEvidenceStore,
+)
+from deepresearch.workflow import (
+    BaselineNodeHandlers,
+    DurableRunEventSink,
+    LangGraphResearchRunner,
+    build_baseline_graph,
+)
+
+if TYPE_CHECKING:
+    from deepresearch.config import Settings
+    from deepresearch.providers.embeddings import EmbeddingModelLock
 
 from deepresearch import __version__
 
@@ -82,9 +127,10 @@ def _validate_research_options(options: _ResearchOptions) -> _ResearchOptions:
         _option_error("recording cannot be combined with resume")
 
     replay_root = options.replay_root
-    if replay_root is not None:
-        if _is_link_or_reparse(replay_root) or not replay_root.exists() or not replay_root.is_dir():
-            _option_error("replay root is invalid")
+    if replay_root is not None and (
+        _is_link_or_reparse(replay_root) or not replay_root.exists() or not replay_root.is_dir()
+    ):
+        _option_error("replay root is invalid")
 
     record_root = options.record_replay_root
     if record_root is not None and (_is_link_or_reparse(record_root) or record_root.exists()):
@@ -254,7 +300,7 @@ def _build_provider_profile(
         "live": live,
     }
     digest = hashlib.sha256(canonical_json_bytes(profile)).hexdigest()
-    return profile, f"baseline-{mode}-v1:{digest}"
+    return cast("dict[str, object]", profile), f"baseline-{mode}-v1:{digest}"
 
 
 def _build_request_config(
@@ -307,6 +353,649 @@ def _repository_metadata(*, root: Path | None = None) -> tuple[str, str]:
     except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
         raise ValueError("repository metadata is unavailable") from None
     return commit, lock_digest
+
+
+class _ModelIdentityAdapter:
+    """Immutable public-protocol forwarding adapter with explicit model identity."""
+
+    def __init__(
+        self,
+        delegate: ModelProvider,
+        *,
+        model_id: str,
+        model_revision: str,
+    ) -> None:
+        if not model_id or not model_revision:
+            raise ValueError("model identity is incomplete")
+        self._delegate = delegate
+        self.provider_id = delegate.provider_id
+        self.model_id = model_id
+        self.model_revision = model_revision
+
+    def _request(self, request: Any) -> Any:
+        copy = getattr(request, "model_copy", None)
+        if not callable(copy):
+            raise TypeError("model request is invalid")
+        return copy(update={"model_id": self.model_id})
+
+    async def complete(self, request: Any, *, deadline: float, cancellation_token: CancellationToken) -> Any:
+        result = await self._delegate.complete(
+            self._request(request),
+            deadline=deadline,
+            cancellation_token=cancellation_token,
+        )
+        return result.model_copy(update={"model_id": self.model_id})
+
+    async def structured(
+        self,
+        request: Any,
+        output_schema: type[Any],
+        *,
+        deadline: float,
+        cancellation_token: CancellationToken,
+    ) -> Any:
+        result = await self._delegate.structured(
+            self._request(request),
+            output_schema,
+            deadline=deadline,
+            cancellation_token=cancellation_token,
+        )
+        return result.model_copy(update={"model_id": self.model_id})
+
+    def stream(
+        self,
+        request: Any,
+        *,
+        deadline: float,
+        cancellation_token: CancellationToken,
+    ) -> AsyncIterator[Any]:
+        return self._delegate.stream(
+            self._request(request),
+            deadline=deadline,
+            cancellation_token=cancellation_token,
+        )
+
+    async def aclose(self) -> None:
+        close = getattr(self._delegate, "aclose", None)
+        if callable(close):
+            result = close()
+            if hasattr(result, "__await__"):
+                await cast("Any", result)
+
+
+class _ParserRouter:
+    parser_id = "baseline-parser-router"
+    parser_version = "baseline-parser-v1"
+
+    def __init__(self, parsers: tuple[Parser, ...]) -> None:
+        self._parsers = parsers
+
+    def supports(self, content_type: str) -> bool:
+        return any(parser.supports(content_type) for parser in self._parsers)
+
+    async def parse(
+        self,
+        raw_document: Any,
+        *,
+        deadline: float,
+        cancellation_token: CancellationToken,
+    ) -> Any:
+        for parser in self._parsers:
+            if parser.supports(raw_document.content_type):
+                parsed = await parser.parse(
+                    raw_document,
+                    deadline=deadline,
+                    cancellation_token=cancellation_token,
+                )
+                return parsed.model_copy(
+                    update={"parser_id": self.parser_id, "parser_version": self.parser_version}
+                )
+        from deepresearch.providers import ProviderError
+
+        raise ProviderError(
+            code="PARSE_UNSUPPORTED",
+            provider=self.parser_id,
+            operation="parse",
+            public_message="document media type is unsupported",
+            retryable=False,
+        )
+
+
+class _UnknownCostResolver:
+    def resolve_cost(
+        self,
+        *,
+        operation: str,
+        provider_id: str,
+        model_id: str | None,
+        outcome: str,
+        usage: Any,
+    ) -> Decimal | None:
+        del operation, provider_id, model_id, outcome, usage
+        return None
+
+
+def _runtime_root(checkpoint_db: Path) -> Path:
+    absolute = checkpoint_db.absolute()
+    return absolute.parent / f".{absolute.stem}.runtime"
+
+
+def _new_run_id() -> str:
+    return str(uuid.uuid4())
+
+
+def _path_identity(path: Path) -> tuple[int, int]:
+    details = path.stat(follow_symlinks=False)
+    return details.st_dev, details.st_ino
+
+
+class _RuntimeLock:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self._descriptor: int | None = None
+        self._locked = False
+
+    def __enter__(self) -> Self:
+        if _is_link_or_reparse(self.root):
+            raise ValueError("runtime root is unsafe")
+        if self.root.exists() and not self.root.is_dir():
+            raise ValueError("runtime root is not a directory")
+        self.root.mkdir(parents=True, exist_ok=True)
+        if _is_link_or_reparse(self.root) or not self.root.is_dir():
+            raise ValueError("runtime root is unsafe")
+        lock_path = self.root / ".runtime.lock"
+        if _is_link_or_reparse(lock_path):
+            raise ValueError("runtime lock is unsafe")
+        descriptor = os.open(
+            lock_path,
+            os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            if os.fstat(descriptor).st_size == 0:
+                os.write(descriptor, b"\0")
+                os.fsync(descriptor)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            if os.name == "nt":
+                import msvcrt
+
+                try:
+                    msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                except OSError as error:
+                    raise BlockingIOError("runtime is already in use") from error
+            else:
+                import fcntl
+
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as error:
+                    raise BlockingIOError("runtime is already in use") from error
+            self._descriptor = descriptor
+            self._locked = True
+            return self
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        descriptor = self._descriptor
+        self._descriptor = None
+        if descriptor is None:
+            return
+        try:
+            if self._locked:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+            self._locked = False
+
+
+def _event_path(root: Path, *, run_id: str, seq: int) -> Path:
+    key = canonical_json_bytes({"run_id": run_id, "seq": seq})
+    digest = hashlib.sha256(key).hexdigest()
+    directory = root / "run-events" / digest[:2]
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"{digest}.json"
+
+
+class _DurableEventFileSink:
+    def __init__(self, root: Path) -> None:
+        self._root = root
+        events = root / "run-events"
+        if _is_link_or_reparse(events):
+            raise ValueError("event root is unsafe")
+        events.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _canonical_event(event: RunEvent) -> bytes:
+        payload = canonical_json_bytes(event.model_dump(mode="json"))
+        if len(payload) > 1024 * 1024:
+            raise ArtifactIntegrityError("event is too large")
+        return payload
+
+    async def __call__(self, event: RunEvent) -> None:
+        payload = self._canonical_event(event)
+        path = _event_path(self._root, run_id=event.run_id, seq=event.seq)
+        try:
+            descriptor = os.open(
+                path,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+        except FileExistsError:
+            existing = path.read_bytes()
+            if existing != payload:
+                raise ArtifactIntegrityError("durable event conflicts with stored event")
+            return
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            with contextlib.suppress(OSError):
+                path.unlink()
+            raise
+
+    async def get_event(self, *, run_id: str, seq: int) -> RunEvent | None:
+        path = _event_path(self._root, run_id=run_id, seq=seq)
+        try:
+            payload = path.read_bytes()
+        except FileNotFoundError:
+            return None
+        try:
+            event = RunEvent.model_validate_json(payload, strict=True)
+            if canonical_json_bytes(event.model_dump(mode="json")) != payload:
+                raise ValueError
+            if event.run_id != run_id or event.seq != seq:
+                raise ValueError
+            return event
+        except (TypeError, ValueError):
+            raise ArtifactIntegrityError("durable event is corrupt") from None
+
+
+@dataclass
+class _RuntimeComposition:
+    model: ModelProvider
+    search: SearchProvider
+    fetcher: Fetcher
+    embedder: TextEmbedder
+    parser: Parser
+    artifact_store: LocalArtifactStore
+    evidence_store: LocalEvidenceStore
+    cache: FileCache
+    graph: Any
+    runner: LangGraphResearchRunner
+    config: RunConfig
+    replay_bundle: ReplayBundle | None = None
+    recording_writer: Any | None = None
+    _owned: tuple[Any, ...] = ()
+
+    async def aclose(self) -> None:
+        errors: list[Exception] = []
+        for resource in reversed(self._owned):
+            close = getattr(resource, "aclose", None)
+            if not callable(close):
+                continue
+            try:
+                result = close()
+                if hasattr(result, "__await__"):
+                    await cast("Any", result)
+            except Exception as error:  # noqa: BLE001 - close all resources
+                errors.append(error)
+        if errors:
+            raise errors[0]
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON object member")
+        value[key] = item
+    return value
+
+
+def _reject_json_constant(value: str) -> object:
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+def _validate_public_artifacts(
+    composition: _RuntimeComposition,
+    result: RunResult,
+) -> tuple[bytes, bytes, bytes]:
+    if result.status != "completed" or not all(
+        isinstance(item, str)
+        for item in (
+            result.report_artifact_id,
+            result.evidence_graph_artifact_id,
+            result.manifest_artifact_id,
+        )
+    ):
+        raise ArtifactIntegrityError("completed run is missing public artifacts")
+    assert result.report_artifact_id is not None
+    assert result.evidence_graph_artifact_id is not None
+    assert result.manifest_artifact_id is not None
+    try:
+        report_bytes = composition.artifact_store.get_bytes(result.report_artifact_id)
+        evidence_bytes = composition.artifact_store.get_bytes(result.evidence_graph_artifact_id)
+        manifest_bytes = composition.artifact_store.get_bytes(result.manifest_artifact_id)
+        report_bytes.decode("utf-8")
+        parsed_evidence: object = json.loads(
+            evidence_bytes,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+        if type(parsed_evidence) is not dict:
+            raise ValueError
+        parsed_mapping = cast("dict[str, object]", parsed_evidence)
+        if set(parsed_mapping) != {"evidence", "sources"}:
+            raise ValueError
+        from deepresearch.domain import EvidenceSpan, SourceDocument
+
+        evidence_values = parsed_mapping["evidence"]
+        source_values = parsed_mapping["sources"]
+        if type(evidence_values) is not list or type(source_values) is not list:
+            raise ValueError
+        for item in cast("list[object]", evidence_values):
+            EvidenceSpan.model_validate_json(canonical_json_bytes(item), strict=True)
+        for item in cast("list[object]", source_values):
+            SourceDocument.model_validate_json(canonical_json_bytes(item), strict=True)
+        from deepresearch.runtime.manifest import RunManifest
+
+        RunManifest.model_validate_json(manifest_bytes, strict=True)
+    except (FileNotFoundError, TypeError, ValueError, UnicodeDecodeError):
+        raise ArtifactIntegrityError("public artifacts are invalid") from None
+    return report_bytes, evidence_bytes, manifest_bytes
+
+
+def _write_fsynced(path: Path, payload: bytes) -> None:
+    descriptor = os.open(
+        path,
+        os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        with contextlib.suppress(OSError):
+            path.unlink()
+        raise
+
+
+def _publish_public_output(
+    *,
+    output: Path,
+    report_bytes: bytes,
+    evidence_bytes: bytes,
+    manifest_bytes: bytes,
+) -> Path:
+    final = output.absolute()
+    parent = final.parent
+    if _is_link_or_reparse(parent):
+        raise ArtifactIntegrityError("output parent is unsafe")
+    parent.mkdir(parents=True, exist_ok=True)
+    if _is_link_or_reparse(final) or final.exists():
+        raise ArtifactIntegrityError("output destination is occupied")
+    staging = Path(tempfile.mkdtemp(prefix=f".{final.name}.staging.", dir=parent))
+    staging_identity = _path_identity(staging)
+    try:
+        _write_fsynced(staging / "report.md", report_bytes)
+        _write_fsynced(staging / "evidence.json", evidence_bytes)
+        _write_fsynced(staging / "run-manifest.json", manifest_bytes)
+        descriptor = os.open(staging, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        if _is_link_or_reparse(staging) or _path_identity(staging) != staging_identity:
+            raise ArtifactIntegrityError("output staging object was substituted")
+        if _is_link_or_reparse(final) or final.exists():
+            raise ArtifactIntegrityError("output destination is occupied")
+        os.rename(staging, final)
+        staging = Path()
+        return final
+    finally:
+        if staging != Path() and staging.exists():
+            with contextlib.suppress(OSError):
+                if not _is_link_or_reparse(staging) and _path_identity(staging) == staging_identity:
+                    for child in staging.iterdir():
+                        child.unlink(missing_ok=True)
+                    staging.rmdir()
+
+
+def _print_result(*, result: RunResult, output: Path) -> None:
+    typer.echo(f"status={result.status}")
+    if result.stop_reason is not None:
+        typer.echo(f"stop_reason={result.stop_reason}")
+    typer.echo(f"report={output / 'report.md'}")
+    typer.echo(f"evidence={output / 'evidence.json'}")
+    typer.echo(f"manifest={output / 'run-manifest.json'}")
+
+
+def _replay_model_id(bundle: ReplayBundle) -> str:
+    snapshot = bundle.snapshot.providers.get("model")
+    if snapshot is None or snapshot.model_id is None:
+        raise ValueError("replay model identity is unavailable")
+    return snapshot.model_id
+
+
+def _load_replay_bundle(path: Path) -> ReplayBundle:
+    try:
+        bundle = ReplayBundle.load(path)
+        verification = bundle.verify()
+        if not verification.valid:
+            raise ValueError("replay bundle is invalid")
+        return bundle
+    except Exception as error:
+        if isinstance(error, MemoryError):
+            raise
+        raise ValueError("replay bundle is invalid") from None
+
+
+def _compose_replay_components(
+    *,
+    bundle: ReplayBundle,
+    runtime_root: Path,
+    budget_name: Literal["low", "medium", "high"],
+    provider_profile_id: str,
+    checkpointer: Any,
+    question: str,
+    mode: Literal["replay", "hybrid"],
+) -> _RuntimeComposition:
+    from deepresearch.providers.replay import (
+        ReplayFetcher,
+        ReplayModelProvider,
+        ReplaySearchProvider,
+        ReplayTextEmbedder,
+    )
+
+    artifact_store = LocalArtifactStore(runtime_root)
+    evidence_store = LocalEvidenceStore(runtime_root)
+    cache = FileCache(runtime_root)
+    model_base: ModelProvider = _ModelIdentityAdapter(
+        ReplayModelProvider(bundle),
+        model_id=_replay_model_id(bundle),
+        model_revision=bundle.snapshot.providers["model"].model_revision or "",
+    )
+    search: SearchProvider = ReplaySearchProvider(bundle)
+    fetcher: Fetcher = ReplayFetcher(bundle)
+    embedder: TextEmbedder = ReplayTextEmbedder(bundle)
+    parser: Parser = _ParserRouter((HtmlParser(), PdfParser()))
+    budget = RunBudget.preset(budget_name).model_copy(update={"max_cost_usd": None})
+    planner = FixedPlanner(
+        model=model_base,
+        artifact_store=artifact_store,
+        budget=budget,
+    )
+    ranker = SimilarityRanker(embedder)
+    writer = MarkdownReportWriter(evidence_store, model=model_base)
+    code_commit, lock_digest = _repository_metadata()
+    handlers = BaselineNodeHandlers(
+        initial_plan_generator=planner,
+        ranker=cast("Any", ranker),
+        writer=writer,
+        search_provider=search,
+        fetcher=fetcher,
+        parser=parser,
+        artifact_store=artifact_store,
+        evidence_store=evidence_store,
+        cache=cache,
+        usage_cost_resolver=_UnknownCostResolver(),
+        search_snapshot_id=f"{provider_profile_id}/search",
+        fetch_snapshot_id=f"{provider_profile_id}/fetch",
+        code_commit=code_commit,
+        dependency_lock_sha256=lock_digest,
+        provider_profile_configuration_sha256=provider_profile_id.split(":", 1)[1],
+        seed_supported=True,
+        pricing_status="unknown",
+        pricing_snapshots=(),
+        replay_parent=bundle.snapshot.run_id,
+    )
+    config = _build_request_config(
+        question=question,
+        mode=mode,
+        budget_name=budget_name,
+        provider_profile_id=provider_profile_id,
+        prompt_versions=dict(handlers.prompt_versions),
+    )
+    graph = build_baseline_graph(handlers.as_dependencies(checkpointer))
+    runner = LangGraphResearchRunner(baseline_graph=graph)
+    return _RuntimeComposition(
+        model=model_base,
+        search=search,
+        fetcher=fetcher,
+        embedder=embedder,
+        parser=parser,
+        artifact_store=artifact_store,
+        evidence_store=evidence_store,
+        cache=cache,
+        graph=graph,
+        runner=runner,
+        config=config,
+        replay_bundle=bundle,
+        _owned=(model_base, search, fetcher, embedder),
+    )
+
+
+def _compose_live_components(
+    *,
+    settings: Any,
+    embedding_lock: Any,
+    runtime_root: Path,
+    budget_name: Literal["low", "medium", "high"],
+    provider_profile_id: str,
+    checkpointer: Any,
+    question: str,
+    mode: Literal["live", "hybrid"],
+    replay_bundle: ReplayBundle | None = None,
+) -> _RuntimeComposition:
+    from deepresearch.providers.embeddings import SentenceTransformerTextEmbedder
+    from deepresearch.providers.httpx_fetcher import HttpxFetcher
+    from deepresearch.providers.httpx_transport import PinnedPeerTransport
+    from deepresearch.providers.openai_compatible import OpenAICompatibleModelProvider
+    from deepresearch.providers.tavily import TavilySearchProvider
+
+    artifact_store = LocalArtifactStore(runtime_root)
+    evidence_store = LocalEvidenceStore(runtime_root)
+    cache = FileCache(runtime_root)
+    transport = PinnedPeerTransport(
+        connect_timeout_seconds=float(settings.connect_timeout_seconds),
+        read_timeout_seconds=float(settings.read_timeout_seconds),
+    )
+    raw_model = OpenAICompatibleModelProvider(
+        base_url=_safe_absolute_endpoint(str(settings.model_base_url), model_base=True),
+        api_key=settings.model_api_key,
+        model_revision=_MODEL_REVISION,
+    )
+    model: ModelProvider = _ModelIdentityAdapter(
+        raw_model,
+        model_id=settings.model_id,
+        model_revision=_MODEL_REVISION,
+    )
+    parser: Parser = _ParserRouter((HtmlParser(), PdfParser()))
+    embedder: TextEmbedder = SentenceTransformerTextEmbedder.from_lock(
+        embedding_lock,
+        model_root=Path(settings.embedding_model_root),
+    )
+    search: SearchProvider
+    fetcher: Fetcher
+    owned: list[Any] = [model, embedder, raw_model]
+    if replay_bundle is None:
+        search = TavilySearchProvider(api_key=settings.tavily_api_key)
+        fetcher = HttpxFetcher(
+            transport=transport,
+            max_redirects=_FETCH_MAX_REDIRECTS,
+            max_body_bytes=_FETCH_MAX_BODY_BYTES,
+        )
+        owned.extend((search, fetcher))
+    else:
+        from deepresearch.providers.replay import ReplayFetcher, ReplaySearchProvider
+
+        search = ReplaySearchProvider(replay_bundle)
+        fetcher = ReplayFetcher(replay_bundle)
+        owned.extend((search, fetcher))
+    budget = RunBudget.preset(budget_name).model_copy(update={"max_cost_usd": None})
+    planner = FixedPlanner(model=model, artifact_store=artifact_store, budget=budget)
+    ranker = SimilarityRanker(embedder)
+    writer = MarkdownReportWriter(evidence_store, model=model)
+    code_commit, lock_digest = _repository_metadata()
+    handlers = BaselineNodeHandlers(
+        initial_plan_generator=planner,
+        ranker=cast("Any", ranker),
+        writer=writer,
+        search_provider=search,
+        fetcher=fetcher,
+        parser=parser,
+        artifact_store=artifact_store,
+        evidence_store=evidence_store,
+        cache=cache,
+        usage_cost_resolver=_UnknownCostResolver(),
+        search_snapshot_id=f"{provider_profile_id}/search",
+        fetch_snapshot_id=f"{provider_profile_id}/fetch",
+        code_commit=code_commit,
+        dependency_lock_sha256=lock_digest,
+        provider_profile_configuration_sha256=provider_profile_id.split(":", 1)[1],
+        seed_supported=True,
+        pricing_status="unknown",
+        pricing_snapshots=(),
+        replay_parent=None if replay_bundle is None else replay_bundle.snapshot.run_id,
+    )
+    config = _build_request_config(
+        question=question,
+        mode=mode,
+        budget_name=budget_name,
+        provider_profile_id=provider_profile_id,
+        prompt_versions=dict(handlers.prompt_versions),
+    )
+    graph = build_baseline_graph(handlers.as_dependencies(checkpointer))
+    runner = LangGraphResearchRunner(baseline_graph=graph)
+    return _RuntimeComposition(
+        model=model,
+        search=search,
+        fetcher=fetcher,
+        embedder=embedder,
+        parser=parser,
+        artifact_store=artifact_store,
+        evidence_store=evidence_store,
+        cache=cache,
+        graph=graph,
+        runner=runner,
+        config=config,
+        replay_bundle=replay_bundle,
+        _owned=tuple(owned),
+    )
 
 
 @app.callback()
@@ -371,12 +1060,129 @@ def research(
     )
     try:
         asyncio.run(_research_async(options))
-    except typer.ClickException:
+    except ClickException:
         raise
-    except Exception as error:  # noqa: BLE001 - convert to a stable CLI boundary
-        raise typer.ClickException("research run failed") from error
+    except Exception as error:
+        raise ClickException("research run failed") from error
 
 
 async def _research_async(options: _ResearchOptions) -> None:
-    del options
-    raise typer.ClickException("research composition is not available")
+    replay_bundle: ReplayBundle | None = None
+    settings: Any | None = None
+    embedding_lock: Any | None = None
+    if options.mode in {"replay", "hybrid"}:
+        if options.replay_root is None:
+            raise ClickException("replay root is required")
+        replay_bundle = _load_replay_bundle(options.replay_root)
+    if options.mode in {"live", "hybrid"}:
+        try:
+            from deepresearch.config import Settings
+            from deepresearch.providers.embeddings import EmbeddingModelLock
+
+            settings = Settings()
+            embedding_lock = EmbeddingModelLock.load(settings.embedding_lock_path)
+            embedding_lock.verify(settings.embedding_model_root)
+        except Exception as error:
+            if isinstance(error, MemoryError):
+                raise
+            raise ClickException("live provider configuration is unavailable") from None
+
+    # Build identity before the regular request/config objects.  Replay remains a
+    # strict offline path: neither Settings nor live provider modules are imported.
+    _profile, profile_id = _build_provider_profile(
+        mode=options.mode,
+        bundle=replay_bundle,
+        settings=settings,
+        embedding_lock=embedding_lock,
+    )
+    runtime_root = _runtime_root(options.checkpoint_db)
+    try:
+        with _RuntimeLock(runtime_root):
+            async with open_sqlite_checkpointer(options.checkpoint_db) as saver:
+                checkpoint: CheckpointRef | None = None
+                run_id: str
+                thread_id: str
+                if options.resume_checkpoint is not None and options.resume_thread_id is not None:
+                    thread_id = options.resume_thread_id
+                    run_id = thread_id
+                    saved = await cast("Any", saver).aget_tuple(
+                        {
+                            "configurable": {
+                                "thread_id": thread_id,
+                                "checkpoint_ns": "",
+                                "checkpoint_id": options.resume_checkpoint,
+                            }
+                        }
+                    )
+                    if saved is None:
+                        raise ClickException("checkpoint mismatch")
+                    try:
+                        checkpoint = checkpoint_ref_from_tuple(saved)
+                    except Exception as error:
+                        if isinstance(error, MemoryError):
+                            raise
+                        raise ClickException("checkpoint mismatch") from None
+                    if (
+                        checkpoint.thread_id != thread_id
+                        or checkpoint.checkpoint_id != options.resume_checkpoint
+                    ):
+                        raise ClickException("checkpoint mismatch")
+                else:
+                    run_id = _new_run_id()
+                    thread_id = run_id
+
+                if replay_bundle is not None and options.mode == "replay":
+                    composition = _compose_replay_components(
+                        bundle=replay_bundle,
+                        runtime_root=runtime_root,
+                        budget_name=options.budget,
+                        provider_profile_id=profile_id,
+                        checkpointer=saver,
+                        question=options.question,
+                        mode=cast("Literal['replay', 'hybrid']", options.mode),
+                    )
+                elif settings is not None and embedding_lock is not None:
+                    composition = _compose_live_components(
+                        settings=settings,
+                        embedding_lock=embedding_lock,
+                        runtime_root=runtime_root,
+                        budget_name=options.budget,
+                        provider_profile_id=profile_id,
+                        checkpointer=saver,
+                        question=options.question,
+                        mode=cast("Literal['live', 'hybrid']", options.mode),
+                        replay_bundle=replay_bundle,
+                    )
+                else:
+                    raise ClickException("provider composition is unavailable")
+                try:
+                    # Task 8 requires a durable sink, not a best-effort display callback.
+                    sink: DurableRunEventSink = _DurableEventFileSink(runtime_root)
+                    result = await composition.runner.run(
+                        run_id=run_id,
+                        thread_id=thread_id,
+                        config=composition.config,
+                        checkpoint=checkpoint,
+                        emit=sink,
+                        cancellation_token=CancellationToken(),
+                    )
+                    if result.status != "completed":
+                        raise ClickException("research run failed")
+                    report_bytes, evidence_bytes, manifest_bytes = _validate_public_artifacts(
+                        composition, result
+                    )
+                finally:
+                    await composition.aclose()
+                published = _publish_public_output(
+                    output=options.output,
+                    report_bytes=report_bytes,
+                    evidence_bytes=evidence_bytes,
+                    manifest_bytes=manifest_bytes,
+                )
+                _print_result(result=result, output=published)
+    except ClickException:
+        raise
+    except BlockingIOError:
+        raise ClickException("runtime is already in use") from None
+    except (ArtifactIntegrityError, OSError, ValueError):
+        raise ClickException("research run failed") from None

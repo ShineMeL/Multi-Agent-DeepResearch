@@ -5,21 +5,19 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from apps.cli.main import app
-from apps.cli.main import (
-    _build_provider_profile,
-    _build_request_config,
-    _repository_metadata,
-    _safe_absolute_endpoint,
-)
+import apps.cli.main as cli
 from deepresearch.config import Settings
 from deepresearch.domain import RunBudget
 from deepresearch.providers.embeddings import EmbeddingModelFile, EmbeddingModelLock
 from deepresearch.providers.replay_schema import ReplayBundle
 
-
 runner = CliRunner()
 FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures" / "replay" / "provider_contract"
+app = cli.app
+_build_provider_profile = getattr(cli, "_build_provider_profile")  # noqa: B009
+_build_request_config = getattr(cli, "_build_request_config")  # noqa: B009
+_repository_metadata = getattr(cli, "_repository_metadata")  # noqa: B009
+_safe_absolute_endpoint = getattr(cli, "_safe_absolute_endpoint")  # noqa: B009
 
 
 def test_version_output_is_byte_compatible() -> None:
