@@ -1,0 +1,117 @@
+{
+  "task_id": "dev-ts-example",
+  "split": "dev",
+  "category": "technical_survey",
+  "request": {
+    "question": "What are the main planner routes for research agents?",
+    "output_requirements": {
+      "answer_shape": "markdown",
+      "include_limitations": true
+    },
+    "report_language": "en",
+    "source_languages": ["en"],
+    "freshness_requirement": {"kind": "none"},
+    "execution_mode": "replay",
+    "access_profile": "showcase",
+    "provider_profile_id": "example-profile",
+    "run_purpose": "benchmark",
+    "budget_preset": "low"
+  },
+  "evaluation_cutoff": "2026-08-29",
+  "information_needs": [
+    {
+      "need_id": "need-routes",
+      "text": "Which planner routes are used?",
+      "importance": 0.6,
+      "acceptable_claim_ids": ["claim-iterative"]
+    },
+    {
+      "need_id": "need-tradeoff",
+      "text": "What tradeoff does the route introduce?",
+      "importance": 0.4,
+      "acceptable_claim_ids": ["claim-tradeoff"]
+    }
+  ],
+  "acceptable_claims": [
+    {
+      "claim_id": "claim-iterative",
+      "text": "Iterative decomposition is one planner route.",
+      "claim_type": "fact",
+      "entities": ["planner"],
+      "numbers": [],
+      "qualifiers": [],
+      "report_section": "findings",
+      "verification_status": "supported"
+    },
+    {
+      "claim_id": "claim-tradeoff",
+      "text": "The route trades extra searches for broader coverage.",
+      "claim_type": "comparison",
+      "entities": ["searches", "coverage"],
+      "numbers": [],
+      "qualifiers": [],
+      "report_section": "tradeoffs",
+      "verification_status": "supported"
+    }
+  ],
+  "candidate_source_ids": ["src-html", "src-pdf"],
+  "gold_source_family_ids": ["example.test/html", "example.test/pdf"],
+  "snapshot_id": "snapshot-example-v1",
+  "corpus_version": "corpus-example-v1",
+  "index_version": "index-example-v1",
+  "gold_evidence_spans": [
+    {
+      "evidence_id": "ev-html",
+      "source_id": "src-html",
+      "locator": {
+        "kind": "html",
+        "paragraph_id": "main-0",
+        "start_char": 0,
+        "end_char": 33
+      },
+      "relevance_grade": 3,
+      "excerpt_hash": "23a1a78cec04dcbf7a31aa9d49d34ad6b40790f58e27fa6f556ad6ff526ce0a5"
+    },
+    {
+      "evidence_id": "ev-pdf",
+      "source_id": "src-pdf",
+      "locator": {
+        "kind": "pdf",
+        "page_index": 0,
+        "block_index": 0,
+        "start_char": 0,
+        "end_char": 32
+      },
+      "relevance_grade": 2,
+      "excerpt_hash": "a9baaec58d1ff706b6e93ece64a40d43059e3c74960be267ecba46a6be8d6fd5"
+    }
+  ],
+  "gold_claim_links": [
+    {
+      "claim_id": "claim-iterative",
+      "evidence_links": [{"evidence_id": "ev-html", "relation": "support"}]
+    },
+    {
+      "claim_id": "claim-tradeoff",
+      "evidence_links": [{"evidence_id": "ev-pdf", "relation": "context"}]
+    }
+  ],
+  "rubric": {
+    "coverage": {
+      "rubric_id": "coverage",
+      "description": "Coverage of the requested routes",
+      "weight": 0.6,
+      "levels": {"0": "none", "1": "limited", "2": "mostly", "3": "complete"}
+    },
+    "evidence": {
+      "rubric_id": "evidence",
+      "description": "Traceability of claims to sources",
+      "weight": 0.4,
+      "levels": {"0": "none", "1": "weak", "2": "good", "3": "direct"}
+    }
+  },
+  "expected_stop_reason": "SUFFICIENT",
+  "expected_is_partial": false,
+  "created_at": "2026-08-29",
+  "annotation_version": "example-v1"
+}
