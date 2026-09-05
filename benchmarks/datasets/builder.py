@@ -155,7 +155,8 @@ def _require_semantic_reviews(private_root: Path, records: Sequence[AnnotatedQue
         raise ValueError("semantic review artifact is invalid") from error
     if not isinstance(raw, list):
         raise TypeError("semantic review artifact must be a list")
-    reviewed: set[tuple[frozenset[str], frozenset[str]]] = set()
+    known_hashes = {record.task_id: _question_content_hash(record) for record in records}
+    reviewed: set[tuple[tuple[str, str], tuple[str, str]]] = set()
     for item in cast("list[object]", raw):
         if not isinstance(item, dict):
             raise TypeError("semantic review entry is invalid")
@@ -175,16 +176,27 @@ def _require_semantic_reviews(private_root: Path, records: Sequence[AnnotatedQue
             or any(not isinstance(value, str) for value in [*task_id_values, *hash_values])
         ):
             raise ValueError("semantic review entry is invalid")
-        reviewed.add(
-            (
-                frozenset(cast("str", value) for value in task_id_values),
-                frozenset(cast("str", value) for value in hash_values),
-            )
+        pair_values = sorted(
+            (cast("str", task_id), cast("str", question_hash))
+            for task_id, question_hash in zip(task_id_values, hash_values, strict=True)
         )
+        pairs = (pair_values[0], pair_values[1])
+        if pairs[0][0] == pairs[1][0] or any(
+            task_id not in known_hashes
+            or not re.fullmatch(r"[0-9a-f]{64}", question_hash)
+            or known_hashes[task_id] != question_hash
+            for task_id, question_hash in pairs
+        ):
+            raise ValueError("semantic review entry is invalid")
+        reviewed.add(pairs)
     for first, second in _semantic_review_candidates(records):
-        expected = (
-            frozenset((first.task_id, second.task_id)),
-            frozenset((_question_content_hash(first), _question_content_hash(second))),
+        expected = tuple(
+            sorted(
+                (
+                    (first.task_id, _question_content_hash(first)),
+                    (second.task_id, _question_content_hash(second)),
+                )
+            )
         )
         if expected not in reviewed:
             raise ValueError(f"unreviewed semantic candidate: {first.task_id}, {second.task_id}")
@@ -261,9 +273,9 @@ class DatasetBuilder:
             raise ValueError("version must be non-empty")
         if type(subset_seed) is not int:
             raise TypeError("subset_seed must be an integer")
-        private_path = Path(private_root).absolute()
-        public_path = Path(public_root).absolute()
-        snapshot_path = Path(snapshot_root).absolute()
+        private_path = Path(private_root).resolve()
+        public_path = Path(public_root).resolve()
+        snapshot_path = Path(snapshot_root).resolve()
         private_manifest_path = private_path / "private_manifest.json"
         public_manifest_path = public_path / "public_manifest.json"
         commit_marker_path = private_path / ".dataset_commit.json"
@@ -426,14 +438,17 @@ class DatasetBuilder:
                     "existing finalized dataset is invalid and cannot be replaced"
                 )
 
-        private_stage_root = (
-            private_path.parent / f".{private_path.name}.{uuid.uuid4().hex}.staging"
-        )
+        private_stage_root = private_path / f".dataset-staging-{uuid.uuid4().hex}.staging"
         public_stage_root = public_path.parent / f".{public_path.name}.{uuid.uuid4().hex}.staging"
         commit_staging = private_stage_root / ".dataset_commit.json"
         staging_paths: list[tuple[Path, Path]] = []
         staging_files: list[Path] = [commit_staging]
         try:
+            if _path_exists(private_stage_root):
+                raise FileExistsError("private staging path already exists")
+            private_stage_root.mkdir()
+            if not private_stage_root.resolve().is_relative_to(private_path):
+                raise ValueError("private staging path escapes private_root")
             for category in TaskCategory:
                 dev_target = public_path / "runtime" / "dev" / f"{category.value}.jsonl"
                 test_target = private_path / "runtime" / "test" / f"{category.value}.jsonl"

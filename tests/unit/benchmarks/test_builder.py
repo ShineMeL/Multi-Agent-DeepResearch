@@ -407,6 +407,31 @@ def test_finalize_requires_content_bound_distinct_review_across_categories(tmp_p
                 {
                     "disposition": "distinct",
                     "question_sha256": [
+                        builder_module._question_content_hash(second),
+                        builder_module._question_content_hash(first),
+                    ],
+                    "task_ids": [first.task_id, second.task_id],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="semantic review entry is invalid"):
+        DatasetBuilder(snapshot_root=snapshot_root).finalize(
+            dataset_id="frozen-ai-cs-60",
+            version="1.0.0",
+            private_root=private_root,
+            public_root=public_root,
+            snapshot_root=snapshot_root,
+            subset_seed=20260829,
+        )
+
+    (private_root / "semantic_reviews.json").write_text(
+        json.dumps(
+            [
+                {
+                    "disposition": "distinct",
+                    "question_sha256": [
                         builder_module._question_content_hash(first),
                         builder_module._question_content_hash(second),
                     ],
@@ -429,3 +454,85 @@ def test_finalize_requires_content_bound_distinct_review_across_categories(tmp_p
         "semantic_reviews" not in path.read_text(encoding="utf-8")
         for path in (public_root / "runtime" / "dev").glob("*.jsonl")
     )
+
+
+def test_finalize_rejects_review_when_prompt_content_changes(tmp_path: Path) -> None:
+    private_root = tmp_path / "private"
+    public_root = tmp_path / "public"
+    snapshot_root = tmp_path / "snapshots"
+    _write_complete_private_dataset(private_root, snapshot_root)
+    first_path = private_root / "batches" / "technical_survey.jsonl"
+    second_path = private_root / "batches" / "method_comparison.jsonl"
+
+    def replace_question(path: Path, question: str) -> AnnotatedQuestion:
+        records = [
+            AnnotatedQuestion.model_validate_json(line, strict=True)
+            for line in path.read_bytes().splitlines()
+        ]
+        replacement = records[0].model_copy(
+            update={"request": records[0].request.model_copy(update={"question": question})}
+        )
+        records[0] = replacement
+        path.write_bytes(
+            b"".join(record.model_dump_json().encode("utf-8") + b"\n" for record in records)
+        )
+        return replacement
+
+    first = replace_question(first_path, "Compare research agent planner routes")
+    second = replace_question(second_path, "Contrast research agent planner routes")
+    (private_root / "semantic_reviews.json").write_text(
+        json.dumps(
+            [
+                {
+                    "disposition": "distinct",
+                    "question_sha256": [
+                        builder_module._question_content_hash(first),
+                        builder_module._question_content_hash(second),
+                    ],
+                    "task_ids": [first.task_id, second.task_id],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    replace_question(first_path, "Compare research agent planner pathways")
+
+    with pytest.raises(ValueError, match="semantic review entry is invalid"):
+        DatasetBuilder(snapshot_root=snapshot_root).finalize(
+            dataset_id="frozen-ai-cs-60",
+            version="1.0.0",
+            private_root=private_root,
+            public_root=public_root,
+            snapshot_root=snapshot_root,
+            subset_seed=20260829,
+        )
+
+
+def test_finalize_private_staging_is_contained_in_private_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    private_root = tmp_path / "private-dataset"
+    public_root = tmp_path / "public-dataset"
+    snapshot_root = tmp_path / "snapshots"
+    _write_complete_private_dataset(private_root, snapshot_root)
+    staging_paths: list[Path] = []
+
+    def record_private_staging_then_fail(path: Path, payload: bytes) -> None:
+        if "test" in path.parts and "runtime" in path.parts:
+            staging_paths.append(path.resolve())
+            raise OSError("stop after private staging path allocation")
+
+    monkeypatch.setattr(builder_module, "_write_staging_file", record_private_staging_then_fail)
+    with pytest.raises(OSError, match="stop after private staging"):
+        DatasetBuilder(snapshot_root=snapshot_root).finalize(
+            dataset_id="frozen-ai-cs-60",
+            version="1.0.0",
+            private_root=private_root,
+            public_root=public_root,
+            snapshot_root=snapshot_root,
+            subset_seed=20260829,
+        )
+
+    assert staging_paths
+    assert all(path.is_relative_to(private_root.resolve()) for path in staging_paths)
+    assert not list(private_root.rglob("*.staging"))
