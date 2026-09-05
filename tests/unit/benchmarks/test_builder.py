@@ -536,3 +536,65 @@ def test_finalize_private_staging_is_contained_in_private_root(
     assert staging_paths
     assert all(path.is_relative_to(private_root.resolve()) for path in staging_paths)
     assert not list(private_root.rglob("*.staging"))
+
+
+def test_finalize_preserves_existing_private_staging_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    private_root = tmp_path / "private"
+    snapshot_root = tmp_path / "snapshots"
+    _write_complete_private_dataset(private_root, snapshot_root)
+    staging_root = private_root / ".dataset-staging-sentinel.staging"
+    staging_root.mkdir()
+    sentinel = staging_root / "keep.txt"
+    sentinel.write_text("must survive", encoding="utf-8")
+
+    class FixedUUID:
+        hex = "sentinel"
+
+    monkeypatch.setattr(builder_module.uuid, "uuid4", lambda: FixedUUID())
+    with pytest.raises(FileExistsError, match="private staging path already exists"):
+        DatasetBuilder(snapshot_root=snapshot_root).finalize(
+            dataset_id="frozen-ai-cs-60",
+            version="1.0.0",
+            private_root=private_root,
+            public_root=tmp_path / "public",
+            snapshot_root=snapshot_root,
+            subset_seed=20260829,
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "must survive"
+
+
+def test_finalize_preserves_existing_private_staging_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    private_root = tmp_path / "private"
+    snapshot_root = tmp_path / "snapshots"
+    _write_complete_private_dataset(private_root, snapshot_root)
+    sentinel_root = tmp_path / "symlink-target"
+    sentinel_root.mkdir()
+    sentinel = sentinel_root / "keep.txt"
+    sentinel.write_text("must survive", encoding="utf-8")
+    staging_root = private_root / ".dataset-staging-sentinel.staging"
+    try:
+        staging_root.symlink_to(sentinel_root, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are not permitted on this platform")
+
+    class FixedUUID:
+        hex = "sentinel"
+
+    monkeypatch.setattr(builder_module.uuid, "uuid4", lambda: FixedUUID())
+    with pytest.raises(FileExistsError, match="private staging path already exists"):
+        DatasetBuilder(snapshot_root=snapshot_root).finalize(
+            dataset_id="frozen-ai-cs-60",
+            version="1.0.0",
+            private_root=private_root,
+            public_root=tmp_path / "public",
+            snapshot_root=snapshot_root,
+            subset_seed=20260829,
+        )
+
+    assert staging_root.is_symlink()
+    assert sentinel.read_text(encoding="utf-8") == "must survive"

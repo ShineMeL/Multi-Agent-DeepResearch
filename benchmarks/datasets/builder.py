@@ -48,6 +48,13 @@ def _path_exists(path: Path) -> bool:
     return path.exists() or path.is_symlink()
 
 
+def _resolved_within(path: Path, root: Path) -> bool:
+    try:
+        return path.resolve().is_relative_to(root.resolve())
+    except OSError:
+        return False
+
+
 def _write_staging_file(path: Path, payload: bytes) -> None:
     with path.open("xb") as handle:
         handle.write(payload)
@@ -442,20 +449,32 @@ class DatasetBuilder:
         public_stage_root = public_path.parent / f".{public_path.name}.{uuid.uuid4().hex}.staging"
         commit_staging = private_stage_root / ".dataset_commit.json"
         staging_paths: list[tuple[Path, Path]] = []
-        staging_files: list[Path] = [commit_staging]
+        private_stage_owned = False
+        private_stage_contained = False
+        public_stage_owned = False
+        public_stage_contained = False
         try:
             if _path_exists(private_stage_root):
                 raise FileExistsError("private staging path already exists")
             private_stage_root.mkdir()
-            if not private_stage_root.resolve().is_relative_to(private_path):
+            private_stage_owned = True
+            private_stage_contained = _resolved_within(private_stage_root, private_path)
+            if not private_stage_contained:
                 raise ValueError("private staging path escapes private_root")
+            public_stage_root.parent.mkdir(parents=True, exist_ok=True)
+            if _path_exists(public_stage_root):
+                raise FileExistsError("public staging path already exists")
+            public_stage_root.mkdir()
+            public_stage_owned = True
+            public_stage_contained = _resolved_within(public_stage_root, public_path.parent)
+            if not public_stage_contained:
+                raise ValueError("public staging path escapes public parent")
             for category in TaskCategory:
                 dev_target = public_path / "runtime" / "dev" / f"{category.value}.jsonl"
                 test_target = private_path / "runtime" / "test" / f"{category.value}.jsonl"
                 dev_staging = public_stage_root / "runtime" / "dev" / f"{category.value}.jsonl"
                 test_staging = private_stage_root / "runtime" / "test" / f"{category.value}.jsonl"
                 staging_paths.extend(((dev_staging, dev_target), (test_staging, test_target)))
-                staging_files.extend((dev_staging, test_staging))
                 dev_staging.parent.mkdir(parents=True, exist_ok=True)
                 test_staging.parent.mkdir(parents=True, exist_ok=True)
                 _write_staging_file(
@@ -474,7 +493,6 @@ class DatasetBuilder:
                     (public_staging, public_manifest_path),
                 )
             )
-            staging_files.extend((private_staging, public_staging))
             private_staging.parent.mkdir(parents=True, exist_ok=True)
             public_staging.parent.mkdir(parents=True, exist_ok=True)
             _write_staging_file(private_staging, private_bytes)
@@ -505,14 +523,18 @@ class DatasetBuilder:
             _publish_file(commit_staging, commit_marker_path)
             if commit_marker_path.read_bytes() != commit_bytes:
                 raise ValueError("published dataset commit marker does not match")
-        except Exception:
-            for staging in staging_files:
-                if _path_exists(staging):
-                    staging.unlink()
-            raise
         finally:
-            for stage_root in (private_stage_root, public_stage_root):
-                if _path_exists(stage_root):
+            for stage_root, root, owned, contained in (
+                (private_stage_root, private_path, private_stage_owned, private_stage_contained),
+                (public_stage_root, public_path.parent, public_stage_owned, public_stage_contained),
+            ):
+                if (
+                    owned
+                    and contained
+                    and _path_exists(stage_root)
+                    and not stage_root.is_symlink()
+                    and _resolved_within(stage_root, root)
+                ):
                     shutil.rmtree(stage_root)
         return DatasetFinalizeResult(
             public_manifest_path=public_manifest_path,
