@@ -846,6 +846,26 @@ def _run_event_from_receipt_payload(value: object) -> RunEvent:
     return exact
 
 
+def _node_execution_from_receipt_payload(value: object) -> NodeExecutionRecord:
+    """Decode a node receipt only when its JSON is strict and canonical."""
+    try:
+        payload_bytes = _canonical_bytes(value)
+        record = NodeExecutionRecord.model_validate_json(
+            payload_bytes,
+            strict=True,
+        )
+    except (TypeError, ValueError):
+        raise ArtifactIntegrityError("node execution receipt is corrupt") from None
+    if payload_bytes != _canonical_bytes(record.model_dump(mode="json")):
+        raise ArtifactIntegrityError("node execution receipt is not canonical")
+    if (
+        record.usage.wall_seconds == 0.0
+        and math.copysign(1.0, record.usage.wall_seconds) < 0
+    ):
+        raise ArtifactIntegrityError("node execution receipt is not canonical")
+    return record
+
+
 def _validate_exact_json_value(value: object) -> None:
     if value is None or type(value) in (str, int, bool):
         return
@@ -4096,11 +4116,13 @@ class BaselineNodeHandlers:
             consumed_node_receipts.add(node_receipt_id)
             receipt = indexed_receipts[node_receipt_id]
             try:
-                execution = NodeExecutionRecord.model_validate(
+                execution = _node_execution_from_receipt_payload(
                     receipt.payload.get("record")
                 )
-            except (TypeError, ValueError):
-                raise ArtifactIntegrityError("node completion receipt is corrupt") from None
+            except ArtifactIntegrityError:
+                raise ArtifactIntegrityError(
+                    "node completion receipt is corrupt"
+                ) from None
             base_event = _run_event_from_receipt_payload(receipt.payload.get("event"))
             expected_event = base_event.model_copy(
                 update={
@@ -4929,7 +4951,7 @@ def _next_node_attempt(
             continue
         if receipt.run_id != state["run_id"] or receipt.thread_id != state["thread_id"]:
             raise ArtifactIntegrityError("node audit receipt belongs to another run")
-        record = NodeExecutionRecord.model_validate(receipt.payload.get("record"))
+        record = _node_execution_from_receipt_payload(receipt.payload.get("record"))
         if record.node == node:
             attempts.append(record.attempt)
     if attempts != list(range(1, len(attempts) + 1)):
@@ -5085,9 +5107,11 @@ async def _recover_durable_node_event(
         raise ArtifactIntegrityError("durable event node receipt is missing or ambiguous")
     node_receipt_id, payload = matches[0]
     try:
-        execution = NodeExecutionRecord.model_validate(payload.get("record"))
-    except (TypeError, ValueError):
-        raise ArtifactIntegrityError("durable event node receipt is corrupt") from None
+        execution = _node_execution_from_receipt_payload(payload.get("record"))
+    except ArtifactIntegrityError:
+        raise ArtifactIntegrityError(
+            "durable event node receipt is corrupt"
+        ) from None
     base_event = _run_event_from_receipt_payload(payload.get("event"))
     if execution.node != node or base_event.node != node:
         raise ArtifactIntegrityError("durable event node receipt conflicts with graph state")
@@ -5142,6 +5166,86 @@ async def _recover_durable_node_event(
     }
 
 
+def _verified_persist_result_pair(
+    *,
+    composition: _AuditComposition,
+    state: BaselineState,
+    evidence_graph_artifact_id: object,
+    manifest_artifact_id: object,
+) -> tuple[str | None, str | None]:
+    """Return a result pair only after strict content-addressed readback."""
+    if (
+        type(evidence_graph_artifact_id) is not str
+        or type(manifest_artifact_id) is not str
+    ):
+        return None, None
+    graph_id = evidence_graph_artifact_id
+    manifest_id = manifest_artifact_id
+    if (
+        not graph_id.startswith("sha256:")
+        or not manifest_id.startswith("sha256:")
+    ):
+        return None, None
+    try:
+        graph_bytes = composition.artifact_store.get_bytes(graph_id)
+        manifest_bytes = composition.artifact_store.get_bytes(manifest_id)
+        if (
+            hashlib.sha256(graph_bytes).hexdigest() != graph_id.removeprefix("sha256:")
+            or hashlib.sha256(manifest_bytes).hexdigest()
+            != manifest_id.removeprefix("sha256:")
+        ):
+            return None, None
+        graph_value: object = json.loads(
+            graph_bytes,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+        if type(graph_value) is not dict:
+            return None, None
+        graph_payload = cast("dict[str, object]", graph_value)
+        if set(graph_payload) != {"evidence", "sources"}:
+            return None, None
+        evidence_values = graph_payload["evidence"]
+        source_values = graph_payload["sources"]
+        if type(evidence_values) is not list or type(source_values) is not list:
+            return None, None
+        evidence_items = cast("list[object]", evidence_values)
+        source_items = cast("list[object]", source_values)
+        evidence = tuple(
+            EvidenceSpan.model_validate_json(_canonical_bytes(item), strict=True)
+            for item in evidence_items
+        )
+        sources = tuple(
+            SourceDocument.model_validate_json(_canonical_bytes(item), strict=True)
+            for item in source_items
+        )
+        canonical_graph = _canonical_bytes(
+            {
+                "evidence": [item.model_dump(mode="json") for item in evidence],
+                "sources": [item.model_dump(mode="json") for item in sources],
+            }
+        )
+        if (
+            canonical_graph != graph_bytes
+            or tuple(item.evidence_id for item in evidence) != state["evidence_ids"]
+            or tuple(item.source_id for item in sources) != state["source_ids"]
+        ):
+            return None, None
+        manifest = RunManifest.model_validate_json(manifest_bytes, strict=True)
+        if (
+            _canonical_bytes(manifest.model_dump(mode="json")) != manifest_bytes
+            or manifest.run_id != state["run_id"]
+            or manifest.thread_id != state["thread_id"]
+            or graph_id not in manifest.artifact_ids
+        ):
+            return None, None
+    except (asyncio.CancelledError, KeyboardInterrupt, MemoryError, SystemExit):
+        raise
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        return None, None
+    return graph_id, manifest_id
+
+
 def _node_error_code(error: Exception, *, node: str) -> str:
     if node == "PersistResults":
         return "PERSIST_RESULTS_FAILED"
@@ -5172,6 +5276,7 @@ type _EventPublicationStatus = Literal[
     "clean_exact",
     "recovered_exact",
     "absent",
+    "unreadable",
 ]
 
 
@@ -5199,7 +5304,7 @@ async def _publish_event_with_bounded_recovery(
     except (asyncio.CancelledError, KeyboardInterrupt, MemoryError, SystemExit):
         raise
     except Exception:  # noqa: BLE001 - public-safe durable sink boundary
-        raise ArtifactIntegrityError("durable event publication failed") from None
+        return "unreadable"
     if recovered is None:
         return "absent"
     if not _run_events_match_exact(recovered, event):
@@ -5320,7 +5425,7 @@ async def _publish_missing_event_failure_transition(
         sink=sink,
         event=failure_event,
     )
-    if publication == "absent":
+    if publication in {"absent", "unreadable"}:
         raise ArtifactIntegrityError("durable event failure transition failed")
     return {
         **failure_update,
@@ -5575,13 +5680,36 @@ def _safe_node(
             sink=sink,
             event=event,
         )
+        if node == "PersistResults" and publication in {"absent", "unreadable"}:
+            if (
+                audit_composition is not None
+                and type(update.get("evidence_graph_artifact_id")) is str
+                and type(update.get("manifest_artifact_id")) is str
+            ):
+                graph_id, manifest_id = _verified_persist_result_pair(
+                    composition=audit_composition,
+                    state=merged,
+                    evidence_graph_artifact_id=merged["evidence_graph_artifact_id"],
+                    manifest_artifact_id=merged["manifest_artifact_id"],
+                )
+            else:
+                graph_id, manifest_id = None, None
+            update["evidence_graph_artifact_id"] = graph_id
+            update["manifest_artifact_id"] = manifest_id
+            update["error_code"] = "PERSIST_RESULTS_FAILED"
+            update["failed_node"] = "PersistResults"
+            update["baseline_work_artifact_ids"] = work_ids
+            update["next_event_seq"] = restored["next_event_seq"]
+            return validate_baseline_state({**restored, **update})
+        if publication == "unreadable":
+            raise ArtifactIntegrityError("durable event publication failed")
         if publication == "absent":
             if (
                 audit_composition is None
                 or execution is None
                 or node_receipt_id is None
-                or not restored["evidence_ids"]
-                or node not in {"DraftReport", "FinalizeCitations"}
+                or not merged["evidence_ids"]
+                or node == "PersistResults"
             ):
                 raise ArtifactIntegrityError("durable event publication failed")
             if merged["error_code"] is None:
@@ -5601,16 +5729,20 @@ def _safe_node(
                 sink=sink,
                 event=event,
             )
-            if retry_publication == "absent":
+            if retry_publication in {"absent", "unreadable"}:
                 raise ArtifactIntegrityError("durable event publication failed")
-        elif publication == "recovered_exact" and merged["error_code"] is None:
+        elif (
+            publication == "recovered_exact"
+            and merged["error_code"] is None
+            and node != "PersistResults"
+        ):
             if (
                 audit_composition is None
                 or execution is None
                 or node_receipt_id is None
                 or not restored["evidence_ids"]
                 or merged["error_code"] is not None
-                or node in {"FinalizeCitations", "PersistResults"}
+                or node == "FinalizeCitations"
             ):
                 raise ArtifactIntegrityError("durable event publication failed")
 

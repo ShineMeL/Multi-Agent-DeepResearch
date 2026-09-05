@@ -349,22 +349,42 @@ class OneShotReadbackFailureSink(MemoryEventSink):
 
 
 class OneShotPreWriteFailureSink(MemoryEventSink):
-    def __init__(self, *, target_node: str) -> None:
+    def __init__(
+        self,
+        *,
+        target_node: str,
+        target_occurrence: int = 1,
+        invocations: Counter[str] | None = None,
+        target_success_only: bool = True,
+    ) -> None:
         super().__init__()
         self.target_node = target_node
+        self.target_occurrence = target_occurrence
+        self.invocations = invocations
+        self.target_success_only = target_success_only
         self.attempts: list[RunEvent] = []
         self.target_key: tuple[str, int] | None = None
         self.authoritative_reads: list[RunEvent | None] = []
+        self.provider_calls_at_failure: int | None = None
+        self.successful_target_events = 0
         self.failed = False
 
     async def __call__(self, event: RunEvent) -> None:
         self.attempts.append(event)
+        matches_target = event.node == self.target_node and (
+            not self.target_success_only or event.error_code is None
+        )
+        if matches_target:
+            self.successful_target_events += 1
         if (
-            event.node == self.target_node
-            and event.error_code is None
+            matches_target
+            and self.successful_target_events == self.target_occurrence
             and not self.failed
         ):
             self.target_key = (event.run_id, event.seq)
+            self.provider_calls_at_failure = (
+                None if self.invocations is None else sum(self.invocations.values())
+            )
             self.failed = True
             raise OSError("one-shot durable event pre-write failure")
         await super().__call__(event)
@@ -4891,6 +4911,8 @@ async def _run_failure_after_evidence(
     *,
     mutate: object | None = None,
     sink: MemoryEventSink | None = None,
+    plan_payload: dict[str, object] | None = None,
+    prewrite_target: tuple[str, int] | None = None,
 ) -> tuple[
     object,
     BaselineNodeHandlers,
@@ -4904,6 +4926,7 @@ async def _run_failure_after_evidence(
         tmp_path,
         invocations=invocations,
         persist_entries=persist_entries,
+        plan_payload=plan_payload,
     )
     if mutate is not None:
         cast("Any", mutate)(handlers)
@@ -4920,7 +4943,16 @@ async def _run_failure_after_evidence(
             utc_now=clock.utc_now,
         ),
     )
-    event_sink = sink if sink is not None else MemoryEventSink()
+    if sink is not None:
+        event_sink = sink
+    elif prewrite_target is not None:
+        event_sink = OneShotPreWriteFailureSink(
+            target_node=prewrite_target[0],
+            target_occurrence=prewrite_target[1],
+            invocations=invocations,
+        )
+    else:
+        event_sink = MemoryEventSink()
     result = await runner.run(
         run_id="run-failure-after-evidence",
         thread_id="thread-failure-after-evidence",
@@ -5235,6 +5267,523 @@ async def test_prewrite_event_failure_after_evidence_persists_once_at_same_seq(
     assert {item["source_id"] for item in graph_payload["sources"]} == {
         item.source_id for item in manifest.parsed_artifacts
     }
+
+
+@pytest.mark.parametrize(
+    ("target_node", "target_occurrence", "two_loop"),
+    [
+        ("StoreEvidence", 1, False),
+        ("RankEvidence", 1, False),
+        ("DecideNext", 2, True),
+        ("Search", 2, True),
+        ("Fetch", 2, True),
+        ("ParseAndNormalize", 2, True),
+        ("StoreEvidence", 2, True),
+        ("RankEvidence", 2, True),
+    ],
+)
+async def test_prewrite_event_failure_after_merged_evidence_persists_once(
+    tmp_path: Path,
+    target_node: str,
+    target_occurrence: int,
+    two_loop: bool,
+) -> None:
+    result_value, handlers, invocations, persist_entries, returned_sink = (
+        await _run_failure_after_evidence(
+            tmp_path,
+            plan_payload=_two_loop_plan() if two_loop else None,
+            prewrite_target=(target_node, target_occurrence),
+        )
+    )
+    result = cast("Any", result_value)
+    sink = cast("OneShotPreWriteFailureSink", returned_sink)
+
+    assert sink.failed is True
+    assert sink.authoritative_reads[0] is None
+    assert sink.provider_calls_at_failure is not None
+    assert sum(invocations.values()) == sink.provider_calls_at_failure
+    attempted_success = [
+        event
+        for event in sink.attempts
+        if event.node == target_node and event.error_code is None
+    ][target_occurrence - 1]
+    target_events = [
+        event for event in sink.events.values() if event.node == target_node
+    ]
+    failure_events = [
+        event for event in target_events if event.error_code == "DATA_CORRUPTION"
+    ]
+    assert len(failure_events) == 1
+    failure_event = failure_events[0]
+    assert failure_event.seq == attempted_success.seq
+    assert failure_event.status == "failed"
+    assert not any(
+        event.seq == attempted_success.seq and event.error_code is None
+        for event in target_events
+    )
+
+    persist_events = [
+        event for event in sink.events.values() if event.node == "PersistResults"
+    ]
+    assert len(persist_events) == 1
+    assert persist_events[0].seq == failure_event.seq + 1
+    assert sorted(seq for run_id, seq in sink.events if run_id == failure_event.run_id) == list(
+        range(1, persist_events[0].seq + 1)
+    )
+    assert persist_entries == Counter({"persist-results": 1})
+
+    node_receipts = [
+        (artifact_id, receipt)
+        for artifact_id in failure_event.artifact_ids
+        if (
+            receipt := cast("Any", baseline_graph_module)._load_audit_receipt(
+                handlers.artifact_store,
+                artifact_id,
+            )
+        )
+        is not None
+        and receipt.kind == "node-execution"
+    ]
+    assert len(node_receipts) == 1
+    _, node_receipt = node_receipts[0]
+    receipt_state = cast("Any", baseline_graph_module)._state_from_payload(
+        node_receipt.payload["state"]
+    )
+    execution = NodeExecutionRecord.model_validate_json(
+        json.dumps(
+            node_receipt.payload["record"],
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        strict=True,
+    )
+    receipt_event = cast("Any", baseline_graph_module)._run_event_from_receipt_payload(
+        node_receipt.payload["event"]
+    )
+    assert receipt_state["next_event_seq"] == failure_event.seq
+    assert receipt_state["evidence_ids"]
+    assert receipt_state["error_code"] == "DATA_CORRUPTION"
+    assert receipt_state["failed_node"] == target_node
+    assert execution.attempt == target_occurrence
+    assert execution.status == "failed"
+    assert execution.error_code == "DATA_CORRUPTION"
+    assert execution.output_artifact_ids == receipt_event.artifact_ids
+    child_receipts = [
+        cast("Any", baseline_graph_module)._load_audit_receipt(
+            handlers.artifact_store,
+            artifact_id,
+        )
+        for artifact_id in node_receipt.payload["child_receipt_ids"]
+    ]
+    assert all(receipt is not None for receipt in child_receipts)
+    assert len([receipt for receipt in child_receipts if receipt.kind == "terminal"]) == 1
+    for artifact_id, receipt in zip(
+        node_receipt.payload["child_receipt_ids"],
+        child_receipts,
+        strict=True,
+    ):
+        if receipt.kind in {"parsed-artifact", "evidence-hash"}:
+            assert artifact_id in execution.output_artifact_ids
+            assert artifact_id in receipt_event.artifact_ids
+
+    assert result.status == "failed"
+    assert result.error_code == "DATA_CORRUPTION"
+    assert result.report_artifact_id is None
+    assert result.evidence_graph_artifact_id is not None
+    assert result.manifest_artifact_id is not None
+    graph_payload = json.loads(
+        handlers.artifact_store.get_bytes(result.evidence_graph_artifact_id)
+    )
+    manifest = RunManifest.model_validate_json(
+        handlers.artifact_store.get_bytes(result.manifest_artifact_id),
+        strict=True,
+    )
+    assert graph_payload["evidence"]
+    assert manifest.failure_codes == ("DATA_CORRUPTION",)
+    assert manifest.run_event_count == failure_event.seq
+    target_executions = [
+        record for record in manifest.node_executions if record.node == target_node
+    ]
+    assert len(target_executions) == target_occurrence
+    assert target_executions[-1].attempt == target_occurrence
+    assert target_executions[-1].status == "failed"
+    assert target_executions[-1].error_code == "DATA_CORRUPTION"
+
+
+async def test_persist_results_prewrite_absence_is_terminal_without_second_emit(
+    tmp_path: Path,
+) -> None:
+    invocations: Counter[str] = Counter()
+    persist_entries: Counter[str] = Counter()
+    handlers = _recovery_composition(
+        tmp_path,
+        invocations=invocations,
+        persist_entries=persist_entries,
+    )
+    saver = InMemorySaver(serde=checkpoint_serializer())
+    graph = build_baseline_graph(handlers.as_dependencies(checkpointer=saver))
+    clock = ControlledSegmentClock(
+        monotonic_start=time.monotonic(),
+        utc_offset_seconds=0.0,
+    )
+    runner = LangGraphResearchRunner(
+        baseline_graph=graph,
+        runtime_hooks=BaselineRuntimeHooks(
+            monotonic=clock.monotonic,
+            utc_now=clock.utc_now,
+        ),
+    )
+    sink = OneShotPreWriteFailureSink(
+        target_node="PersistResults",
+        invocations=invocations,
+    )
+    run_id = "run-persist-prewrite-absent"
+    thread_id = "thread-persist-prewrite-absent"
+
+    result = await runner.run(
+        run_id=run_id,
+        thread_id=thread_id,
+        config=_recovery_config(handlers),
+        checkpoint=None,
+        emit=sink,
+        cancellation_token=CancellationToken(),
+    )
+
+    assert sink.failed is True
+    assert sink.authoritative_reads == [None]
+    assert sink.provider_calls_at_failure is not None
+    assert sum(invocations.values()) == sink.provider_calls_at_failure
+    assert persist_entries == Counter({"persist-results": 1})
+    persist_attempts = [
+        event for event in sink.attempts if event.node == "PersistResults"
+    ]
+    assert len(persist_attempts) == 1
+    attempted_success = persist_attempts[0]
+    assert attempted_success.seq == 12
+    assert attempted_success.error_code is None
+    assert not any(event.node == "PersistResults" for event in sink.events.values())
+    assert await sink.get_event(run_id=run_id, seq=12) is None
+    provisional_receipt_ids = [
+        artifact_id
+        for artifact_id in attempted_success.artifact_ids
+        if (
+            receipt := cast("Any", baseline_graph_module)._load_audit_receipt(
+                handlers.artifact_store,
+                artifact_id,
+            )
+        )
+        is not None
+        and receipt.kind == "node-execution"
+    ]
+    assert len(provisional_receipt_ids) == 1
+
+    saved = await saver.aget_tuple(
+        {
+            "configurable": {
+                "thread_id": thread_id,
+                "checkpoint_ns": "",
+            }
+        }
+    )
+    assert saved is not None
+    values = cast("Any", saved).checkpoint["channel_values"]
+    terminal_state = cast("Any", baseline_graph_module).validate_baseline_state(
+        {
+            field: values[field]
+            for field in cast("Any", baseline_graph_module).BaselineState.__annotations__
+        }
+    )
+    assert terminal_state["next_event_seq"] == 12
+    assert terminal_state["error_code"] == "PERSIST_RESULTS_FAILED"
+    assert terminal_state["failed_node"] == "PersistResults"
+    assert provisional_receipt_ids[0] not in terminal_state[
+        "baseline_work_artifact_ids"
+    ]
+
+    assert result.status == "failed"
+    assert result.error_code == "PERSIST_RESULTS_FAILED"
+    assert result.report_artifact_id == terminal_state["report_artifact_id"]
+    assert (
+        result.evidence_graph_artifact_id
+        == terminal_state["evidence_graph_artifact_id"]
+    )
+    assert result.manifest_artifact_id == terminal_state["manifest_artifact_id"]
+    assert result.report_artifact_id is not None
+    assert result.evidence_graph_artifact_id is not None
+    assert result.manifest_artifact_id is not None
+    report_bytes = handlers.artifact_store.get_bytes(result.report_artifact_id)
+    graph_bytes = handlers.artifact_store.get_bytes(
+        result.evidence_graph_artifact_id
+    )
+    manifest_bytes = handlers.artifact_store.get_bytes(result.manifest_artifact_id)
+    assert report_bytes
+    assert json.loads(graph_bytes)["evidence"]
+    manifest = RunManifest.model_validate_json(
+        manifest_bytes,
+        strict=True,
+    )
+    assert manifest.run_event_count == 11
+    assert manifest.failure_codes == ()
+    assert [
+        sink.events[(run_id, seq)].node for seq in range(1, 12)
+    ][-1] == "FinalizeCitations"
+
+    terminal_checkpoint = checkpoint_ref_from_tuple(saved)
+    resumed = await runner.run(
+        run_id=run_id,
+        thread_id=thread_id,
+        config=_recovery_config(handlers),
+        checkpoint=terminal_checkpoint,
+        emit=sink,
+        cancellation_token=CancellationToken(),
+    )
+    assert resumed == result
+    assert persist_entries == Counter({"persist-results": 1})
+    assert sum(invocations.values()) == sink.provider_calls_at_failure
+    assert len(
+        [event for event in sink.attempts if event.node == "PersistResults"]
+    ) == 1
+    assert await sink.get_event(run_id=run_id, seq=12) is None
+
+
+async def test_persist_results_recovered_exact_is_success_and_resumes_identically(
+    tmp_path: Path,
+) -> None:
+    invocations: Counter[str] = Counter()
+    persist_entries: Counter[str] = Counter()
+    handlers = _recovery_composition(
+        tmp_path,
+        invocations=invocations,
+        persist_entries=persist_entries,
+    )
+    current_config = _recovery_config(handlers)
+    saver = InMemorySaver(serde=checkpoint_serializer())
+    graph = build_baseline_graph(handlers.as_dependencies(checkpointer=saver))
+    clock = ControlledSegmentClock(
+        monotonic_start=time.monotonic(),
+        utc_offset_seconds=0.0,
+    )
+    runner = LangGraphResearchRunner(
+        baseline_graph=graph,
+        runtime_hooks=BaselineRuntimeHooks(
+            monotonic=clock.monotonic,
+            utc_now=clock.utc_now,
+        ),
+    )
+    sink = OneShotReadbackFailureSink(target_node="PersistResults")
+    run_id = "run-persist-recovered-exact"
+    thread_id = "thread-persist-recovered-exact"
+
+    first = await runner.run(
+        run_id=run_id,
+        thread_id=thread_id,
+        config=current_config,
+        checkpoint=None,
+        emit=sink,
+        cancellation_token=CancellationToken(),
+    )
+    provider_calls_after_first = sum(invocations.values())
+    persist_event = await sink.get_event(run_id=run_id, seq=12)
+    assert persist_event is not None
+    persist_event_bytes = FilesystemEventSink._bytes(persist_event)
+    pre_persist_checkpoint: CheckpointRef | None = None
+    async for saved in saver.alist(
+        {
+            "configurable": {
+                "thread_id": thread_id,
+                "checkpoint_ns": "",
+            }
+        }
+    ):
+        values = cast("Any", saved).checkpoint["channel_values"]
+        if (
+            values.get("next_event_seq") == 12
+            and values.get("manifest_artifact_id") is None
+        ):
+            pre_persist_checkpoint = checkpoint_ref_from_tuple(saved)
+            break
+    assert pre_persist_checkpoint is not None
+
+    second = await runner.run(
+        run_id=run_id,
+        thread_id=thread_id,
+        config=current_config,
+        checkpoint=pre_persist_checkpoint,
+        emit=sink,
+        cancellation_token=CancellationToken(),
+    )
+
+    assert sink.failed is True
+    assert first.status == "completed", first.error_code
+    assert second.status == "completed", second.error_code
+    assert second == first
+    assert persist_entries == Counter({"persist-results": 1})
+    assert sum(invocations.values()) == provider_calls_after_first == 9
+    assert FilesystemEventSink._bytes(
+        cast("RunEvent", await sink.get_event(run_id=run_id, seq=12))
+    ) == persist_event_bytes
+    assert first.report_artifact_id is not None
+    assert first.evidence_graph_artifact_id is not None
+    assert first.manifest_artifact_id is not None
+    handlers.artifact_store.get_bytes(first.report_artifact_id)
+    handlers.artifact_store.get_bytes(first.evidence_graph_artifact_id)
+    RunManifest.model_validate_json(
+        handlers.artifact_store.get_bytes(first.manifest_artifact_id),
+        strict=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_code", "keeps_ids"),
+    [
+        ("conflict", "DATA_CORRUPTION", False),
+        ("constructed-corruption", "DATA_CORRUPTION", False),
+        ("unreadable", "PERSIST_RESULTS_FAILED", True),
+    ],
+)
+async def test_persist_results_publication_uncertainty_does_not_reenter_handler(
+    tmp_path: Path,
+    mode: str,
+    expected_code: str,
+    keeps_ids: bool,
+) -> None:
+    sink = ClassifiedPreWriteFailureSink(
+        target_node="PersistResults",
+        mode=mode,
+    )
+    result_value, handlers, invocations, persist_entries, _ = (
+        await _run_failure_after_evidence(tmp_path, sink=sink)
+    )
+    result = cast("Any", result_value)
+
+    assert sink.failed is True
+    assert result.status == "failed"
+    assert result.error_code == expected_code
+    assert (result.report_artifact_id is not None) is keeps_ids
+    assert (result.evidence_graph_artifact_id is not None) is keeps_ids
+    assert (result.manifest_artifact_id is not None) is keeps_ids
+    if keeps_ids:
+        assert result.report_artifact_id is not None
+        assert result.evidence_graph_artifact_id is not None
+        assert result.manifest_artifact_id is not None
+        handlers.artifact_store.get_bytes(result.report_artifact_id)
+        assert json.loads(
+            handlers.artifact_store.get_bytes(result.evidence_graph_artifact_id)
+        )["evidence"]
+        RunManifest.model_validate_json(
+            handlers.artifact_store.get_bytes(result.manifest_artifact_id),
+            strict=True,
+        )
+    assert persist_entries == Counter({"persist-results": 1})
+    assert sum(invocations.values()) == 9
+    assert len(
+        [event for event in sink.attempts if event.node == "PersistResults"]
+    ) == 1
+    assert not any(event.node == "PersistResults" for event in sink.events.values())
+
+
+async def test_persist_publication_failure_replaces_prior_primary_once(
+    tmp_path: Path,
+) -> None:
+    def fail_draft(handlers: BaselineNodeHandlers) -> None:
+        def fail_render_prompt(**_kwargs: object) -> str:
+            raise OSError("draft dependency failed")
+
+        handlers.writer.render_prompt = cast("Any", fail_render_prompt)
+
+    sink = OneShotPreWriteFailureSink(
+        target_node="PersistResults",
+        target_success_only=False,
+    )
+    result_value, handlers, invocations, persist_entries, _ = (
+        await _run_failure_after_evidence(
+            tmp_path,
+            mutate=fail_draft,
+            sink=sink,
+        )
+    )
+    result = cast("Any", result_value)
+
+    assert sink.authoritative_reads == [None]
+    assert len(
+        [event for event in sink.attempts if event.node == "PersistResults"]
+    ) == 1
+    assert not any(event.node == "PersistResults" for event in sink.events.values())
+    assert persist_entries == Counter({"persist-results": 1})
+    assert sum(invocations.values()) == 8
+    assert result.status == "failed"
+    assert result.error_code == "PERSIST_RESULTS_FAILED"
+    assert result.report_artifact_id is None
+    assert result.evidence_graph_artifact_id is not None
+    assert result.manifest_artifact_id is not None
+    manifest = RunManifest.model_validate_json(
+        handlers.artifact_store.get_bytes(result.manifest_artifact_id),
+        strict=True,
+    )
+    assert manifest.failure_codes == ("INTERNAL_ERROR",)
+    assert manifest.run_event_count == 10
+    assert sink.events[("run-failure-after-evidence", 10)].error_code == "INTERNAL_ERROR"
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["initial-call-hard", "authoritative-read-hard"],
+)
+@pytest.mark.parametrize(
+    "hard_type",
+    [asyncio.CancelledError, MemoryError],
+)
+async def test_persist_results_publication_preserves_hard_exception_identity(
+    tmp_path: Path,
+    mode: str,
+    hard_type: type[BaseException],
+) -> None:
+    invocations: Counter[str] = Counter()
+    persist_entries: Counter[str] = Counter()
+    handlers = _recovery_composition(
+        tmp_path,
+        invocations=invocations,
+        persist_entries=persist_entries,
+    )
+    saver = InMemorySaver(serde=checkpoint_serializer())
+    graph = build_baseline_graph(handlers.as_dependencies(checkpointer=saver))
+    clock = ControlledSegmentClock(
+        monotonic_start=time.monotonic(),
+        utc_offset_seconds=0.0,
+    )
+    runner = LangGraphResearchRunner(
+        baseline_graph=graph,
+        runtime_hooks=BaselineRuntimeHooks(
+            monotonic=clock.monotonic,
+            utc_now=clock.utc_now,
+        ),
+    )
+    primary = hard_type(f"hard PersistResults publication {mode}")
+    sink = ClassifiedPreWriteFailureSink(
+        target_node="PersistResults",
+        mode=mode,
+        primary=primary,
+    )
+
+    with pytest.raises(hard_type) as caught:
+        await runner.run(
+            run_id=f"run-persist-hard-{mode}-{hard_type.__name__}",
+            thread_id=f"thread-persist-hard-{mode}-{hard_type.__name__}",
+            config=_recovery_config(handlers),
+            checkpoint=None,
+            emit=sink,
+            cancellation_token=CancellationToken(),
+        )
+
+    assert caught.value is primary
+    assert persist_entries == Counter({"persist-results": 1})
+    assert sum(invocations.values()) == 9
+    assert len(
+        [event for event in sink.attempts if event.node == "PersistResults"]
+    ) == 1
+    assert not any(event.node == "PersistResults" for event in sink.events.values())
 
 
 @pytest.mark.parametrize(
@@ -5879,6 +6428,83 @@ def _replace_event_node_receipt(
         for item in state["baseline_work_artifact_ids"]
     )
     return cast("Any", baseline_graph_module).validate_baseline_state(replaced)
+
+
+def _apply_node_record_representation_corruption(
+    record: dict[str, object],
+    corruption: str,
+) -> None:
+    usage = cast("dict[str, object]", record["usage"])
+    if corruption == "record-attempt-bool":
+        record["attempt"] = True
+    elif corruption == "record-latency-float":
+        record["latency_ms"] = float(cast("int", record["latency_ms"]))
+    elif corruption == "record-usage-wall-int":
+        usage["wall_seconds"] = 0
+    elif corruption == "record-usage-cached-bool":
+        usage["cached_tokens"] = False
+    elif corruption == "record-usage-wall-negative-zero":
+        usage["wall_seconds"] = -0.0
+    else:
+        raise AssertionError(f"unknown node record corruption: {corruption}")
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "record-attempt-bool",
+        "record-latency-float",
+        "record-usage-wall-int",
+        "record-usage-cached-bool",
+        "record-usage-wall-negative-zero",
+    ],
+)
+async def test_attempt_and_manifest_reject_noncanonical_node_execution_record(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    handlers, current_config, sink, state = await _clean_ledger_checkpoint(tmp_path)
+    composition = handlers.as_dependencies(
+        checkpointer=InMemorySaver(serde=checkpoint_serializer())
+    )._audit_composition
+    assert composition is not None
+    assert (
+        cast("Any", baseline_graph_module)._next_node_attempt(
+            composition,
+            state,
+            "Plan",
+        )
+        == 2
+    )
+    event, receipt_id, receipt = _event_node_receipt(
+        handlers,
+        sink,
+        node="Plan",
+    )
+    payload = deepcopy(cast("Any", receipt).payload)
+    record = cast("dict[str, object]", payload["record"])
+    _apply_node_record_representation_corruption(record, corruption)
+    state = _replace_event_node_receipt(
+        handlers,
+        sink,
+        state,
+        event=event,
+        old_receipt_id=receipt_id,
+        receipt=receipt,
+        payload=payload,
+    )
+
+    with pytest.raises(ArtifactIntegrityError):
+        cast("Any", baseline_graph_module)._next_node_attempt(
+            composition,
+            state,
+            "Plan",
+        )
+
+    _bind_direct_runtime(handlers, current_config, sink, state)
+
+    with pytest.raises(ArtifactIntegrityError):
+        await handlers.persist_results(state)
 
 
 def _bind_direct_runtime(
@@ -7224,7 +7850,15 @@ async def test_resume_reuses_durable_event_receipt_after_pre_checkpoint_crash(
 
 @pytest.mark.parametrize(
     "receipt_corruption",
-    ["state-extra-field", "event-seq-float"],
+    [
+        "state-extra-field",
+        "event-seq-float",
+        "record-attempt-bool",
+        "record-latency-float",
+        "record-usage-wall-int",
+        "record-usage-cached-bool",
+        "record-usage-wall-negative-zero",
+    ],
 )
 async def test_resume_rejects_corrupt_durable_state_receipt_without_handler_reexecution(
     tmp_path: Path,
@@ -7285,8 +7919,11 @@ async def test_resume_rejects_corrupt_durable_state_receipt_without_handler_reex
         cast("dict[str, object]", corrupt_payload["state"])[
             "ignored_collision"
         ] = True
-    else:
+    elif receipt_corruption == "event-seq-float":
         cast("dict[str, object]", corrupt_payload["event"])["seq"] = 2.0
+    else:
+        record = cast("dict[str, object]", corrupt_payload["record"])
+        _apply_node_record_representation_corruption(record, receipt_corruption)
     corrupt_receipt_id = cast("Any", baseline_graph_module)._put_audit_receipt(
         handlers.artifact_store,
         kind="node-execution",
@@ -7343,10 +7980,16 @@ async def test_resume_rejects_corrupt_durable_state_receipt_without_handler_reex
     )
     assert result.status == "failed"
     assert result.error_code == "DATA_CORRUPTION"
+    assert result.manifest_artifact_id is None
     assert run_plan_calls == 1
     assert sink.events[(corrupt_event.run_id, corrupt_event.seq)] == corrupt_event
     assert after is not None
-    assert checkpoint_ref_from_tuple(after) == checkpoint
+    if receipt_corruption in {"state-extra-field", "event-seq-float"}:
+        assert checkpoint_ref_from_tuple(after) == checkpoint
+    else:
+        original_values = cast("Any", saved).checkpoint["channel_values"]
+        after_values = cast("Any", after).checkpoint["channel_values"]
+        assert after_values["next_event_seq"] == original_values["next_event_seq"]
 
 
 @pytest.mark.parametrize(
