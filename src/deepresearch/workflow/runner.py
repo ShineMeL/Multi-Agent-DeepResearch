@@ -42,7 +42,13 @@ from .baseline_graph import (
     DurableRunEventSink,
     WorkflowInvariantError,
 )
-from .state import BaselineState, StateValidationError, validate_baseline_state
+from .state import (
+    BaselineState,
+    ResearchState,
+    StateValidationError,
+    validate_baseline_state,
+    validate_research_state,
+)
 
 
 def _new_id(prefix: str) -> str:
@@ -253,9 +259,18 @@ class LangGraphResearchRunner:
             BaselineState,
         ],
         runtime_hooks: BaselineRuntimeHooks | None = None,
+        research_graph: CompiledStateGraph[Any, Any, Any, Any] | None = None,
     ) -> None:
         self._baseline_graph = baseline_graph
         self._runtime_hooks = runtime_hooks or BaselineRuntimeHooks()
+        self._research_graph = research_graph
+
+    def _graph_for_config(self, config: RunConfig) -> Any:
+        if config.workflow_id == "baseline-v1":
+            return self._baseline_graph
+        if config.workflow_id == "research-v1" and self._research_graph is not None:
+            return self._research_graph
+        raise ValueError("research-v1 graph is not configured")
 
     async def run(
         self,
@@ -267,11 +282,15 @@ class LangGraphResearchRunner:
         emit: Callable[[RunEvent], Awaitable[None]],
         cancellation_token: CancellationToken,
     ) -> RunResult:
-        if (
-            config.workflow_id != "baseline-v1"
-            or config.planner_id != "P1"
-            or config.ranker_id != "R1"
-        ):
+        invalid_config = config.workflow_id not in {"baseline-v1", "research-v1"}
+        invalid_config = invalid_config or (
+            config.workflow_id == "baseline-v1"
+            and (config.planner_id != "P1" or config.ranker_id != "R1")
+        )
+        invalid_config = invalid_config or (
+            config.workflow_id == "research-v1" and self._research_graph is None
+        )
+        if invalid_config:
             accountant = BudgetAccountant(config.budget, run_scope=run_id or "invalid")
             return _failed_result(
                 run_id=run_id,
@@ -292,13 +311,14 @@ class LangGraphResearchRunner:
         run_started_at = self._runtime_hooks.utc_now()
         effective_budget = config.budget
         accountant = BudgetAccountant(config.budget, run_scope=run_id or "invalid")
-        input_state: BaselineState | None
+        input_state: BaselineState | ResearchState | None
         graph_config: dict[str, dict[str, str]]
         elapsed_before_resume = 0.0
         context: BaselineRuntimeContext | None = None
         try:
             cancellation_token.raise_if_cancelled()
-            graph = cast("Any", self._baseline_graph)
+            graph = self._graph_for_config(config)
+            is_research = config.workflow_id == "research-v1"
             audit_composition = getattr(
                 graph,
                 "_baseline_audit_composition",
@@ -359,10 +379,19 @@ class LangGraphResearchRunner:
                         name: channel_values[name]
                         for name in BaselineState.__annotations__
                     }
+                    if is_research:
+                        for name in ResearchState.__annotations__:
+                            if (
+                                name not in BaselineState.__annotations__
+                                and name in channel_values
+                            ):
+                                state_values[name] = channel_values[name]
                 except KeyError:
                     raise CheckpointIdentityError() from None
-                restored = validate_baseline_state(
-                    cast("Mapping[str, object]", state_values)
+                restored = (
+                    validate_research_state(cast("Mapping[str, object]", state_values))
+                    if is_research
+                    else validate_baseline_state(cast("Mapping[str, object]", state_values))
                 )
                 if (
                     restored["run_id"] != run_id
@@ -443,9 +472,13 @@ class LangGraphResearchRunner:
                 graph_config,
                 context=context,
             )
-            state = validate_baseline_state(cast("Mapping[str, object]", output))
+            state = (
+                validate_research_state(cast("Mapping[str, object]", output))
+                if config.workflow_id == "research-v1"
+                else validate_baseline_state(cast("Mapping[str, object]", output))
+            )
             return _result_from_state(
-                state,
+                cast("BaselineState", state),
                 _usage_from_accountant(
                     accountant,
                     run_wall_seconds=state["elapsed_wall_seconds"],
