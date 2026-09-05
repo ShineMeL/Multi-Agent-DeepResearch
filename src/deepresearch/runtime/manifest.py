@@ -815,20 +815,12 @@ class RunManifest(_ManifestModel):
                     raise ValueError(
                         "provider calls must be chronological and non-overlapping"
                     )
-                if call.attempt == 1:
-                    expected_attempt = 2
-                elif call.attempt == expected_attempt:
-                    expected_attempt += 1
-                else:
+                if call.attempt != expected_attempt:
                     raise ValueError(
                         "provider invocation attempts must start at one and be contiguous"
                     )
-                derived_retry = int(call.attempt > 1)
-                if call.usage.retries != derived_retry:
-                    raise ValueError(
-                        "provider call retry usage does not match invocation history"
-                    )
-                retries_by_execution[execution_index] += derived_retry
+                expected_attempt += 1
+                retries_by_execution[execution_index] += call.usage.retries
                 previous = call
         return tuple(retries_by_execution)
 
@@ -903,9 +895,12 @@ class RunManifest(_ManifestModel):
             )
             if self.usage_by_node[node] != expected:
                 raise ValueError("usage_by_node does not match aggregated node executions")
+        envelope_wall_seconds = (self.finished_at - self.started_at).total_seconds()
+        if self.usage.wall_seconds > envelope_wall_seconds:
+            raise ValueError("active wall time exceeds the run envelope")
         expected_run = self._aggregate_usage(
             tuple(self.usage_by_node.values()),
-            wall_seconds=(self.finished_at - self.started_at).total_seconds(),
+            wall_seconds=self.usage.wall_seconds,
             cost_usd=self._charged_cost(self.provider_calls),
         )
         if self.usage != expected_run:

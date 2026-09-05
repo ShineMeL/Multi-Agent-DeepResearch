@@ -1,13 +1,15 @@
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
+from typing import Any, cast
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from deepresearch.domain import ResourceUsage, RunBudget
 from deepresearch.runtime import (
     BudgetAccountant,
     BudgetExceeded,
+    BudgetSnapshot,
     ResourceEstimate,
 )
 
@@ -429,3 +431,264 @@ def test_accountant_accepts_finite_seed_usage_that_already_exhausts_a_limit() ->
 
     assert snapshot.used_wall_seconds == 500.0
     assert "wall_seconds" in snapshot.exhausted
+
+
+def test_from_snapshot_restores_exact_usage_and_last_observation_without_reservations() -> None:
+    budget = RunBudget.preset("low")
+    original = BudgetAccountant(budget, run_scope="original")
+    charged = original.reserve(
+        estimate(tokens=10, cost="0.01"),
+        node="Planner",
+        idempotency_key="charged",
+    )
+    original.settle(charged, actual=usage(tokens=7, cost="0.01"))
+    observed = original.reserve(
+        estimate(tokens=5, cost="0.01"),
+        node="Tool",
+        idempotency_key="observed",
+    )
+    expected = original.settle(
+        observed,
+        actual=usage(tokens=5, retries=1, cost=None),
+        charge=False,
+    )
+
+    restored = BudgetAccountant.from_snapshot(
+        budget,
+        expected,
+        run_scope="restored",
+    )
+
+    assert restored.snapshot() == expected
+    replacement = restored.reserve(
+        estimate(tokens=1, cost="0.01"),
+        node="Planner",
+        idempotency_key="charged",
+    )
+    assert replacement.reservation_id != charged.reservation_id
+
+
+def test_from_snapshot_rejects_any_reserved_capacity() -> None:
+    accountant = BudgetAccountant(RunBudget.preset("low"))
+    accountant.reserve(
+        estimate(tokens=1, cost="0.01"),
+        node="Tool",
+        idempotency_key="active",
+    )
+
+    with pytest.raises(ValueError, match="reserved|active"):
+        BudgetAccountant.from_snapshot(
+            RunBudget.preset("low"),
+            accountant.snapshot(),
+        )
+
+
+def test_from_snapshot_revalidates_constructed_snapshot_and_full_reconciliation() -> None:
+    valid = BudgetAccountant(RunBudget.preset("low")).snapshot()
+    corrupt = cast(
+        "BudgetSnapshot", BaseModel.model_copy(valid, update={"used_tokens": 1})
+    )
+
+    with pytest.raises(ValueError, match="snapshot|reconcile|usage"):
+        BudgetAccountant.from_snapshot(RunBudget.preset("low"), corrupt)
+
+
+@pytest.mark.parametrize("bad_used_tokens", [True, "0"])
+def test_from_snapshot_strictly_rejects_coercible_constructed_values(
+    bad_used_tokens: object,
+) -> None:
+    valid = BudgetAccountant(RunBudget.preset("low")).snapshot()
+    corrupt = cast(
+        "BudgetSnapshot",
+        BaseModel.model_copy(valid, update={"used_tokens": bad_used_tokens}),
+    )
+
+    with pytest.raises(ValueError, match="snapshot|invalid"):
+        BudgetAccountant.from_snapshot(RunBudget.preset("low"), corrupt)
+
+
+def test_from_snapshot_rejects_history_below_original_configured_seed() -> None:
+    seed = usage(tokens=5, pages=1, cost="0.01")
+    budget = RunBudget.preset("low").model_copy(
+        update={
+            "used_by_node": {
+                **RunBudget.preset("low").used_by_node,
+                "Planner": seed,
+            }
+        }
+    )
+    rewound = BudgetAccountant(RunBudget.preset("low")).snapshot()
+
+    with pytest.raises(ValueError, match="seed|history|rewind"):
+        BudgetAccountant.from_snapshot(budget, rewound)
+
+
+def test_from_snapshot_preserves_unknown_cost_mode_and_observation_exactly() -> None:
+    budget = RunBudget.preset("low").model_copy(
+        update={
+            "max_cost_usd": None,
+            "used_by_node": {
+                **RunBudget.preset("low").used_by_node,
+                "Tool": usage(tokens=3, cost="0.25"),
+            },
+        }
+    )
+    original = BudgetAccountant(budget, run_scope="same")
+    observed = original.reserve(
+        estimate(tokens=2, cost=None),
+        node="Tool",
+        idempotency_key="observed",
+    )
+    expected = original.settle(
+        observed,
+        actual=usage(tokens=2, cost=None),
+        charge=False,
+    )
+
+    restored = BudgetAccountant.from_snapshot(budget, expected, run_scope="same")
+
+    assert restored.snapshot() == expected
+    assert restored.snapshot().used_cost_usd is None
+    assert restored.snapshot().used_by_node["Tool"].cost_usd == Decimal("0.25")
+    assert restored.snapshot().last_observed_usage.cost_usd is None
+
+
+@pytest.mark.parametrize("rewound_cost", ["0.10", None])
+def test_from_snapshot_rejects_cost_disabled_seed_cost_rewind(
+    rewound_cost: str | None,
+) -> None:
+    preset = RunBudget.preset("low")
+    budget = preset.model_copy(
+        update={
+            "max_cost_usd": None,
+            "used_by_node": {
+                **preset.used_by_node,
+                "Tool": usage(tokens=3, cost="0.25"),
+            },
+        }
+    )
+    rewound_budget = budget.model_copy(
+        update={
+            "used_by_node": {
+                **budget.used_by_node,
+                "Tool": usage(tokens=3, cost=rewound_cost),
+            }
+        }
+    )
+    rewound = BudgetAccountant(rewound_budget).snapshot()
+
+    with pytest.raises(ValueError, match="seed|history|rewind"):
+        BudgetAccountant.from_snapshot(budget, rewound)
+
+
+def test_from_snapshot_maps_missing_constructed_fields_to_public_value_error() -> None:
+    valid_budget = RunBudget.preset("low")
+    valid_snapshot = BudgetAccountant(valid_budget).snapshot()
+    missing_budget = RunBudget.model_construct()
+    missing_snapshot = BudgetSnapshot.model_construct()
+
+    with pytest.raises(ValueError, match="budget|snapshot|invalid"):
+        BudgetAccountant.from_snapshot(missing_budget, valid_snapshot)
+    with pytest.raises(ValueError, match="budget|snapshot|invalid"):
+        BudgetAccountant.from_snapshot(valid_budget, missing_snapshot)
+
+
+def test_from_snapshot_accepts_normalized_sparse_budget_seed() -> None:
+    sparse = RunBudget(
+        max_search_calls=1,
+        max_pages=1,
+        max_total_tokens=10,
+        max_wall_time_seconds=10,
+        max_cost_usd=Decimal(1),
+        max_retries=1,
+        used_by_node={},
+    )
+    expected = BudgetAccountant(sparse).snapshot()
+
+    restored = BudgetAccountant.from_snapshot(sparse, expected)
+
+    assert restored.snapshot() == expected
+
+
+def test_from_snapshot_rejects_seed_invalid_under_normal_cost_mode() -> None:
+    preset = RunBudget.preset("low")
+    invalid_seed = preset.model_copy(
+        update={
+            "used_by_node": {
+                **preset.used_by_node,
+                "Tool": usage(tokens=1, cost=None),
+            }
+        }
+    )
+    valid_history = preset.model_copy(
+        update={
+            "used_by_node": {
+                **preset.used_by_node,
+                "Tool": usage(tokens=1, cost="0.01"),
+            }
+        }
+    )
+    snapshot = BudgetAccountant(valid_history).snapshot()
+
+    with pytest.raises(ValueError, match="seed|cost|budget|invalid"):
+        BudgetAccountant.from_snapshot(invalid_seed, snapshot)
+
+
+@pytest.mark.parametrize("wall_value", [0, Decimal(0)])
+def test_from_snapshot_rejects_noncanonical_top_level_wall_type(
+    wall_value: int | Decimal,
+) -> None:
+    budget = RunBudget.preset("low")
+    valid = BudgetAccountant(budget).snapshot()
+    corrupt = cast(
+        "BudgetSnapshot",
+        BaseModel.model_copy(valid, update={"reserved_wall_seconds": wall_value}),
+    )
+
+    with pytest.raises(ValueError, match="snapshot|invalid|type"):
+        BudgetAccountant.from_snapshot(budget, corrupt)
+
+
+def test_from_snapshot_rejects_noncanonical_nested_usage_wall_type() -> None:
+    budget = RunBudget.preset("low")
+    valid = BudgetAccountant(budget).snapshot()
+    corrupt_usage = cast(
+        "ResourceUsage",
+        BaseModel.model_copy(
+            valid.used_by_node["Tool"],
+            update={"wall_seconds": 0},
+        ),
+    )
+    mapping_type = type(valid.used_by_node)
+    corrupt_mapping = mapping_type(valid.used_by_node)
+    corrupt_dict = cast("dict[str, ResourceUsage]", corrupt_mapping)
+    cast("Any", dict).__setitem__(corrupt_dict, "Tool", corrupt_usage)
+    corrupt = cast(
+        "BudgetSnapshot",
+        BaseModel.model_copy(valid, update={"used_by_node": corrupt_mapping}),
+    )
+
+    with pytest.raises(ValueError, match="snapshot|usage|invalid|type"):
+        BudgetAccountant.from_snapshot(budget, corrupt)
+
+
+def test_from_snapshot_does_not_restore_reservation_objects_or_indexes() -> None:
+    budget = RunBudget.preset("low")
+    original = BudgetAccountant(budget, run_scope="same")
+    old = original.reserve(
+        estimate(tokens=1, cost="0.01"),
+        node="Tool",
+        idempotency_key="same-key",
+    )
+    snapshot = original.release(old)
+    restored = BudgetAccountant.from_snapshot(budget, snapshot, run_scope="same")
+
+    with pytest.raises(ValueError, match="accountant|unknown"):
+        restored.settle(old, actual=usage(tokens=1, cost="0.01"))
+    fresh = restored.reserve(
+        estimate(tokens=1, cost="0.01"),
+        node="Tool",
+        idempotency_key="same-key",
+    )
+    assert fresh is not old
+    assert fresh.reservation_id == old.reservation_id

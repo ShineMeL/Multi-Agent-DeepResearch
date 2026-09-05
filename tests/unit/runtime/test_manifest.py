@@ -292,6 +292,40 @@ def test_manifest_wall_time_uses_run_envelope_not_concurrent_sum(
     assert sum(item.wall_seconds for item in concurrent.usage_by_node.values()) == 1.1
 
 
+def test_manifest_allows_inactive_resume_gap_outside_active_wall(
+    pricing_snapshot: PricingSnapshot,
+) -> None:
+    base = _manifest(pricing_snapshot)
+    active_usage = base.usage.model_copy(update={"wall_seconds": 0.75})
+
+    resumed = RunManifest.create(
+        {
+            **base.model_dump(),
+            "usage": active_usage,
+            "manifest_sha256": "",
+        }
+    )
+
+    assert resumed.usage.wall_seconds == 0.75
+    assert (resumed.finished_at - resumed.started_at).total_seconds() == 1.0
+
+
+def test_manifest_rejects_active_wall_greater_than_calendar_envelope(
+    pricing_snapshot: PricingSnapshot,
+) -> None:
+    base = _manifest(pricing_snapshot)
+    impossible_usage = base.usage.model_copy(update={"wall_seconds": 1.01})
+
+    with pytest.raises(ValidationError, match="wall|envelope"):
+        RunManifest.create(
+            {
+                **base.model_dump(),
+                "usage": impossible_usage,
+                "manifest_sha256": "",
+            }
+        )
+
+
 def _search_call(
     started: datetime,
     *,
@@ -303,7 +337,7 @@ def _search_call(
     usage = ResourceUsage.zero().model_copy(
         update={
             "search_calls": 1,
-            "retries": int(attempt > 1) if usage_retries is None else usage_retries,
+            "retries": 0 if usage_retries is None else usage_retries,
             "wall_seconds": 0.01,
         }
     )
@@ -437,7 +471,7 @@ def test_provider_attempts_are_per_request_and_link_by_containing_execution(
         ),
     )
     tool_observed = ResourceUsage.zero().model_copy(
-        update={"search_calls": 4, "pages": 2, "retries": 1, "wall_seconds": 0.1}
+        update={"search_calls": 4, "pages": 2, "retries": 0, "wall_seconds": 0.1}
     )
     tool_attributed = tool_observed.model_copy(update={"cost_usd": Decimal(0)})
     tool_execution = NodeExecutionRecord(
@@ -447,7 +481,7 @@ def test_provider_attempts_are_per_request_and_link_by_containing_execution(
         usage=tool_observed,
     )
     run_usage = base.usage.model_copy(
-        update={"search_calls": 4, "pages": 2, "retries": 1, "wall_seconds": 1.0}
+        update={"search_calls": 4, "pages": 2, "retries": 0, "wall_seconds": 1.0}
     )
 
     manifest = RunManifest.create(
@@ -619,23 +653,23 @@ def test_provider_retry_attempts_are_chronological_and_non_overlapping(
         _manifest_with_one_tool_execution(base, calls)
 
 
-def test_identical_fresh_provider_invocations_can_each_start_at_attempt_one(
+def test_repeated_provider_invocations_use_contiguous_attempt_ordinals(
     pricing_snapshot: PricingSnapshot,
 ) -> None:
     base = _manifest(pricing_snapshot)
     started = base.started_at
     calls = (
         _search_call(started, request_sha256="a" * 64, attempt=1, offset_ms=10),
-        _search_call(started, request_sha256="a" * 64, attempt=1, offset_ms=30),
+        _search_call(started, request_sha256="a" * 64, attempt=2, offset_ms=30),
     )
 
     manifest = _manifest_with_one_tool_execution(base, calls)
 
-    assert [call.attempt for call in manifest.provider_calls[-2:]] == [1, 1]
+    assert [call.attempt for call in manifest.provider_calls[-2:]] == [1, 2]
     assert manifest.usage.retries == 0
 
 
-def test_retry_history_rejects_hidden_retry_under_zero_budget(
+def test_repeated_invocations_do_not_consume_retry_budget_without_reported_retries(
     pricing_snapshot: PricingSnapshot,
 ) -> None:
     base = _manifest(pricing_snapshot)
@@ -657,13 +691,14 @@ def test_retry_history_rejects_hidden_retry_under_zero_budget(
     )
     zero_retry_budget = base.budget.model_copy(update={"max_retries": 0})
 
-    with pytest.raises(ValidationError, match="retry"):
-        _manifest_with_one_tool_execution(
-            base.model_copy(update={"budget": zero_retry_budget}), calls
-        )
+    manifest = _manifest_with_one_tool_execution(
+        base.model_copy(update={"budget": zero_retry_budget}), calls
+    )
+
+    assert manifest.usage.retries == 0
 
 
-def test_retry_history_rejects_provider_call_double_count(
+def test_one_protocol_invocation_retains_aggregate_provider_retries(
     pricing_snapshot: PricingSnapshot,
 ) -> None:
     base = _manifest(pricing_snapshot)
@@ -673,12 +708,34 @@ def test_retry_history_rejects_provider_call_double_count(
             request_sha256="a" * 64,
             attempt=1,
             offset_ms=10,
-            usage_retries=1,
+            usage_retries=2,
         ),
     )
 
-    with pytest.raises(ValidationError, match="retry"):
-        _manifest_with_one_tool_execution(base, calls)
+    manifest = _manifest_with_one_tool_execution(base, calls)
+
+    assert manifest.usage.retries == 2
+
+
+def test_one_protocol_invocation_rejects_aggregate_retries_above_budget(
+    pricing_snapshot: PricingSnapshot,
+) -> None:
+    base = _manifest(pricing_snapshot)
+    calls = (
+        _search_call(
+            base.started_at,
+            request_sha256="a" * 64,
+            attempt=1,
+            offset_ms=10,
+            usage_retries=2,
+        ),
+    )
+    limited = base.model_copy(
+        update={"budget": base.budget.model_copy(update={"max_retries": 1})}
+    )
+
+    with pytest.raises(ValidationError, match="retry.*budget"):
+        _manifest_with_one_tool_execution(limited, calls)
 
 
 def test_retry_history_reconciles_multiple_retries_and_cache_outcomes(
@@ -691,6 +748,7 @@ def test_retry_history_reconciles_multiple_retries_and_cache_outcomes(
             request_sha256="a" * 64,
             attempt=1,
             offset_ms=10,
+            usage_retries=2,
         ).model_copy(update={"outcome_code": "NETWORK"}),
         _search_call(
             base.started_at,
@@ -742,28 +800,22 @@ def test_retry_history_is_revalidated_on_manifest_copy(
         ),
     )
     manifest = _manifest_with_one_tool_execution(base, calls)
-    hidden_calls = tuple(
-        call.model_copy(update={"usage": call.usage.model_copy(update={"retries": 0})})
-        for call in manifest.provider_calls
+    inconsistent_calls = (
+        *manifest.provider_calls[:-2],
+        manifest.provider_calls[-2].model_copy(
+            update={
+                "usage": manifest.provider_calls[-2].usage.model_copy(
+                    update={"retries": 1}
+                )
+            }
+        ),
+        manifest.provider_calls[-1],
     )
-    hidden_executions = tuple(
-        execution.model_copy(
-            update={"usage": execution.usage.model_copy(update={"retries": 0})}
-        )
-        for execution in manifest.node_executions
-    )
-    hidden_by_node = {
-        node: usage.model_copy(update={"retries": 0})
-        for node, usage in manifest.usage_by_node.items()
-    }
 
     with pytest.raises(ValidationError, match="retry"):
         manifest.model_copy(
             update={
-                "provider_calls": hidden_calls,
-                "node_executions": hidden_executions,
-                "usage_by_node": hidden_by_node,
-                "usage": manifest.usage.model_copy(update={"retries": 0}),
+                "provider_calls": inconsistent_calls,
             }
         )
 
