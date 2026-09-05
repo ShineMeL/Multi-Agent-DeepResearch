@@ -7,10 +7,13 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import tempfile
+import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Self, cast
@@ -34,6 +37,7 @@ from deepresearch.providers import (
     ModelProvider,
     Parser,
     SearchProvider,
+    StructuredModelResult,
     TextEmbedder,
 )
 from deepresearch.providers.parsers import HtmlParser, PdfParser
@@ -60,6 +64,7 @@ from deepresearch.storage import (
 )
 from deepresearch.workflow import (
     BaselineNodeHandlers,
+    BaselineRuntimeHooks,
     DurableRunEventSink,
     LangGraphResearchRunner,
     build_baseline_graph,
@@ -171,6 +176,7 @@ _PARSER_SPECS: tuple[dict[str, str], ...] = (
     {"parser_id": "trafilatura-html", "parser_version": "2.2"},
     {"parser_id": "pymupdf-pdf", "parser_version": "1.28"},
 )
+_RUNTIME_PROFILE_PLACEHOLDER = "runtime-profile-bound-v1"
 
 
 def _safe_absolute_endpoint(value: str, *, model_base: bool = False) -> str:
@@ -355,6 +361,49 @@ def _repository_metadata(*, root: Path | None = None) -> tuple[str, str]:
     return commit, lock_digest
 
 
+def _bind_runtime_profile_request(request: Any) -> Any:
+    """Stabilize planner request identity without leaking a circular profile hash.
+
+    ``provider_profile_id`` is run metadata, not research content.  The profile
+    itself signs the replay files, while the planner request is recorded in one
+    of those files; passing the digest through the planner prompt would create
+    an impossible cryptographic fixed point.  Keep the public RunConfig value
+    exact, but use one deterministic marker at the model boundary.
+    """
+    if getattr(request, "prompt_version", None) != "fixed-planner-v1":
+        return request
+    messages_value: object = getattr(request, "messages", None)
+    if not isinstance(messages_value, tuple) or not messages_value:
+        return request
+    messages = cast("tuple[Any, ...]", messages_value)
+    last: Any = messages[-1]
+    content = getattr(last, "content", None)
+    if not isinstance(content, str):
+        return request
+    try:
+        payload_value: object = json.loads(
+            content,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return request
+    if type(payload_value) is not dict or "provider_profile_id" not in payload_value:
+        return request
+    payload = cast("dict[str, object]", payload_value)
+    payload["provider_profile_id"] = _RUNTIME_PROFILE_PLACEHOLDER
+    message_copy = getattr(last, "model_copy", None)
+    request_copy = getattr(request, "model_copy", None)
+    if not callable(message_copy) or not callable(request_copy):
+        return request
+    bound_message = message_copy(
+        update={
+            "content": canonical_json_bytes(payload).decode("utf-8"),
+        }
+    )
+    return request_copy(update={"messages": (*messages[:-1], bound_message)})
+
+
 class _ModelIdentityAdapter:
     """Immutable public-protocol forwarding adapter with explicit model identity."""
 
@@ -364,6 +413,7 @@ class _ModelIdentityAdapter:
         *,
         model_id: str,
         model_revision: str,
+        bind_runtime_profile: bool = False,
     ) -> None:
         if not model_id or not model_revision:
             raise ValueError("model identity is incomplete")
@@ -371,12 +421,16 @@ class _ModelIdentityAdapter:
         self.provider_id = delegate.provider_id
         self.model_id = model_id
         self.model_revision = model_revision
+        self._bind_runtime_profile = bind_runtime_profile
 
     def _request(self, request: Any) -> Any:
         copy = getattr(request, "model_copy", None)
         if not callable(copy):
             raise TypeError("model request is invalid")
-        return copy(update={"model_id": self.model_id})
+        request_copy = copy(update={"model_id": self.model_id})
+        if not self._bind_runtime_profile:
+            return request_copy
+        return _bind_runtime_profile_request(request_copy)
 
     async def complete(self, request: Any, *, deadline: float, cancellation_token: CancellationToken) -> Any:
         result = await self._delegate.complete(
@@ -400,7 +454,17 @@ class _ModelIdentityAdapter:
             deadline=deadline,
             cancellation_token=cancellation_token,
         )
-        return result.model_copy(update={"model_id": self.model_id})
+        # The replay provider's public generic return is parameterized with a
+        # runtime TypeVar.  Calling its model_copy would therefore revalidate
+        # the typed output as a plain mapping.  Rebind the supplied schema here
+        # so FixedPlanner receives the exact structured object it requested.
+        return StructuredModelResult[output_schema].model_validate(
+            {
+                **result.model_dump(mode="json"),
+                "output": result.output,
+                "model_id": self.model_id,
+            }
+        )
 
     def stream(
         self,
@@ -478,6 +542,29 @@ class _UnknownCostResolver:
 def _runtime_root(checkpoint_db: Path) -> Path:
     absolute = checkpoint_db.absolute()
     return absolute.parent / f".{absolute.stem}.runtime"
+
+
+def _runtime_hooks() -> BaselineRuntimeHooks:
+    """Pair wall timestamps to one monotonic source for manifest envelopes."""
+    origin_monotonic = time.monotonic()
+    origin_utc = datetime.now(UTC)
+    utc_calls = 0
+
+    def monotonic() -> float:
+        return time.monotonic()
+
+    def utc_now() -> datetime:
+        nonlocal utc_calls
+        utc_calls += 1
+        elapsed = max(0.0, time.monotonic() - origin_monotonic)
+        # A timestamp is sampled after the monotonic measurement that updates
+        # elapsed state.  Keep the wall envelope just ahead of that sample so
+        # sub-millisecond clock ordering cannot make a valid run fail strict
+        # manifest reconciliation.
+        slack = 0.001 if utc_calls > 1 else 0.0
+        return origin_utc + timedelta(seconds=elapsed + slack)
+
+    return BaselineRuntimeHooks(monotonic=monotonic, utc_now=utc_now)
 
 
 def _new_run_id() -> str:
@@ -734,6 +821,94 @@ def _write_fsynced(path: Path, payload: bytes) -> None:
         raise
 
 
+def _flush_windows_directory(path: Path) -> None:
+    """Flush directory metadata with a native backup-semantics handle."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.FlushFileBuffers.argtypes = (wintypes.HANDLE,)
+    kernel32.FlushFileBuffers.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.CreateFileW(
+        str(path),
+        0x40000000,
+        0x00000001 | 0x00000002 | 0x00000004,
+        None,
+        3,
+        0x02000000,
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    flushed = False
+    try:
+        if not kernel32.FlushFileBuffers(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+        flushed = True
+    finally:
+        if not kernel32.CloseHandle(handle) and flushed:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        _flush_windows_directory(path)
+        return
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_rename_noreplace_impl(source: Path, destination: Path) -> None:
+    """Atomically publish a directory without replacing an existing target."""
+    if os.name == "nt":
+        # ``os.rename`` maps to MoveFileExW without replace semantics on Windows.
+        os.rename(source, destination)
+        return
+    import ctypes
+    import errno
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    if sys.platform.startswith("linux"):
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise NotImplementedError("atomic no-replace rename is unavailable")
+        result = renameat2(-100, source_bytes, -100, destination_bytes, 1)
+    elif sys.platform == "darwin":
+        renamex_np = getattr(libc, "renamex_np", None)
+        if renamex_np is None:
+            raise NotImplementedError("atomic no-replace rename is unavailable")
+        result = renamex_np(source_bytes, destination_bytes, 0x00000004)
+    else:
+        raise NotImplementedError("atomic no-replace rename is unsupported")
+    if result != 0:
+        error_number = ctypes.get_errno()
+        if error_number == errno.EEXIST:
+            raise FileExistsError(error_number, os.strerror(error_number), destination)
+        raise OSError(error_number, os.strerror(error_number), destination)
+
+
+def _atomic_rename_noreplace(source: Path, destination: Path) -> None:
+    """Keep the publication primitive injectable for security/fault tests."""
+    _atomic_rename_noreplace_impl(source, destination)
+
+
 def _publish_public_output(
     *,
     output: Path,
@@ -746,25 +921,40 @@ def _publish_public_output(
     if _is_link_or_reparse(parent):
         raise ArtifactIntegrityError("output parent is unsafe")
     parent.mkdir(parents=True, exist_ok=True)
+    if _is_link_or_reparse(parent):
+        raise ArtifactIntegrityError("output parent is unsafe")
+    parent_identity = _path_identity(parent)
     if _is_link_or_reparse(final) or final.exists():
         raise ArtifactIntegrityError("output destination is occupied")
     staging = Path(tempfile.mkdtemp(prefix=f".{final.name}.staging.", dir=parent))
     staging_identity = _path_identity(staging)
     try:
-        _write_fsynced(staging / "report.md", report_bytes)
-        _write_fsynced(staging / "evidence.json", evidence_bytes)
-        _write_fsynced(staging / "run-manifest.json", manifest_bytes)
-        descriptor = os.open(staging, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
         if _is_link_or_reparse(staging) or _path_identity(staging) != staging_identity:
             raise ArtifactIntegrityError("output staging object was substituted")
+        for name, payload in (
+            ("report.md", report_bytes),
+            ("evidence.json", evidence_bytes),
+            ("run-manifest.json", manifest_bytes),
+        ):
+            if _is_link_or_reparse(staging) or _path_identity(staging) != staging_identity:
+                raise ArtifactIntegrityError("output staging object was substituted")
+            _write_fsynced(staging / name, payload)
+        _fsync_directory(staging)
+        if _is_link_or_reparse(staging) or _path_identity(staging) != staging_identity:
+            raise ArtifactIntegrityError("output staging object was substituted")
+        if _is_link_or_reparse(parent) or _path_identity(parent) != parent_identity:
+            raise ArtifactIntegrityError("output parent was substituted")
         if _is_link_or_reparse(final) or final.exists():
             raise ArtifactIntegrityError("output destination is occupied")
-        os.rename(staging, final)
+        _atomic_rename_noreplace(staging, final)
         staging = Path()
+        try:
+            _fsync_directory(final)
+            _fsync_directory(parent)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise OSError(
+                "public output was published but durability finalization failed"
+            ) from error
         return final
     finally:
         if staging != Path() and staging.exists():
@@ -773,6 +963,7 @@ def _publish_public_output(
                     for child in staging.iterdir():
                         child.unlink(missing_ok=True)
                     staging.rmdir()
+                    _fsync_directory(parent)
 
 
 def _print_result(*, result: RunResult, output: Path) -> None:
@@ -828,6 +1019,7 @@ def _compose_replay_components(
         ReplayModelProvider(bundle),
         model_id=_replay_model_id(bundle),
         model_revision=bundle.snapshot.providers["model"].model_revision or "",
+        bind_runtime_profile=True,
     )
     search: SearchProvider = ReplaySearchProvider(bundle)
     fetcher: Fetcher = ReplayFetcher(bundle)
@@ -871,7 +1063,10 @@ def _compose_replay_components(
         prompt_versions=dict(handlers.prompt_versions),
     )
     graph = build_baseline_graph(handlers.as_dependencies(checkpointer))
-    runner = LangGraphResearchRunner(baseline_graph=graph)
+    runner = LangGraphResearchRunner(
+        baseline_graph=graph,
+        runtime_hooks=_runtime_hooks(),
+    )
     return _RuntimeComposition(
         model=model_base,
         search=search,
@@ -923,6 +1118,7 @@ def _compose_live_components(
         raw_model,
         model_id=settings.model_id,
         model_revision=_MODEL_REVISION,
+        bind_runtime_profile=True,
     )
     parser: Parser = _ParserRouter((HtmlParser(), PdfParser()))
     embedder: TextEmbedder = SentenceTransformerTextEmbedder.from_lock(
@@ -931,7 +1127,9 @@ def _compose_live_components(
     )
     search: SearchProvider
     fetcher: Fetcher
-    owned: list[Any] = [model, embedder, raw_model]
+    # The identity adapter owns and closes the raw model delegate.  Keep only
+    # the adapter here so shutdown cannot close the same HTTP client twice.
+    owned: list[Any] = [model, embedder]
     if replay_bundle is None:
         search = TavilySearchProvider(api_key=settings.tavily_api_key)
         fetcher = HttpxFetcher(
@@ -980,7 +1178,10 @@ def _compose_live_components(
         prompt_versions=dict(handlers.prompt_versions),
     )
     graph = build_baseline_graph(handlers.as_dependencies(checkpointer))
-    runner = LangGraphResearchRunner(baseline_graph=graph)
+    runner = LangGraphResearchRunner(
+        baseline_graph=graph,
+        runtime_hooks=_runtime_hooks(),
+    )
     return _RuntimeComposition(
         model=model,
         search=search,
