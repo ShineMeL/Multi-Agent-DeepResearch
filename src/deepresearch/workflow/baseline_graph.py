@@ -5131,6 +5131,18 @@ async def _recover_durable_node_event(
         or recovered["next_event_seq"] != restored["next_event_seq"]
     ):
         raise ArtifactIntegrityError("durable event state receipt is corrupt")
+    if node == "PersistResults":
+        graph_id, manifest_id = _verified_persist_result_pair(
+            composition=composition,
+            state=recovered,
+            evidence_graph_artifact_id=recovered["evidence_graph_artifact_id"],
+            manifest_artifact_id=recovered["manifest_artifact_id"],
+        )
+        if (
+            graph_id != recovered["evidence_graph_artifact_id"]
+            or manifest_id != recovered["manifest_artifact_id"]
+        ):
+            raise ArtifactIntegrityError("persisted result pair is corrupt")
     calls, budget_facts = _provider_calls_from_receipt(
         composition,
         run_id=restored["run_id"],
