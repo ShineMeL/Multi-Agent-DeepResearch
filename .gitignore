@@ -6,3 +6,11 @@ artifacts/
 .cache/deepresearch/
 models/embedding/
 __pycache__/
+
+# Benchmark gold and generated experiment payloads stay evaluator-only.
+benchmarks/private/
+benchmarks/snapshots/**/documents.jsonl
+benchmarks/snapshots/**/search.jsonl
+benchmarks/snapshots/**/index.json
+benchmarks/snapshots/frozen_ai_cs_60/test-*/
+experiments/*/
