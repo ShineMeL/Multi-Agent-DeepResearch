@@ -1,0 +1,8 @@
+{
+  "name": "stop_plateau",
+  "stop_code": "PLATEAU",
+  "report_artifact_id": "sha256:plateau-report",
+  "expected_status": "completed",
+  "expected_partial": true,
+  "targeted_research_rounds": 0
+}

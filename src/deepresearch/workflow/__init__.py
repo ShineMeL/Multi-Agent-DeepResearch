@@ -16,12 +16,25 @@ from .baseline_graph import (
     route_after_decide,
     stable_operation_id,
 )
+from .research_graph import (
+    ClaimResolutionRecord,
+    InitialPlanNode,
+    NodeHandler,
+    ResearchGraphDependencies,
+    build_research_graph,
+    result_status_for,
+    route_after_verify,
+)
 from .runner import BaselineRuntimeHooks, LangGraphResearchRunner
 from .state import (
     BaselineBlockedNeed,
     BaselineState,
+    ResearchState,
     StateValidationError,
+    blocked_need_from_checkpoint,
+    blocked_need_to_checkpoint,
     validate_baseline_state,
+    validate_research_state,
 )
 
 __all__ = [
@@ -32,19 +45,30 @@ __all__ = [
     "BaselineRuntimeContext",
     "BaselineRuntimeHooks",
     "BaselineState",
+    "ClaimResolutionRecord",
     "DurableRunEventSink",
+    "InitialPlanNode",
     "InvocationUsageObserver",
     "LangGraphResearchRunner",
+    "NodeHandler",
+    "ResearchGraphDependencies",
+    "ResearchState",
     "StateUpdate",
     "StateValidationError",
     "UsageCostResolver",
     "UsageIntegrityError",
     "WorkflowInvariantError",
     "baseline_is_sufficient",
+    "blocked_need_from_checkpoint",
+    "blocked_need_to_checkpoint",
     "build_baseline_graph",
+    "build_research_graph",
     "decide_baseline_stop",
     "rank_baseline_coverage",
+    "result_status_for",
     "route_after_decide",
+    "route_after_verify",
     "stable_operation_id",
     "validate_baseline_state",
+    "validate_research_state",
 ]

@@ -7,6 +7,7 @@ from typing import Literal, TypedDict, cast
 from pydantic import BaseModel
 
 from deepresearch.domain import CoverageLedgerEntry, ResearchRequest, StopReason
+from deepresearch.planning.stop import BlockedNeed
 from deepresearch.runtime import BudgetSnapshot
 
 
@@ -49,6 +50,22 @@ class BaselineState(TypedDict):
     error_code: str | None
 
 
+class ResearchState(BaselineState, total=False):
+    planner_round_index: int
+    decision_route: Literal["SEARCH", "STOP"]
+    verification_route: Literal[
+        "TARGETED_RESEARCH",
+        "RESOLVE_UNSUPPORTED",
+        "FINALIZE",
+    ]
+    rank_artifact_id: str | None
+    claim_ids: tuple[str, ...]
+    unsupported_claim_ids: tuple[str, ...]
+    claim_resolution_artifact_id: str | None
+    citation_guard_artifact_id: str | None
+    directional_research_rounds: int
+
+
 class StateValidationError(ValueError):
     code: Literal["DATA_CORRUPTION"] = "DATA_CORRUPTION"
 
@@ -79,6 +96,23 @@ _OPTIONAL_STRINGS = (
 )
 _STOP_REASONS = frozenset({"SUFFICIENT", "PLATEAU", "BUDGET_EXHAUSTED", "BLOCKED"})
 _BLOCKED_FIELDS = frozenset(BaselineBlockedNeed.__annotations__)
+_RESEARCH_FIELDS = frozenset(
+    {
+        "planner_round_index",
+        "decision_route",
+        "verification_route",
+        "rank_artifact_id",
+        "claim_ids",
+        "unsupported_claim_ids",
+        "claim_resolution_artifact_id",
+        "citation_guard_artifact_id",
+        "directional_research_rounds",
+    }
+)
+_DECISION_ROUTES = frozenset({"SEARCH", "STOP"})
+_VERIFICATION_ROUTES = frozenset(
+    {"TARGETED_RESEARCH", "RESOLVE_UNSUPPORTED", "FINALIZE"}
+)
 
 
 def _invalid() -> StateValidationError:
@@ -218,9 +252,82 @@ def validate_baseline_state(value: Mapping[str, object]) -> BaselineState:
     return cast("BaselineState", copied)
 
 
+def validate_research_state(value: Mapping[str, object]) -> ResearchState:
+    raw = value
+    allowed = _FIELDS | _RESEARCH_FIELDS
+    if not _FIELDS.issubset(raw) or not set(raw).issubset(allowed):
+        raise _invalid()
+    baseline_values = {name: raw[name] for name in _FIELDS}
+    baseline = validate_baseline_state(baseline_values)
+    copied: dict[str, object] = dict(baseline)
+
+    for name in ("planner_round_index", "directional_research_rounds"):
+        if name in raw:
+            item = raw[name]
+            if type(item) is not int or item < 0:
+                raise _invalid()
+            copied[name] = item
+    for name, allowed_values in (
+        ("decision_route", _DECISION_ROUTES),
+        ("verification_route", _VERIFICATION_ROUTES),
+    ):
+        if name in raw:
+            item = raw[name]
+            if type(item) is not str or item not in allowed_values:
+                raise _invalid()
+            copied[name] = item
+    for name in (
+        "rank_artifact_id",
+        "claim_resolution_artifact_id",
+        "citation_guard_artifact_id",
+    ):
+        if name in raw:
+            item = raw[name]
+            if item is not None and (not isinstance(item, str) or not item):
+                raise _invalid()
+            copied[name] = item
+    for name in ("claim_ids", "unsupported_claim_ids"):
+        if name in raw:
+            item = raw[name]
+            if not isinstance(item, tuple):
+                raise _invalid()
+            members = cast("tuple[object, ...]", item)
+            if any(type(member) is not str or not member for member in members):
+                raise _invalid()
+            copied[name] = tuple(members)
+    return cast("ResearchState", copied)
+
+
+def blocked_need_from_checkpoint(record: BaselineBlockedNeed) -> BlockedNeed:
+    validated = _validate_blocked_need(record)
+    return BlockedNeed(
+        need_id=validated["need_id"],
+        required_source_unavailable=validated["required_source_unavailable"],
+        alternative_strategies_exhausted=validated["alternative_strategies_exhausted"],
+        retries_used=validated["retry_count"],
+        max_retries=validated["max_retries"],
+    )
+
+
+def blocked_need_to_checkpoint(item: BlockedNeed) -> BaselineBlockedNeed:
+    if type(item) is not BlockedNeed:
+        raise TypeError("item must be a BlockedNeed")
+    return {
+        "need_id": item.need_id,
+        "required_source_unavailable": item.required_source_unavailable,
+        "alternative_strategies_exhausted": item.alternative_strategies_exhausted,
+        "retry_count": item.retries_used,
+        "max_retries": item.max_retries,
+    }
+
+
 __all__ = [
     "BaselineBlockedNeed",
     "BaselineState",
+    "ResearchState",
     "StateValidationError",
+    "blocked_need_from_checkpoint",
+    "blocked_need_to_checkpoint",
     "validate_baseline_state",
+    "validate_research_state",
 ]

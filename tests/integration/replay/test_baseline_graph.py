@@ -638,6 +638,7 @@ async def test_runner_has_frozen_constructor_and_builds_isolated_new_run_context
         "self",
         "baseline_graph",
         "runtime_hooks",
+        "research_graph",
     }
     assert runner._baseline_graph is graph
     assert result.status == "completed"

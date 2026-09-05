@@ -1,0 +1,13 @@
+{
+  "name": "stop_blocked",
+  "stop_code": "BLOCKED",
+  "report_artifact_id": null,
+  "expected_status": "failed",
+  "expected_partial": true,
+  "targeted_research_rounds": 0,
+  "public_steps": [
+    "PROVIDER_FAILURE",
+    "ALTERNATIVE_STRATEGY",
+    "BLOCKED"
+  ]
+}
