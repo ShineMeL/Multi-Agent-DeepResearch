@@ -22,6 +22,7 @@ from .research_graph import (
     NodeHandler,
     ResearchGraphDependencies,
     build_research_graph,
+    result_status_for,
     route_after_verify,
 )
 from .runner import BaselineRuntimeHooks, LangGraphResearchRunner
@@ -64,6 +65,7 @@ __all__ = [
     "build_research_graph",
     "decide_baseline_stop",
     "rank_baseline_coverage",
+    "result_status_for",
     "route_after_decide",
     "route_after_verify",
     "stable_operation_id",

@@ -10,7 +10,9 @@ from langgraph.graph.state import (  # pyright: ignore[reportMissingTypeStubs]
     CompiledStateGraph,
 )
 
+from deepresearch.domain import RunStatus
 from deepresearch.planning import FixedPlanner
+from deepresearch.planning.stop import StopCode
 
 from .state import (
     ResearchState,
@@ -54,6 +56,20 @@ class ClaimResolutionRecord:
 type NodeHandler = Callable[
     [ResearchState], Awaitable[Mapping[str, object]]
 ]
+
+
+def result_status_for(
+    stop_code: StopCode,
+    report_artifact_id: str | None,
+) -> tuple[RunStatus, bool]:
+    """Map a terminal stop decision to the canonical public result shape."""
+    if type(stop_code) is not StopCode:
+        raise TypeError("stop_code must be a StopCode")
+    if report_artifact_id is None:
+        return "failed", stop_code is not StopCode.SUFFICIENT
+    if stop_code is StopCode.SUFFICIENT:
+        return "completed", False
+    return "completed", True
 
 
 class InitialPlanNode(Protocol):
@@ -104,6 +120,10 @@ def route_after_verify(
         raise ValueError(
             "verification_route must be TARGETED_RESEARCH, RESOLVE_UNSUPPORTED, or FINALIZE"
         )
+    research_rounds = restored.get("directional_research_rounds", 0)
+    unsupported_claim_ids = restored.get("unsupported_claim_ids", ())
+    if research_rounds > 0:
+        return "RESOLVE_UNSUPPORTED" if unsupported_claim_ids else "FINALIZE"
     return cast(
         "Literal['TARGETED_RESEARCH', 'RESOLVE_UNSUPPORTED', 'FINALIZE']",
         route,
@@ -180,6 +200,7 @@ __all__ = [
     "blocked_need_from_checkpoint",
     "blocked_need_to_checkpoint",
     "build_research_graph",
+    "result_status_for",
     "route_after_decide",
     "route_after_verify",
 ]

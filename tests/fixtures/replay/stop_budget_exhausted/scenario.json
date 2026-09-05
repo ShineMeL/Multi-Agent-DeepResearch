@@ -1,0 +1,8 @@
+{
+  "name": "stop_budget_exhausted",
+  "stop_code": "BUDGET_EXHAUSTED",
+  "report_artifact_id": "sha256:budget-report",
+  "expected_status": "completed",
+  "expected_partial": true,
+  "targeted_research_rounds": 0
+}

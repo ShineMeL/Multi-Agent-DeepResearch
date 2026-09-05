@@ -1,0 +1,9 @@
+{
+  "name": "conflict_research",
+  "stop_code": "PLATEAU",
+  "report_artifact_id": "sha256:conflict-report",
+  "expected_status": "completed",
+  "expected_partial": true,
+  "targeted_research_rounds": 1,
+  "targeted_research_event_count": 1
+}

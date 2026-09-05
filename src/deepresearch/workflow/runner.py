@@ -19,6 +19,7 @@ from langgraph.graph.state import (  # pyright: ignore[reportMissingTypeStubs]
 
 from deepresearch.domain import ResourceUsage, RunConfig, RunEvent, RunResult
 from deepresearch.planning import PlanGenerationError
+from deepresearch.planning.stop import StopCode
 from deepresearch.providers import ProviderError
 from deepresearch.runtime import (
     BudgetAccountant,
@@ -42,6 +43,7 @@ from .baseline_graph import (
     DurableRunEventSink,
     WorkflowInvariantError,
 )
+from .research_graph import result_status_for
 from .state import (
     BaselineState,
     ResearchState,
@@ -192,24 +194,22 @@ def _result_from_state(state: BaselineState, usage: ResourceUsage) -> RunResult:
             evidence_graph_artifact_id=state["evidence_graph_artifact_id"],
             manifest_artifact_id=state["manifest_artifact_id"],
         )
-    if stop_reason is not None and report_id is None:
+    if stop_reason is None:
+        return _failed_result(
+            run_id=state["run_id"],
+            thread_id=state["thread_id"],
+            usage=usage,
+            error_code="NO_LEGAL_CONTINUATION",
+        )
+    status, partial = result_status_for(StopCode(stop_reason), report_id)
+    if status == "failed":
         return _failed_result(
             run_id=state["run_id"],
             thread_id=state["thread_id"],
             usage=usage,
             error_code="REPORT_MISSING",
             stop_reason=stop_reason,
-        )
-    if stop_reason == "SUFFICIENT" and report_id is not None:
-        partial = False
-    elif stop_reason in {"PLATEAU", "BUDGET_EXHAUSTED", "BLOCKED"} and report_id:
-        partial = True
-    else:
-        return _failed_result(
-            run_id=state["run_id"],
-            thread_id=state["thread_id"],
-            usage=usage,
-            error_code="NO_LEGAL_CONTINUATION",
+            is_partial=partial,
         )
     return RunResult(
         run_id=state["run_id"],
