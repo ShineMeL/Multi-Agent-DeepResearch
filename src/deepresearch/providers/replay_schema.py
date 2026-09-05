@@ -451,7 +451,11 @@ def _validate_success_record(
         if result.provider_id != record.key.provider_id or result.usage != record.usage:
             raise ValueError("model response metadata or usage does not match its record")
     elif operation == "model.structured":
-        result = StructuredModelResult[JsonValue].model_validate(response)
+        # Replay outcomes freeze nested JSON arrays as tuples for immutable
+        # in-memory records.  Rehydrate ordinary JSON lists before validating
+        # the generic provider result, whose JsonValue contract intentionally
+        # accepts lists but not tuple internals.
+        result = StructuredModelResult[JsonValue].model_validate(_thaw_json(response))
         if result.provider_id != record.key.provider_id or result.usage != record.usage:
             raise ValueError("structured response metadata or usage does not match its record")
     elif operation == "model.stream":
