@@ -5241,7 +5241,7 @@ def _verified_persist_result_pair(
             return None, None
     except (asyncio.CancelledError, KeyboardInterrupt, MemoryError, SystemExit):
         raise
-    except (FileNotFoundError, OSError, TypeError, ValueError):
+    except (ArtifactIntegrityError, FileNotFoundError, OSError, TypeError, ValueError):
         return None, None
     return graph_id, manifest_id
 
