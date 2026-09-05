@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import re
+import unicodedata
+from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, cast
 
 import typer
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -13,14 +16,23 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from deepresearch.providers.errors import ProviderError
 from deepresearch.providers.frozen_index import FrozenCorpusSnapshot
 
-from .models import AnnotatedQuestion, PrivateDatasetManifest, TaskCategory
+from .isolation import GoldIsolationGuard
+from .models import (
+    AnnotatedQuestion,
+    DatasetManifest,
+    PrivateDatasetManifest,
+    RuntimeTask,
+    TaskCategory,
+)
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
 def canonical_json_bytes(value: object) -> bytes:
     return (
-        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
         .encode("utf-8")
         + b"\n"
     )
@@ -77,15 +89,13 @@ def _stable_messages(messages: Sequence[str]) -> tuple[str, ...]:
 
 
 def _question_key(question: AnnotatedQuestion) -> str:
-    return " ".join(question.request.question.casefold().split())
+    normalized = unicodedata.normalize("NFKC", question.request.question).casefold()
+    return " ".join(re.findall(r"[^\W_]+", normalized))
 
 
-def read_annotated_questions(path: Path) -> tuple[AnnotatedQuestion, ...]:
-    source = Path(path)
-    if not source.is_file():
-        raise FileNotFoundError(f"batch file does not exist: {source}")
+def _parse_annotated_questions(source: Path, payload: bytes) -> tuple[AnnotatedQuestion, ...]:
     questions: list[AnnotatedQuestion] = []
-    for line_number, line in enumerate(source.read_bytes().splitlines(), start=1):
+    for line_number, line in enumerate(payload.splitlines(), start=1):
         if not line.strip():
             raise ValueError(f"blank JSONL line at {source}:{line_number}")
         try:
@@ -93,6 +103,18 @@ def read_annotated_questions(path: Path) -> tuple[AnnotatedQuestion, ...]:
         except (TypeError, ValueError, ValidationError) as error:
             raise ValueError(f"invalid AnnotatedQuestion at {source}:{line_number}") from error
     return tuple(questions)
+
+
+def read_annotated_questions_with_bytes(path: Path) -> tuple[bytes, tuple[AnnotatedQuestion, ...]]:
+    source = Path(path)
+    if not source.is_file():
+        raise FileNotFoundError(f"batch file does not exist: {source}")
+    payload = source.read_bytes()
+    return payload, _parse_annotated_questions(source, payload)
+
+
+def read_annotated_questions(path: Path) -> tuple[AnnotatedQuestion, ...]:
+    return read_annotated_questions_with_bytes(path)[1]
 
 
 def _batch_report(
@@ -158,6 +180,35 @@ def _dataset_report(
     )
 
 
+def _expected_subset(
+    records: Sequence[AnnotatedQuestion],
+    *,
+    quotas: tuple[int, int, int, int, int, int],
+    seed: int,
+    label: str,
+) -> tuple[str, ...]:
+    by_category: dict[TaskCategory, list[str]] = {category: [] for category in TaskCategory}
+    for record in records:
+        if record.split == "test":
+            by_category[record.category].append(record.task_id)
+    selected: list[str] = []
+    for category, quota in zip(TaskCategory, quotas, strict=True):
+        candidates = sorted(by_category[category])
+        if len(candidates) < quota:
+            return ()
+        randomizer = random.Random(f"{seed}:{label}:{category.value}")
+        randomizer.shuffle(candidates)
+        selected.extend(candidates[:quota])
+    return tuple(sorted(selected))
+
+
+def _runtime_payload(records: Sequence[AnnotatedQuestion]) -> bytes:
+    return b"".join(
+        canonical_json_bytes(GoldIsolationGuard.runtime_view(record).model_dump(mode="json"))
+        for record in sorted(records, key=lambda item: item.task_id)
+    )
+
+
 class DatasetValidator:
     def __init__(self, *, snapshot_root: Path) -> None:
         self.snapshot_root = Path(snapshot_root)
@@ -207,15 +258,34 @@ class DatasetValidator:
         if type(expected_count) is not int or expected_count <= 0:
             raise ValueError("expected_count must be a positive integer")
         errors: list[str] = []
+        warnings: list[str] = []
         if len(records) != expected_count:
             errors.append(f"expected {expected_count} records, got {len(records)}")
-        task_ids = [record.task_id for record in records]
+        normalized_records: list[AnnotatedQuestion] = []
+        for index, record in enumerate(records, start=1):
+            if type(record) is not AnnotatedQuestion:
+                errors.append(f"record {index}: must be an AnnotatedQuestion")
+                continue
+            try:
+                normalized_records.append(
+                    AnnotatedQuestion.model_validate(record.model_dump(mode="python"), strict=True)
+                )
+            except (TypeError, ValueError, ValidationError):
+                errors.append(f"record {index}: invalid AnnotatedQuestion after revalidation")
+        task_ids = [record.task_id for record in normalized_records]
         if len(task_ids) != len(set(task_ids)):
             errors.append("duplicate immutable task_id")
-        question_keys = [_question_key(record) for record in records]
+        question_keys = [_question_key(record) for record in normalized_records]
         if len(question_keys) != len(set(question_keys)):
             errors.append("duplicate semantic question")
-        for record in records:
+        for first_index, first in enumerate(normalized_records):
+            for second in normalized_records[first_index + 1 :]:
+                if _question_key(first) != _question_key(second):
+                    warnings.append(
+                        "manual semantic review required for distinct prompts: "
+                        f"{first.task_id}, {second.task_id}"
+                    )
+        for record in normalized_records:
             if record.category != expected_category:
                 errors.append(
                     f"task {record.task_id}: category is {record.category}, expected {expected_category}"
@@ -226,6 +296,7 @@ class DatasetValidator:
             category=expected_category,
             record_count=len(records),
             errors=errors,
+            warnings=warnings,
         )
 
     def validate_batch(
@@ -237,7 +308,7 @@ class DatasetValidator:
     ) -> BatchValidationReport:
         batch_path = Path(path)
         try:
-            records = read_annotated_questions(batch_path)
+            _, records = read_annotated_questions_with_bytes(batch_path)
         except (OSError, ValueError, TypeError) as error:
             return _batch_report(
                 batch_id=batch_path.stem or "invalid",
@@ -252,14 +323,18 @@ class DatasetValidator:
             expected_count=expected_count,
         )
 
-    def validate_dataset(self, private_manifest_path: Path) -> DatasetValidationReport:
+    def validate_dataset(
+        self,
+        private_manifest_path: Path,
+        *,
+        public_manifest_path: Path | None = None,
+    ) -> DatasetValidationReport:
         manifest_path = Path(private_manifest_path)
         empty_counts: dict[Literal["dev", "test"], int] = {"dev": 0, "test": 0}
         empty_categories = {category: 0 for category in TaskCategory}
         try:
-            private_manifest = PrivateDatasetManifest.model_validate_json(
-                manifest_path.read_bytes(), strict=True
-            )
+            private_bytes = manifest_path.read_bytes()
+            private_manifest = PrivateDatasetManifest.model_validate_json(private_bytes, strict=True)
         except (OSError, ValueError, TypeError, ValidationError) as error:
             return _dataset_report(
                 dataset_id="invalid",
@@ -284,22 +359,30 @@ class DatasetValidator:
             errors.append("dataset must contain exactly six category batch files")
         for category in TaskCategory:
             batch_path = batch_root / f"{category.value}.jsonl"
-            report = self.validate_batch(
-                batch_path,
-                expected_category=category,
-                expected_count=10,
-            )
+            try:
+                batch_bytes, batch_records = read_annotated_questions_with_bytes(batch_path)
+            except (OSError, ValueError, TypeError) as error:
+                report = _batch_report(
+                    batch_id=batch_path.stem or "invalid",
+                    category=category,
+                    record_count=0,
+                    errors=(str(error),),
+                )
+                batch_bytes = None
+                batch_records = ()
+            else:
+                report = self.validate_records(
+                    batch_records,
+                    batch_id=batch_path.stem,
+                    expected_category=category,
+                    expected_count=10,
+                )
             reports.append(report)
             if not report.valid:
                 errors.extend(f"{category.value}: {error}" for error in report.errors)
-            try:
-                batch_records = read_annotated_questions(batch_path)
-            except (OSError, ValueError, TypeError):
-                continue
             records.extend(batch_records)
             expected_hash = private_manifest.batch_sha256.get(category)
-            actual_hash = sha256_bytes(batch_path.read_bytes())
-            if expected_hash != actual_hash:
+            if batch_bytes is None or expected_hash != sha256_bytes(batch_bytes):
                 errors.append(f"{category.value}: batch hash does not match private manifest")
 
         split_counts: dict[Literal["dev", "test"], int] = {
@@ -362,6 +445,77 @@ class DatasetValidator:
             if len(ids) != expected_size or not set(ids) <= test_ids:
                 errors.append(f"{label} must contain exactly {expected_size} test task IDs")
 
+        expected_subsets = (
+            ("stability_task_ids", private_manifest.stability_task_ids, (4, 4, 3, 3, 3, 3), "stability-cost"),
+            ("cost_subset_task_ids", private_manifest.cost_subset_task_ids, (4, 4, 3, 3, 3, 3), "stability-cost"),
+            ("p0_task_ids", private_manifest.p0_task_ids, (2, 2, 2, 2, 1, 1), "p0"),
+            ("oracle_task_ids", private_manifest.oracle_task_ids, (2, 2, 2, 2, 1, 1), "oracle"),
+        )
+        for label, ids, quotas, selection_label in expected_subsets:
+            expected_ids = _expected_subset(
+                records,
+                quotas=quotas,
+                seed=private_manifest.subset_seed,
+                label=selection_label,
+            )
+            if expected_ids and ids != expected_ids:
+                errors.append(f"{label} does not match its deterministic seed selection")
+            actual_quotas: Counter[TaskCategory] = Counter(
+                record.category for record in records if record.task_id in set(ids)
+            )
+            expected_quotas: Counter[TaskCategory] = Counter()
+            for category, quota in zip(TaskCategory, quotas, strict=True):
+                expected_quotas[category] = quota
+            if actual_quotas != expected_quotas:
+                errors.append(f"{label} does not satisfy the category quotas")
+
+        if public_manifest_path is not None:
+            public_path = Path(public_manifest_path)
+            try:
+                public_bytes = public_path.read_bytes()
+                public_manifest = DatasetManifest.model_validate_json(public_bytes, strict=True)
+            except (OSError, ValueError, TypeError, ValidationError) as error:
+                errors.append(f"public manifest is invalid: {error}")
+            else:
+                if public_manifest.dataset_id != private_manifest.dataset_id:
+                    errors.append("public dataset_id does not match private manifest")
+                if public_manifest.version != private_manifest.version:
+                    errors.append("public version does not match private manifest")
+                if public_manifest.record_count != private_manifest.record_count:
+                    errors.append("public record_count does not match private manifest")
+                if public_manifest.split_counts != private_manifest.split_counts:
+                    errors.append("public split_counts do not match private manifest")
+                if public_manifest.category_counts != private_manifest.category_counts:
+                    errors.append("public category_counts do not match private manifest")
+                if public_manifest.private_manifest_sha256 != sha256_bytes(private_bytes):
+                    errors.append("public private_manifest_sha256 does not match")
+                if public_manifest.snapshot_collection_sha256 != sha256_bytes(
+                    canonical_json_bytes(dict(sorted(snapshot_locks.items())))
+                ):
+                    errors.append("public snapshot_collection_sha256 does not match")
+                if public_manifest.cost_subset_sha256 != sha256_bytes(
+                    canonical_json_bytes(list(private_manifest.cost_subset_task_ids))
+                ):
+                    errors.append("public cost_subset_sha256 does not match")
+                if public_manifest.public_runtime_files != private_manifest.public_runtime_files:
+                    errors.append("public runtime file list does not match private manifest")
+                errors.extend(
+                    self._validate_runtime_files(
+                        root=public_path.parent,
+                        paths=public_manifest.public_runtime_files,
+                        records=records,
+                        split="dev",
+                    )
+                )
+                errors.extend(
+                    self._validate_runtime_files(
+                        root=private_root,
+                        paths=private_manifest.private_test_runtime_files,
+                        records=records,
+                        split="test",
+                    )
+                )
+
         return _dataset_report(
             dataset_id=private_manifest.dataset_id,
             version=private_manifest.version,
@@ -371,6 +525,49 @@ class DatasetValidator:
             batch_reports=reports,
             errors=errors,
         )
+
+    def _validate_runtime_files(
+        self,
+        *,
+        root: Path,
+        paths: Sequence[str],
+        records: Sequence[AnnotatedQuestion],
+        split: Literal["dev", "test"],
+    ) -> tuple[str, ...]:
+        expected_paths = [f"runtime/{split}/{category.value}.jsonl" for category in TaskCategory]
+        errors: list[str] = []
+        if list(paths) != expected_paths:
+            errors.append(f"{split} runtime files must name the six category files")
+            return tuple(errors)
+        for category, relative_path in zip(TaskCategory, paths, strict=True):
+            relative = Path(relative_path)
+            if relative.is_absolute() or ".." in relative.parts:
+                errors.append(f"{split} runtime path is not relative: {relative_path}")
+                continue
+            target = root / relative
+            expected_records = [
+                record
+                for record in records
+                if record.category == category and record.split == split
+            ]
+            try:
+                actual = target.read_bytes()
+            except OSError:
+                errors.append(f"{split} runtime file is missing: {relative_path}")
+                continue
+            if actual != _runtime_payload(expected_records):
+                errors.append(f"{split} runtime file content does not match frozen records: {relative_path}")
+                continue
+            for line_number, line in enumerate(actual.splitlines(), start=1):
+                try:
+                    raw = json.loads(line)
+                    raw_mapping = cast("dict[str, object]", raw)
+                    if not isinstance(raw, dict) or set(raw_mapping) != set(RuntimeTask.model_fields):
+                        raise ValueError("RuntimeTask fields are not exact")
+                    RuntimeTask.model_validate_json(line, strict=True)
+                except (TypeError, ValueError, ValidationError, json.JSONDecodeError):
+                    errors.append(f"{split} runtime file has invalid RuntimeTask: {relative_path}:{line_number}")
+        return _stable_messages(errors)
 
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -396,10 +593,14 @@ def validate_batch_command(
 
 @app.command("validate-dataset")
 def validate_dataset_command(
-    private_manifest: Annotated[Path, typer.Option(...)],
+    manifest: Annotated[Path, typer.Option("--manifest", "--private-manifest")],
     snapshot_root: Annotated[Path, typer.Option()] = _DEFAULT_SNAPSHOT_ROOT,
+    public_manifest: Annotated[Path | None, typer.Option()] = None,
 ) -> None:
-    report = DatasetValidator(snapshot_root=snapshot_root).validate_dataset(private_manifest)
+    report = DatasetValidator(snapshot_root=snapshot_root).validate_dataset(
+        manifest,
+        public_manifest_path=public_manifest,
+    )
     typer.echo(report.model_dump_json())
     if not report.valid:
         raise typer.Exit(code=2)

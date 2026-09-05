@@ -8,8 +8,10 @@ from pathlib import Path
 
 import pytest
 
+import benchmarks.datasets.builder as builder_module
 from benchmarks.datasets.builder import DatasetBuilder, DatasetFrozenError
 from benchmarks.datasets.models import AnnotatedQuestion, FrozenEvidenceRecord, TaskCategory
+from benchmarks.datasets.validator import DatasetValidator
 from benchmarks.scripts.build_snapshot import main as build_snapshot
 
 TEMPLATE = (
@@ -224,3 +226,76 @@ def test_finalize_exports_disjoint_dev_and_test_runtime_files(tmp_path: Path) ->
             "corpus_version",
             "index_version",
         } for record in [*dev_records, *test_records])
+
+
+def test_finalize_validates_public_manifest_hash_chain_and_runtime_content(tmp_path: Path) -> None:
+    private_root = tmp_path / "private"
+    public_root = tmp_path / "public"
+    snapshot_root = tmp_path / "snapshots"
+    _write_complete_private_dataset(private_root, snapshot_root)
+    result = DatasetBuilder(snapshot_root=snapshot_root).finalize(
+        dataset_id="frozen-ai-cs-60",
+        version="1.0.0",
+        private_root=private_root,
+        public_root=public_root,
+        snapshot_root=snapshot_root,
+        subset_seed=20260829,
+    )
+
+    validator = DatasetValidator(snapshot_root=snapshot_root)
+    assert validator.validate_dataset(
+        result.private_manifest_path,
+        public_manifest_path=result.public_manifest_path,
+    ).valid
+    commit = json.loads((private_root / ".dataset_commit.json").read_bytes())
+    assert commit["dataset_id"] == "frozen-ai-cs-60"
+    assert commit["private_manifest_sha256"]
+    assert commit["public_manifest_sha256"]
+
+    public_payload = json.loads(result.public_manifest_path.read_bytes())
+    public_payload["private_manifest_sha256"] = "0" * 64
+    result.public_manifest_path.write_text(json.dumps(public_payload), encoding="utf-8")
+    report = validator.validate_dataset(
+        result.private_manifest_path,
+        public_manifest_path=result.public_manifest_path,
+    )
+    assert "public private_manifest_sha256 does not match" in report.errors
+
+
+def test_finalize_recovers_after_public_manifest_publish_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    private_root = tmp_path / "private"
+    public_root = tmp_path / "public"
+    snapshot_root = tmp_path / "snapshots"
+    _write_complete_private_dataset(private_root, snapshot_root)
+    original_publish = builder_module._publish_file
+    failed = False
+
+    def fail_public_manifest(staging: Path, output: Path) -> None:
+        nonlocal failed
+        if output == public_root / "public_manifest.json" and not failed:
+            failed = True
+            raise OSError("simulated public manifest publish failure")
+        original_publish(staging, output)
+
+    monkeypatch.setattr(builder_module, "_publish_file", fail_public_manifest)
+    with pytest.raises(OSError, match="simulated public manifest"):
+        DatasetBuilder(snapshot_root=snapshot_root).finalize(
+            dataset_id="frozen-ai-cs-60",
+            version="1.0.0",
+            private_root=private_root,
+            public_root=public_root,
+            snapshot_root=snapshot_root,
+            subset_seed=20260829,
+        )
+    monkeypatch.setattr(builder_module, "_publish_file", original_publish)
+
+    result = DatasetBuilder(snapshot_root=snapshot_root).finalize(
+        dataset_id="frozen-ai-cs-60",
+        version="1.0.0",
+        private_root=private_root,
+        public_root=public_root,
+        snapshot_root=snapshot_root,
+        subset_seed=20260829,
+    )
+    assert result.public_manifest_path.is_file()
+    assert not list(tmp_path.rglob("*.staging"))

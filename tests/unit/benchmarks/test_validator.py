@@ -4,8 +4,10 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
-from benchmarks.datasets.models import PrivateDatasetManifest, TaskCategory
-from benchmarks.datasets.validator import DatasetValidator
+from typer.testing import CliRunner
+
+from benchmarks.datasets.models import AnnotatedQuestion, PrivateDatasetManifest, TaskCategory
+from benchmarks.datasets.validator import DatasetValidator, app
 
 TEMPLATE = (
     Path(__file__).parents[3]
@@ -18,6 +20,10 @@ TEMPLATE = (
 
 def _question_payload() -> dict[str, object]:
     return json.loads(TEMPLATE.read_bytes())
+
+
+def _question() -> AnnotatedQuestion:
+    return AnnotatedQuestion.model_validate_json(TEMPLATE.read_bytes(), strict=True)
 
 
 def test_batch_requires_exactly_ten_records(tmp_path: Path) -> None:
@@ -97,3 +103,70 @@ def test_dataset_rejects_snapshot_locks_for_unreferenced_tasks(tmp_path: Path) -
 
     assert "batch hash categories must match the six dataset categories" in report.errors
     assert "snapshot lock task IDs must match dataset task IDs" in report.errors
+
+
+def test_validate_records_revalidates_mutated_frozen_models(tmp_path: Path) -> None:
+    record = _question()
+    record.information_needs.clear()
+
+    report = DatasetValidator(snapshot_root=tmp_path / "snapshots").validate_records(
+        (record,),
+        batch_id="mutated",
+        expected_category=TaskCategory.TECHNICAL_SURVEY,
+        expected_count=1,
+    )
+
+    assert "invalid AnnotatedQuestion" in " ".join(report.errors)
+
+
+def test_duplicate_question_normalization_handles_unicode_and_punctuation(tmp_path: Path) -> None:
+    first = _question()
+    second = first.model_copy(
+        update={
+            "task_id": "dev-ts-unicode-duplicate",
+            "request": first.request.model_copy(update={"question": "Re\u0301sume\u0301 -- methods"}),
+        }
+    )
+    first = first.model_copy(
+        update={"request": first.request.model_copy(update={"question": "R\u00e9sum\u00e9: methods!"})}
+    )
+
+    report = DatasetValidator(snapshot_root=tmp_path / "snapshots").validate_records(
+        (first, second),
+        batch_id="unicode",
+        expected_category=TaskCategory.TECHNICAL_SURVEY,
+        expected_count=2,
+    )
+
+    assert "duplicate semantic question" in report.errors
+
+
+def test_distinct_questions_emit_auditable_manual_semantic_review_warning(tmp_path: Path) -> None:
+    first = _question()
+    second = first.model_copy(
+        update={
+            "task_id": "dev-ts-synonym-review",
+            "request": first.request.model_copy(
+                update={"question": "Contrast the primary planner routes for research agents."}
+            ),
+        }
+    )
+
+    report = DatasetValidator(snapshot_root=tmp_path / "snapshots").validate_records(
+        (first, second),
+        batch_id="synonym-review",
+        expected_category=TaskCategory.TECHNICAL_SURVEY,
+        expected_count=2,
+    )
+
+    assert any("manual semantic review" in warning for warning in report.warnings)
+
+
+def test_validate_dataset_cli_accepts_manifest_option(tmp_path: Path) -> None:
+    result = CliRunner().invoke(
+        app,
+        ["validate-dataset", "--manifest", str(tmp_path / "missing-private-manifest.json")],
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.output)["record_count"] == 0

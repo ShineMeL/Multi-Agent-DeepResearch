@@ -22,6 +22,7 @@ from .validator import (
     DatasetValidator,
     canonical_json_bytes,
     read_annotated_questions,
+    read_annotated_questions_with_bytes,
     sha256_bytes,
 )
 
@@ -170,8 +171,20 @@ class DatasetBuilder:
         snapshot_path = Path(snapshot_root).absolute()
         private_manifest_path = private_path / "private_manifest.json"
         public_manifest_path = public_path / "public_manifest.json"
-        if _path_exists(private_manifest_path) or _path_exists(public_manifest_path):
-            raise DatasetFrozenError("new semantic version is required for frozen dataset")
+        commit_marker_path = private_path / ".dataset_commit.json"
+        existing_private = _path_exists(private_manifest_path)
+        existing_public = _path_exists(public_manifest_path)
+        existing_commit = _path_exists(commit_marker_path)
+        if existing_private:
+            try:
+                PrivateDatasetManifest.model_validate_json(private_manifest_path.read_bytes(), strict=True)
+            except (OSError, TypeError, ValueError):
+                raise DatasetFrozenError("new semantic version is required for frozen dataset") from None
+        if existing_public:
+            try:
+                DatasetManifest.model_validate_json(public_manifest_path.read_bytes(), strict=True)
+            except (OSError, TypeError, ValueError):
+                raise DatasetFrozenError("new semantic version is required for frozen dataset") from None
 
         batch_root = private_path / "batches"
         expected_batch_files = {f"{category.value}.jsonl" for category in TaskCategory}
@@ -186,7 +199,7 @@ class DatasetBuilder:
         batch_sha256: dict[TaskCategory, str] = {}
         for category in TaskCategory:
             batch_path = private_path / "batches" / f"{category.value}.jsonl"
-            records = read_annotated_questions(batch_path)
+            batch_bytes, records = read_annotated_questions_with_bytes(batch_path)
             report = validator.validate_records(
                 records,
                 batch_id=batch_path.stem,
@@ -196,7 +209,7 @@ class DatasetBuilder:
             if not report.valid:
                 raise ValueError("batch is invalid: " + "; ".join(report.errors))
             records_by_category[category] = records
-            batch_sha256[category] = sha256_bytes(batch_path.read_bytes())
+            batch_sha256[category] = sha256_bytes(batch_bytes)
 
         records = tuple(
             record for category in TaskCategory for record in records_by_category[category]
@@ -276,6 +289,33 @@ class DatasetBuilder:
             created_at=created_at,
         )
         public_bytes = canonical_json_bytes(public_manifest.model_dump(mode="json"))
+        commit_bytes = canonical_json_bytes(
+            {
+                "dataset_id": dataset_id,
+                "private_manifest_sha256": sha256_bytes(private_bytes),
+                "public_manifest_sha256": sha256_bytes(public_bytes),
+                "version": version,
+            }
+        )
+
+        if existing_private and private_manifest_path.read_bytes() != private_bytes:
+            raise DatasetFrozenError("new semantic version is required for existing dataset output")
+        if existing_public and public_manifest_path.read_bytes() != public_bytes:
+            raise DatasetFrozenError("new semantic version is required for existing dataset output")
+        if existing_commit and commit_marker_path.read_bytes() != commit_bytes:
+            raise DatasetFrozenError("existing dataset commit marker does not match output")
+        if existing_commit and not (existing_private and existing_public):
+            raise DatasetFrozenError("existing dataset commit marker has incomplete manifests")
+        if existing_private and existing_public:
+            report = validator.validate_dataset(
+                private_manifest_path,
+                public_manifest_path=public_manifest_path,
+            )
+            if report.valid:
+                if existing_commit:
+                    raise DatasetFrozenError("new semantic version is required for frozen dataset")
+            else:
+                raise DatasetFrozenError("existing finalized dataset is invalid and cannot be replaced")
 
         public_path.mkdir(parents=True, exist_ok=True)
         private_path.mkdir(parents=True, exist_ok=True)
@@ -292,6 +332,7 @@ class DatasetBuilder:
                 test_staging = test_target.with_name(
                     f".{test_target.name}.{uuid.uuid4().hex}.staging"
                 )
+                staging_paths.extend(((dev_staging, dev_target), (test_staging, test_target)))
                 _write_staging_file(
                     dev_staging,
                     _runtime_payload(records_by_category[category], include_split="dev"),
@@ -300,29 +341,42 @@ class DatasetBuilder:
                     test_staging,
                     _runtime_payload(records_by_category[category], include_split="test"),
                 )
-                staging_paths.extend(((dev_staging, dev_target), (test_staging, test_target)))
             private_staging = private_manifest_path.with_name(
                 f".{private_manifest_path.name}.{uuid.uuid4().hex}.staging"
             )
             public_staging = public_manifest_path.with_name(
                 f".{public_manifest_path.name}.{uuid.uuid4().hex}.staging"
             )
+            commit_staging = commit_marker_path.with_name(
+                f".{commit_marker_path.name}.{uuid.uuid4().hex}.staging"
+            )
+            staging_paths.extend(
+                (
+                    (private_staging, private_manifest_path),
+                    (public_staging, public_manifest_path),
+                    (commit_staging, commit_marker_path),
+                )
+            )
             _write_staging_file(private_staging, private_bytes)
             _write_staging_file(public_staging, public_bytes)
+            _write_staging_file(commit_staging, commit_bytes)
 
             validation_staging = validator.validate_dataset(private_staging)
             if not validation_staging.valid:
                 raise ValueError("finalized dataset is invalid: " + "; ".join(validation_staging.errors))
             for staging, target in staging_paths:
                 _publish_file(staging, target)
-            _publish_file(private_staging, private_manifest_path)
-            _publish_file(public_staging, public_manifest_path)
+            report = validator.validate_dataset(
+                private_manifest_path,
+                public_manifest_path=public_manifest_path,
+            )
+            if not report.valid:
+                raise ValueError("published dataset is invalid: " + "; ".join(report.errors))
+            if commit_marker_path.read_bytes() != commit_bytes:
+                raise ValueError("published dataset commit marker does not match")
         except Exception:
             for staging, _ in staging_paths:
                 if _path_exists(staging):
-                    staging.unlink()
-            for staging in (locals().get("private_staging"), locals().get("public_staging")):
-                if isinstance(staging, Path) and _path_exists(staging):
                     staging.unlink()
             raise
         return DatasetFinalizeResult(
