@@ -65,7 +65,7 @@ def test_dataset_requires_six_categories_and_thirty_thirty_split(tmp_path: Path)
     manifest_path.write_bytes(
         json.dumps(incomplete.model_dump(mode="json"), sort_keys=True).encode("utf-8") + b"\n"
     )
-    report = DatasetValidator(snapshot_root=tmp_path / "snapshots").validate_dataset(
+    report = DatasetValidator(snapshot_root=tmp_path / "snapshots").validate_private_preflight(
         manifest_path
     )
     assert report.valid is False
@@ -97,7 +97,7 @@ def test_dataset_rejects_snapshot_locks_for_unreferenced_tasks(tmp_path: Path) -
     manifest_path = private_root / "private_manifest.json"
     manifest_path.write_bytes(manifest.model_dump_json().encode("utf-8"))
 
-    report = DatasetValidator(snapshot_root=tmp_path / "snapshots").validate_dataset(
+    report = DatasetValidator(snapshot_root=tmp_path / "snapshots").validate_private_preflight(
         manifest_path
     )
 

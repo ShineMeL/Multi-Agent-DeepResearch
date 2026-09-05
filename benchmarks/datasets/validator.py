@@ -323,11 +323,43 @@ class DatasetValidator:
             expected_count=expected_count,
         )
 
+    def validate_private_preflight(self, private_manifest_path: Path) -> DatasetValidationReport:
+        return self._validate_dataset(
+            private_manifest_path,
+            public_manifest_path=None,
+            batch_root=None,
+            private_runtime_root=None,
+            public_runtime_root=None,
+            require_public=False,
+        )
+
     def validate_dataset(
         self,
         private_manifest_path: Path,
         *,
-        public_manifest_path: Path | None = None,
+        public_manifest_path: Path,
+        batch_root: Path | None = None,
+        private_runtime_root: Path | None = None,
+        public_runtime_root: Path | None = None,
+    ) -> DatasetValidationReport:
+        return self._validate_dataset(
+            private_manifest_path,
+            public_manifest_path=public_manifest_path,
+            batch_root=batch_root,
+            private_runtime_root=private_runtime_root,
+            public_runtime_root=public_runtime_root,
+            require_public=True,
+        )
+
+    def _validate_dataset(
+        self,
+        private_manifest_path: Path,
+        *,
+        public_manifest_path: Path | None,
+        batch_root: Path | None,
+        private_runtime_root: Path | None,
+        public_runtime_root: Path | None,
+        require_public: bool,
     ) -> DatasetValidationReport:
         manifest_path = Path(private_manifest_path)
         empty_counts: dict[Literal["dev", "test"], int] = {"dev": 0, "test": 0}
@@ -351,14 +383,16 @@ class DatasetValidator:
         records: list[AnnotatedQuestion] = []
         errors: list[str] = []
         expected_files = {f"{category.value}.jsonl" for category in TaskCategory}
-        batch_root = private_root / "batches"
+        resolved_batch_root = batch_root if batch_root is not None else private_root / "batches"
         actual_files: set[str] = (
-            {path.name for path in batch_root.glob("*.jsonl")} if batch_root.is_dir() else set()
+            {path.name for path in resolved_batch_root.glob("*.jsonl")}
+            if resolved_batch_root.is_dir()
+            else set()
         )
         if actual_files != expected_files:
             errors.append("dataset must contain exactly six category batch files")
         for category in TaskCategory:
-            batch_path = batch_root / f"{category.value}.jsonl"
+            batch_path = resolved_batch_root / f"{category.value}.jsonl"
             try:
                 batch_bytes, batch_records = read_annotated_questions_with_bytes(batch_path)
             except (OSError, ValueError, TypeError) as error:
@@ -469,7 +503,7 @@ class DatasetValidator:
             if actual_quotas != expected_quotas:
                 errors.append(f"{label} does not satisfy the category quotas")
 
-        if public_manifest_path is not None:
+        if require_public and public_manifest_path is not None:
             public_path = Path(public_manifest_path)
             try:
                 public_bytes = public_path.read_bytes()
@@ -501,7 +535,7 @@ class DatasetValidator:
                     errors.append("public runtime file list does not match private manifest")
                 errors.extend(
                     self._validate_runtime_files(
-                        root=public_path.parent,
+                        root=public_runtime_root if public_runtime_root is not None else public_path.parent,
                         paths=public_manifest.public_runtime_files,
                         records=records,
                         split="dev",
@@ -509,12 +543,14 @@ class DatasetValidator:
                 )
                 errors.extend(
                     self._validate_runtime_files(
-                        root=private_root,
+                        root=private_runtime_root if private_runtime_root is not None else private_root,
                         paths=private_manifest.private_test_runtime_files,
                         records=records,
                         split="test",
                     )
                 )
+        elif require_public:
+            errors.append("public manifest is required for complete dataset validation")
 
         return _dataset_report(
             dataset_id=private_manifest.dataset_id,
@@ -597,9 +633,15 @@ def validate_dataset_command(
     snapshot_root: Annotated[Path, typer.Option()] = _DEFAULT_SNAPSHOT_ROOT,
     public_manifest: Annotated[Path | None, typer.Option()] = None,
 ) -> None:
+    resolved_public_manifest = public_manifest
+    if resolved_public_manifest is None:
+        private_root = manifest.parent
+        resolved_public_manifest = (
+            private_root.parent.parent / "datasets" / private_root.name / "public_manifest.json"
+        )
     report = DatasetValidator(snapshot_root=snapshot_root).validate_dataset(
         manifest,
-        public_manifest_path=public_manifest,
+        public_manifest_path=resolved_public_manifest,
     )
     typer.echo(report.model_dump_json())
     if not report.valid:

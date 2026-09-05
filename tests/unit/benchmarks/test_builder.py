@@ -15,11 +15,7 @@ from benchmarks.datasets.validator import DatasetValidator
 from benchmarks.scripts.build_snapshot import main as build_snapshot
 
 TEMPLATE = (
-    Path(__file__).parents[3]
-    / "benchmarks"
-    / "datasets"
-    / "templates"
-    / "question.example.json"
+    Path(__file__).parents[3] / "benchmarks" / "datasets" / "templates" / "question.example.json"
 )
 
 
@@ -217,15 +213,19 @@ def test_finalize_exports_disjoint_dev_and_test_runtime_files(tmp_path: Path) ->
         assert {record["task_id"] for record in dev_records}.isdisjoint(
             record["task_id"] for record in test_records
         )
-        assert all(set(record) == {
-            "task_id",
-            "category",
-            "request",
-            "evaluation_cutoff",
-            "snapshot_id",
-            "corpus_version",
-            "index_version",
-        } for record in [*dev_records, *test_records])
+        assert all(
+            set(record)
+            == {
+                "task_id",
+                "category",
+                "request",
+                "evaluation_cutoff",
+                "snapshot_id",
+                "corpus_version",
+                "index_version",
+            }
+            for record in [*dev_records, *test_records]
+        )
 
 
 def test_finalize_validates_public_manifest_hash_chain_and_runtime_content(tmp_path: Path) -> None:
@@ -252,17 +252,32 @@ def test_finalize_validates_public_manifest_hash_chain_and_runtime_content(tmp_p
     assert commit["private_manifest_sha256"]
     assert commit["public_manifest_sha256"]
 
-    public_payload = json.loads(result.public_manifest_path.read_bytes())
+    public_bytes = result.public_manifest_path.read_bytes()
+    public_payload = json.loads(public_bytes)
     public_payload["private_manifest_sha256"] = "0" * 64
     result.public_manifest_path.write_text(json.dumps(public_payload), encoding="utf-8")
+    assert validator.validate_private_preflight(result.private_manifest_path).valid
     report = validator.validate_dataset(
         result.private_manifest_path,
         public_manifest_path=result.public_manifest_path,
     )
+    assert report.valid is False
     assert "public private_manifest_sha256 does not match" in report.errors
 
+    result.public_manifest_path.write_bytes(public_bytes)
+    runtime_path = public_root / "runtime" / "dev" / f"{TaskCategory.TECHNICAL_SURVEY.value}.jsonl"
+    runtime_path.write_bytes(runtime_path.read_bytes() + b" ")
+    report = validator.validate_dataset(
+        result.private_manifest_path,
+        public_manifest_path=result.public_manifest_path,
+    )
+    assert report.valid is False
+    assert any("runtime file content does not match" in error for error in report.errors)
 
-def test_finalize_recovers_after_public_manifest_publish_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+
+def test_finalize_recovers_after_public_manifest_publish_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     private_root = tmp_path / "private"
     public_root = tmp_path / "public"
     snapshot_root = tmp_path / "snapshots"
@@ -287,6 +302,7 @@ def test_finalize_recovers_after_public_manifest_publish_failure(tmp_path: Path,
             snapshot_root=snapshot_root,
             subset_seed=20260829,
         )
+    assert not (private_root / ".dataset_commit.json").exists()
     monkeypatch.setattr(builder_module, "_publish_file", original_publish)
 
     result = DatasetBuilder(snapshot_root=snapshot_root).finalize(
@@ -299,3 +315,117 @@ def test_finalize_recovers_after_public_manifest_publish_failure(tmp_path: Path,
     )
     assert result.public_manifest_path.is_file()
     assert not list(tmp_path.rglob("*.staging"))
+
+
+def test_export_runtime_removes_staging_when_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "runtime.jsonl"
+    original_write = builder_module._write_staging_file
+
+    def write_then_fail(path: Path, payload: bytes) -> None:
+        original_write(path, payload)
+        raise OSError("simulated runtime write failure")
+
+    monkeypatch.setattr(builder_module, "_write_staging_file", write_then_fail)
+    with pytest.raises(OSError, match="simulated runtime write failure"):
+        DatasetBuilder(snapshot_root=tmp_path / "snapshots").export_runtime(
+            (_question(),), output_path=output, include_split="dev"
+        )
+
+    assert not output.exists()
+    assert not list(tmp_path.rglob("*.staging"))
+
+
+def test_finalize_validates_staged_joint_dataset_before_any_final_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    private_root = tmp_path / "private"
+    public_root = tmp_path / "public"
+    snapshot_root = tmp_path / "snapshots"
+    _write_complete_private_dataset(private_root, snapshot_root)
+    original_runtime_payload = builder_module._runtime_payload
+
+    def corrupt_staged_runtime(*args: object, **kwargs: object) -> bytes:
+        return original_runtime_payload(*args, **kwargs) + b" "
+
+    monkeypatch.setattr(builder_module, "_runtime_payload", corrupt_staged_runtime)
+    with pytest.raises(ValueError, match="finalized dataset is invalid"):
+        DatasetBuilder(snapshot_root=snapshot_root).finalize(
+            dataset_id="frozen-ai-cs-60",
+            version="1.0.0",
+            private_root=private_root,
+            public_root=public_root,
+            snapshot_root=snapshot_root,
+            subset_seed=20260829,
+        )
+
+    assert not (private_root / "private_manifest.json").exists()
+    assert not (public_root / "public_manifest.json").exists()
+    assert not (private_root / ".dataset_commit.json").exists()
+    assert not list(private_root.rglob("runtime"))
+    assert not list(public_root.rglob("runtime"))
+
+
+def test_finalize_requires_content_bound_distinct_review_across_categories(tmp_path: Path) -> None:
+    private_root = tmp_path / "private"
+    public_root = tmp_path / "public"
+    snapshot_root = tmp_path / "snapshots"
+    _write_complete_private_dataset(private_root, snapshot_root)
+    first_path = private_root / "batches" / "technical_survey.jsonl"
+    second_path = private_root / "batches" / "method_comparison.jsonl"
+
+    def replace_question(path: Path, question: str) -> AnnotatedQuestion:
+        records = [
+            AnnotatedQuestion.model_validate_json(line, strict=True)
+            for line in path.read_bytes().splitlines()
+        ]
+        replacement = records[0].model_copy(
+            update={"request": records[0].request.model_copy(update={"question": question})}
+        )
+        records[0] = replacement
+        path.write_bytes(
+            b"".join(record.model_dump_json().encode("utf-8") + b"\n" for record in records)
+        )
+        return replacement
+
+    first = replace_question(first_path, "Compare research agent planner routes")
+    second = replace_question(second_path, "Contrast research agent planner routes")
+    with pytest.raises(ValueError, match="semantic review artifact is required"):
+        DatasetBuilder(snapshot_root=snapshot_root).finalize(
+            dataset_id="frozen-ai-cs-60",
+            version="1.0.0",
+            private_root=private_root,
+            public_root=public_root,
+            snapshot_root=snapshot_root,
+            subset_seed=20260829,
+        )
+
+    (private_root / "semantic_reviews.json").write_text(
+        json.dumps(
+            [
+                {
+                    "disposition": "distinct",
+                    "question_sha256": [
+                        builder_module._question_content_hash(first),
+                        builder_module._question_content_hash(second),
+                    ],
+                    "task_ids": [first.task_id, second.task_id],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    DatasetBuilder(snapshot_root=snapshot_root).finalize(
+        dataset_id="frozen-ai-cs-60",
+        version="1.0.0",
+        private_root=private_root,
+        public_root=public_root,
+        snapshot_root=snapshot_root,
+        subset_seed=20260829,
+    )
+    assert not (public_root / "semantic_reviews.json").exists()
+    assert all(
+        "semantic_reviews" not in path.read_text(encoding="utf-8")
+        for path in (public_root / "runtime" / "dev").glob("*.jsonl")
+    )

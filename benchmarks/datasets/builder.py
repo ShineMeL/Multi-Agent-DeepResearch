@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import json
 import os
 import random
+import re
+import shutil
+import unicodedata
 import uuid
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, time
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, cast
 
 import typer
 from pydantic import BaseModel, ConfigDict
@@ -96,6 +100,96 @@ def _select_test_subset(
     return tuple(sorted(selected))
 
 
+def _question_content_hash(question: AnnotatedQuestion) -> str:
+    text = unicodedata.normalize("NFKC", question.request.question)
+    return sha256_bytes(text.encode("utf-8"))
+
+
+def _review_tokens(question: AnnotatedQuestion) -> set[str]:
+    stop_words = {
+        "a",
+        "an",
+        "the",
+        "for",
+        "of",
+        "in",
+        "on",
+        "to",
+        "what",
+        "question",
+        "dev",
+        "test",
+        *(part for category in TaskCategory for part in category.value.split("_")),
+    }
+    tokens = re.findall(
+        r"[^\W_]+", unicodedata.normalize("NFKC", question.request.question).casefold()
+    )
+    return {token for token in tokens if token not in stop_words and not token.isdecimal()}
+
+
+def _semantic_review_candidates(
+    records: Sequence[AnnotatedQuestion],
+) -> tuple[tuple[AnnotatedQuestion, AnnotatedQuestion], ...]:
+    candidates: list[tuple[AnnotatedQuestion, AnnotatedQuestion]] = []
+    for index, first in enumerate(records):
+        first_tokens = _review_tokens(first)
+        for second in records[index + 1 :]:
+            second_tokens = _review_tokens(second)
+            union = first_tokens | second_tokens
+            if union and len(first_tokens & second_tokens) / len(union) >= 0.5:
+                candidates.append((first, second))
+    return tuple(candidates)
+
+
+def _require_semantic_reviews(private_root: Path, records: Sequence[AnnotatedQuestion]) -> None:
+    review_path = private_root / "semantic_reviews.json"
+    try:
+        raw: object = json.loads(review_path.read_bytes())
+    except OSError as error:
+        if _semantic_review_candidates(records):
+            raise ValueError(
+                "semantic review artifact is required for candidate prompts"
+            ) from error
+        return
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError("semantic review artifact is invalid") from error
+    if not isinstance(raw, list):
+        raise TypeError("semantic review artifact must be a list")
+    reviewed: set[tuple[frozenset[str], frozenset[str]]] = set()
+    for item in cast("list[object]", raw):
+        if not isinstance(item, dict):
+            raise TypeError("semantic review entry is invalid")
+        entry = cast("dict[str, object]", item)
+        if set(entry) != {"disposition", "question_sha256", "task_ids"}:
+            raise ValueError("semantic review entry is invalid")
+        task_ids = entry.get("task_ids")
+        hashes = entry.get("question_sha256")
+        if not isinstance(task_ids, list) or not isinstance(hashes, list):
+            raise TypeError("semantic review entry is invalid")
+        task_id_values = cast("list[object]", task_ids)
+        hash_values = cast("list[object]", hashes)
+        if (
+            entry.get("disposition") != "distinct"
+            or len(task_id_values) != 2
+            or len(hash_values) != 2
+            or any(not isinstance(value, str) for value in [*task_id_values, *hash_values])
+        ):
+            raise ValueError("semantic review entry is invalid")
+        reviewed.add(
+            (
+                frozenset(cast("str", value) for value in task_id_values),
+                frozenset(cast("str", value) for value in hash_values),
+            )
+        )
+    for first, second in _semantic_review_candidates(records):
+        expected = (
+            frozenset((first.task_id, second.task_id)),
+            frozenset((_question_content_hash(first), _question_content_hash(second))),
+        )
+        if expected not in reviewed:
+            raise ValueError(f"unreviewed semantic candidate: {first.task_id}, {second.task_id}")
+
+
 class DatasetBuilder:
     def __init__(self, *, snapshot_root: Path) -> None:
         self.snapshot_root = Path(snapshot_root)
@@ -134,18 +228,19 @@ class DatasetBuilder:
         target = Path(output_path).absolute()
         if not target.name:
             raise ValueError("output_path must name a file")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        staging = target.with_name(f".{target.name}.{os.getpid()}.{uuid.uuid4().hex}.staging")
-        if _path_exists(staging):
-            raise FileExistsError("runtime staging path already exists")
-        _write_staging_file(
-            staging,
-            _runtime_payload(records, include_split=include_split),
-        )
+        staging: Path | None = None
         try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            staging = target.with_name(f".{target.name}.{os.getpid()}.{uuid.uuid4().hex}.staging")
+            if _path_exists(staging):
+                raise FileExistsError("runtime staging path already exists")
+            _write_staging_file(
+                staging,
+                _runtime_payload(records, include_split=include_split),
+            )
             _publish_file(staging, target)
         except Exception:
-            if _path_exists(staging):
+            if staging is not None and _path_exists(staging):
                 staging.unlink()
             raise
         return target
@@ -177,14 +272,20 @@ class DatasetBuilder:
         existing_commit = _path_exists(commit_marker_path)
         if existing_private:
             try:
-                PrivateDatasetManifest.model_validate_json(private_manifest_path.read_bytes(), strict=True)
+                PrivateDatasetManifest.model_validate_json(
+                    private_manifest_path.read_bytes(), strict=True
+                )
             except (OSError, TypeError, ValueError):
-                raise DatasetFrozenError("new semantic version is required for frozen dataset") from None
+                raise DatasetFrozenError(
+                    "new semantic version is required for frozen dataset"
+                ) from None
         if existing_public:
             try:
                 DatasetManifest.model_validate_json(public_manifest_path.read_bytes(), strict=True)
             except (OSError, TypeError, ValueError):
-                raise DatasetFrozenError("new semantic version is required for frozen dataset") from None
+                raise DatasetFrozenError(
+                    "new semantic version is required for frozen dataset"
+                ) from None
 
         batch_root = private_path / "batches"
         expected_batch_files = {f"{category.value}.jsonl" for category in TaskCategory}
@@ -216,19 +317,23 @@ class DatasetBuilder:
         )
         if len(records) != 60:
             raise ValueError("finalize requires exactly 60 records")
-        if sum(record.split == "dev" for record in records) != 30 or sum(
-            record.split == "test" for record in records
-        ) != 30:
+        if (
+            sum(record.split == "dev" for record in records) != 30
+            or sum(record.split == "test" for record in records) != 30
+        ):
             raise ValueError("finalize requires a 30/30 dev/test split")
         if len({record.task_id for record in records}) != len(records):
             raise ValueError("finalize requires unique task IDs")
+        _require_semantic_reviews(private_path, records)
 
         snapshot_hashes: dict[str, str] = {}
         for record in records:
             manifest = snapshot_path / record.task_id / "manifest.sha256"
             snapshot_hashes[record.task_id] = sha256_bytes(manifest.read_bytes())
 
-        main_test_task_ids = tuple(sorted(record.task_id for record in records if record.split == "test"))
+        main_test_task_ids = tuple(
+            sorted(record.task_id for record in records if record.split == "test")
+        )
         stability_task_ids = _select_test_subset(
             records_by_category,
             quotas=(4, 4, 3, 3, 3, 3),
@@ -250,7 +355,9 @@ class DatasetBuilder:
         created_at = datetime.combine(
             max(record.created_at for record in records), time.min, tzinfo=UTC
         )
-        category_counts = {category: len(records_by_category[category]) for category in TaskCategory}
+        category_counts = {
+            category: len(records_by_category[category]) for category in TaskCategory
+        }
         public_runtime_files = [f"runtime/dev/{category.value}.jsonl" for category in TaskCategory]
         private_test_runtime_files = [
             f"runtime/test/{category.value}.jsonl" for category in TaskCategory
@@ -315,24 +422,27 @@ class DatasetBuilder:
                 if existing_commit:
                     raise DatasetFrozenError("new semantic version is required for frozen dataset")
             else:
-                raise DatasetFrozenError("existing finalized dataset is invalid and cannot be replaced")
+                raise DatasetFrozenError(
+                    "existing finalized dataset is invalid and cannot be replaced"
+                )
 
-        public_path.mkdir(parents=True, exist_ok=True)
-        private_path.mkdir(parents=True, exist_ok=True)
+        private_stage_root = (
+            private_path.parent / f".{private_path.name}.{uuid.uuid4().hex}.staging"
+        )
+        public_stage_root = public_path.parent / f".{public_path.name}.{uuid.uuid4().hex}.staging"
+        commit_staging = private_stage_root / ".dataset_commit.json"
         staging_paths: list[tuple[Path, Path]] = []
+        staging_files: list[Path] = [commit_staging]
         try:
             for category in TaskCategory:
                 dev_target = public_path / "runtime" / "dev" / f"{category.value}.jsonl"
                 test_target = private_path / "runtime" / "test" / f"{category.value}.jsonl"
-                dev_target.parent.mkdir(parents=True, exist_ok=True)
-                test_target.parent.mkdir(parents=True, exist_ok=True)
-                dev_staging = dev_target.with_name(
-                    f".{dev_target.name}.{uuid.uuid4().hex}.staging"
-                )
-                test_staging = test_target.with_name(
-                    f".{test_target.name}.{uuid.uuid4().hex}.staging"
-                )
+                dev_staging = public_stage_root / "runtime" / "dev" / f"{category.value}.jsonl"
+                test_staging = private_stage_root / "runtime" / "test" / f"{category.value}.jsonl"
                 staging_paths.extend(((dev_staging, dev_target), (test_staging, test_target)))
+                staging_files.extend((dev_staging, test_staging))
+                dev_staging.parent.mkdir(parents=True, exist_ok=True)
+                test_staging.parent.mkdir(parents=True, exist_ok=True)
                 _write_staging_file(
                     dev_staging,
                     _runtime_payload(records_by_category[category], include_split="dev"),
@@ -341,29 +451,33 @@ class DatasetBuilder:
                     test_staging,
                     _runtime_payload(records_by_category[category], include_split="test"),
                 )
-            private_staging = private_manifest_path.with_name(
-                f".{private_manifest_path.name}.{uuid.uuid4().hex}.staging"
-            )
-            public_staging = public_manifest_path.with_name(
-                f".{public_manifest_path.name}.{uuid.uuid4().hex}.staging"
-            )
-            commit_staging = commit_marker_path.with_name(
-                f".{commit_marker_path.name}.{uuid.uuid4().hex}.staging"
-            )
+            private_staging = private_stage_root / "private_manifest.json"
+            public_staging = public_stage_root / "public_manifest.json"
             staging_paths.extend(
                 (
                     (private_staging, private_manifest_path),
                     (public_staging, public_manifest_path),
-                    (commit_staging, commit_marker_path),
                 )
             )
+            staging_files.extend((private_staging, public_staging))
+            private_staging.parent.mkdir(parents=True, exist_ok=True)
+            public_staging.parent.mkdir(parents=True, exist_ok=True)
             _write_staging_file(private_staging, private_bytes)
             _write_staging_file(public_staging, public_bytes)
-            _write_staging_file(commit_staging, commit_bytes)
 
-            validation_staging = validator.validate_dataset(private_staging)
+            validation_staging = validator.validate_dataset(
+                private_staging,
+                public_manifest_path=public_staging,
+                batch_root=batch_root,
+                private_runtime_root=private_stage_root,
+                public_runtime_root=public_stage_root,
+            )
             if not validation_staging.valid:
-                raise ValueError("finalized dataset is invalid: " + "; ".join(validation_staging.errors))
+                raise ValueError(
+                    "finalized dataset is invalid: " + "; ".join(validation_staging.errors)
+                )
+            for _, target in staging_paths:
+                target.parent.mkdir(parents=True, exist_ok=True)
             for staging, target in staging_paths:
                 _publish_file(staging, target)
             report = validator.validate_dataset(
@@ -372,13 +486,19 @@ class DatasetBuilder:
             )
             if not report.valid:
                 raise ValueError("published dataset is invalid: " + "; ".join(report.errors))
+            _write_staging_file(commit_staging, commit_bytes)
+            _publish_file(commit_staging, commit_marker_path)
             if commit_marker_path.read_bytes() != commit_bytes:
                 raise ValueError("published dataset commit marker does not match")
         except Exception:
-            for staging, _ in staging_paths:
+            for staging in staging_files:
                 if _path_exists(staging):
                     staging.unlink()
             raise
+        finally:
+            for stage_root in (private_stage_root, public_stage_root):
+                if _path_exists(stage_root):
+                    shutil.rmtree(stage_root)
         return DatasetFinalizeResult(
             public_manifest_path=public_manifest_path,
             private_manifest_path=private_manifest_path,
