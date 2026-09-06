@@ -7,6 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+import yaml
 
 from benchmarks.datasets.models import TaskCategory
 from benchmarks.datasets.validator import canonical_json_bytes
@@ -17,33 +18,58 @@ from deepresearch.runtime.manifest import PricingSnapshot, RunManifest
 from experiments.models import (
     EvaluatorReferenceManifest,
     ExperimentTaskRun,
+    ExperimentVariant,
     OracleReferenceResult,
     canonical_sha256,
 )
 from experiments.runner import ExperimentRunner
-from experiments.summarize import summarize_experiment
+from experiments.summarize import _load_replication_bindings, summarize_experiment
+from tests.integration.experiments.test_abcd_runner import _config_and_task
 
 
 def _write_full_group(root: Path) -> Path:
     (root / "raw").mkdir(parents=True)
+    config, task = _config_and_task()
+    task = task.model_copy(update={"task_id": "test-a"})
+    pricing = config.pricing_snapshot.model_copy(update={"snapshot_id": "pricing-v1"})
+    config = config.model_copy(
+        update={
+            "pricing_snapshot": pricing,
+            "main_test_task_ids": ("test-a",),
+            "stability_task_ids": ("test-a",),
+            "cost_subset_task_ids": ("test-a",),
+            "p0_task_ids": ("test-a",),
+            "oracle_task_ids": ("test-a",),
+            "internal_runtime_task_hashes": {
+                "test-a": canonical_sha256(task.model_dump(mode="json"))
+            },
+        }
+    )
+    group_id = config.experiment_group_id()
+    config_bytes = yaml.safe_dump(
+        config.model_dump(mode="json"), sort_keys=True
+    ).encode("utf-8")
+    (root / "config").mkdir()
+    (root / "config" / "formal.yaml").write_bytes(config_bytes)
     group = {
-        "group_id": "group",
+        "group_id": group_id,
         "dataset_version": "dataset-v1",
         "budget_preset": "medium",
         "candidate_pool_seed": 7,
         "pricing_snapshot_id": "pricing-v1",
         "code_commit": "a" * 40,
         "private_manifest_sha256": "b" * 64,
+        "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
         "evaluator_version": "evaluator-v1",
         "protocols": ["ranker_component", "planner_policy", "end_to_end", "reference"],
         "protocol_task_ids": {
-            "ranker_component": ["task-a"],
-            "planner_policy": ["task-a"],
-            "end_to_end": ["task-a"],
-            "reference": ["task-a"],
+            "ranker_component": ["test-a"],
+            "planner_policy": ["test-a"],
+            "end_to_end": ["test-a"],
+            "reference": ["test-a"],
         },
-        "oracle_task_ids": ["task-a"],
-        "cost_subset_task_ids": ["task-a"],
+        "oracle_task_ids": ["test-a"],
+        "cost_subset_task_ids": ["test-a"],
         "expected_variants": {
             "ranker_component": ["R0", "R1", "R2"],
             "planner_policy": ["A", "B", "C", "D"],
@@ -63,7 +89,7 @@ def _write_full_group(root: Path) -> Path:
             "seed_values": [1],
             "repeat_ids": [],
         },
-        "task_categories": {"task-a": "technical_survey"},
+        "task_categories": {"test-a": "technical_survey"},
     }
     (root / "group.json").write_text(json.dumps(group), encoding="utf-8")
     variants = {
@@ -75,7 +101,7 @@ def _write_full_group(root: Path) -> Path:
     for protocol, protocol_variants in variants.items():
         for variant, planner_id, ranker_id in protocol_variants:
             run = ExperimentTaskRun(
-                task_id="task-a",
+                task_id="test-a",
                 protocol=protocol,
                 variant=variant,
                 planner_id=planner_id,
@@ -162,15 +188,15 @@ def _write_full_group(root: Path) -> Path:
                 },
             )
             key = ExperimentRunner.idempotency_key(
-                "group", protocol, variant, "task-a", 1, None, "medium"
+                group_id, protocol, variant, "test-a", 1, None, "medium"
             )
             (root / "raw" / f"{key}.json").write_bytes(
                 json.dumps(run.model_dump(mode="json"), sort_keys=True).encode("utf-8")
             )
     candidate_key = ExperimentRunner.idempotency_key(
-        "group", "ranker_component", "POOL", "task-a", 7, None, "medium"
+        group_id, "ranker_component", "POOL", "test-a", 7, None, "medium"
     )
-    candidate_payload = {"candidate_pool_version": "formal-v1", "evidence_ids": [], "task_id": "task-a"}
+    candidate_payload = {"candidate_pool_version": "formal-v1", "evidence_ids": [], "task_id": "test-a"}
     candidate_bytes = canonical_json_bytes(candidate_payload)
     candidate_root = root / "candidate-pools"
     setup_root = root / "candidate-pool-setup"
@@ -186,19 +212,26 @@ def _write_full_group(root: Path) -> Path:
         if raw_payload["protocol"] == "ranker_component":
             raw_payload["candidate_pool_hash"] = candidate_hash
             raw_path.write_bytes(canonical_json_bytes(raw_payload))
-    pricing = PricingSnapshot(
-        snapshot_id="pricing-v1",
-        provider_id="model-provider",
-        endpoint_type="responses",
-        model_id="model-v1",
-        effective_at=datetime(2026, 9, 6, tzinfo=UTC),
-        currency="USD",
-        input_tokens_per_million_usd=Decimal(0),
-        output_tokens_per_million_usd=Decimal(0),
-        cached_tokens_per_million_usd=Decimal(0),
-        reasoning_tokens_per_million_usd=Decimal(0),
-    )
     usage = ResourceUsage.zero(cost_known=True)
+    (root / "agent-inputs").mkdir()
+    (root / "agent-inputs" / f"{candidate_key[:32]}.json").write_bytes(
+        canonical_json_bytes(task.model_dump(mode="json"))
+    )
+    request_hash = hashlib.sha256(
+        json.dumps(
+            task.request.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    manifest_config_hash = ExperimentRunner._core_config_sha256(
+        config=config,
+        task=task,
+        planner_id="P1",
+        ranker_id="R1",
+        seed=7,
+    )
     manifest = RunManifest.create(
         {
             "schema_version": "run-manifest-v1",
@@ -206,8 +239,8 @@ def _write_full_group(root: Path) -> Path:
             "thread_id": "pool-thread-1",
             "code_commit": "a" * 40,
             "dependency_lock_sha256": "b" * 64,
-            "request_sha256": "c" * 64,
-            "config_sha256": "d" * 64,
+            "request_sha256": request_hash,
+            "config_sha256": manifest_config_hash,
             "workflow_id": "research-v1",
             "graph_version": "graph-v1",
             "planner_id": "P1",
@@ -221,7 +254,7 @@ def _write_full_group(root: Path) -> Path:
             "usage": usage,
             "usage_by_node": {},
             "pricing_status": "estimated",
-            "pricing_snapshots": (pricing,),
+            "pricing_snapshots": (config.pricing_snapshot,),
             "provider_calls": (),
             "node_executions": (),
             "parsed_artifacts": (),
@@ -245,8 +278,8 @@ def _write_full_group(root: Path) -> Path:
     manifest_path.write_bytes(manifest_bytes)
     setup = {
         "schema_version": "candidate-pool-setup-v1",
-        "group_id": "group",
-        "task_id": "task-a",
+        "group_id": group_id,
+        "task_id": "test-a",
         "pool_key": candidate_key,
         "candidate_pool_sha256": candidate_hash,
         "evidence_ids_sha256": hashlib.sha256(canonical_json_bytes([])).hexdigest(),
@@ -259,10 +292,10 @@ def _write_full_group(root: Path) -> Path:
     (setup_root / f"{candidate_key}.json").write_bytes(canonical_json_bytes(setup))
     created_at = datetime(2026, 9, 6, tzinfo=UTC)
     oracle_result = OracleReferenceResult(
-        task_id="task-a",
+        task_id="test-a",
         dataset_version="dataset-v1",
         private_manifest_sha256="b" * 64,
-        frozen_snapshot_id="snapshot-task-a",
+        frozen_snapshot_id="snapshot-test-a",
         approved_id_set_sha256="c" * 64,
         metric_values={
             "approved_evidence_recall": MetricValue(
@@ -277,10 +310,10 @@ def _write_full_group(root: Path) -> Path:
         created_at=created_at,
     )
     oracle_manifest = EvaluatorReferenceManifest(
-        group_id="group",
+        group_id=group_id,
         private_manifest_sha256=oracle_result.private_manifest_sha256,
         evaluator_version=oracle_result.evaluator_version,
-        task_ids_sha256=canonical_sha256(("task-a",)),
+        task_ids_sha256=canonical_sha256(("test-a",)),
         oracle_results_sha256=canonical_sha256([oracle_result.model_dump(mode="json")]),
         created_at=created_at,
     )
@@ -391,6 +424,165 @@ def test_summary_rejects_completed_ranker_without_verified_pool_setup(
 
     with pytest.raises(ValueError, match="candidate pool|setup"):
         summarize_experiment(root, bootstrap_resamples=4)
+
+
+def test_summary_rejects_setup_manifest_with_forged_request_provenance(
+    tmp_path: Path,
+) -> None:
+    root = _write_full_group(tmp_path / "group")
+    setup_payload = json.loads(
+        next((root / "candidate-pool-setup").glob("*.json")).read_bytes()
+    )
+    manifest_path = Path(setup_payload["manifest_path"])
+    forged_manifest = RunManifest.model_validate_json(manifest_path.read_bytes(), strict=True).model_copy(
+        update={"request_sha256": "f" * 64}
+    )
+    forged_bytes = forged_manifest.model_dump_json().encode("utf-8")
+    manifest_path.write_bytes(forged_bytes)
+    setup_payload["manifest_sha256"] = hashlib.sha256(forged_bytes).hexdigest()
+    setup_path = next((root / "candidate-pool-setup").glob("*.json"))
+    setup_path.write_bytes(canonical_json_bytes(setup_payload))
+
+    with pytest.raises(ValueError, match="manifest|provenance|request"):
+        summarize_experiment(root, bootstrap_resamples=4)
+
+
+def test_summary_rejects_receipt_identity_reused_across_unseeded_repeats(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "group"
+    artifacts = root / "artifacts"
+    requests = root / "requests"
+    bindings = artifacts / "replication-bindings"
+    artifacts.mkdir(parents=True)
+    requests.mkdir()
+    bindings.mkdir()
+    group = {
+        "group_id": "group",
+        "replication": {
+            "mode": "independent_repeats",
+            "seed_supported": False,
+            "repeat_ids": [1, 2],
+        },
+    }
+    pricing = PricingSnapshot(
+        snapshot_id="pricing-v1",
+        provider_id="model-provider",
+        endpoint_type="responses",
+        model_id="model-v1",
+        effective_at=datetime(2026, 9, 6, tzinfo=UTC),
+        currency="USD",
+        input_tokens_per_million_usd=Decimal(0),
+        output_tokens_per_million_usd=Decimal(0),
+        cached_tokens_per_million_usd=Decimal(0),
+        reasoning_tokens_per_million_usd=Decimal(0),
+    )
+    usage = ResourceUsage.zero(cost_known=True)
+    runs: list[ExperimentTaskRun] = []
+    binding_paths: dict[int, Path] = {}
+    for repeat_id in (1, 2):
+        key = ExperimentRunner.idempotency_key(
+            "group", "end_to_end", "D", "task-a", None, repeat_id, "medium"
+        )
+        manifest = RunManifest.create(
+            {
+                "schema_version": "run-manifest-v1",
+                "run_id": f"run-{repeat_id}",
+                "thread_id": f"thread-{repeat_id}",
+                "code_commit": "a" * 40,
+                "dependency_lock_sha256": "b" * 64,
+                "request_sha256": "c" * 64,
+                "config_sha256": "d" * 64,
+                "workflow_id": "research-v1",
+                "graph_version": "graph-v1",
+                "planner_id": "P2",
+                "provider_profiles": (),
+                "model_ids": (),
+                "prompt_versions": {},
+                "parser_versions": {},
+                "ranker_id": "R2",
+                "ranker_weights_version": None,
+                "budget": RunBudget.preset("medium"),
+                "usage": usage,
+                "usage_by_node": {},
+                "pricing_status": "estimated",
+                "pricing_snapshots": (pricing,),
+                "provider_calls": (),
+                "node_executions": (),
+                "parsed_artifacts": (),
+                "evidence_hashes": (),
+                "source_snapshot_ids": (),
+                "artifact_ids": (),
+                "run_event_count": 0,
+                "run_events_sha256": "e" * 64,
+                "seed": None,
+                "seed_supported": False,
+                "cache_hit_count": 0,
+                "stop_reason": "SUFFICIENT",
+                "is_partial": False,
+                "failure_codes": (),
+                "started_at": datetime(2026, 9, 6, tzinfo=UTC),
+                "finished_at": datetime(2026, 9, 6, 0, 0, 1, tzinfo=UTC),
+            }
+        )
+        manifest_path = artifacts / f"manifest-{repeat_id}.json"
+        manifest_bytes = manifest.model_dump_json().encode("utf-8")
+        manifest_path.write_bytes(manifest_bytes)
+        request_name = f"{key}.resume.json" if repeat_id == 1 else f"{key}.json"
+        request_path = requests / request_name
+        request_bytes = f"request-{repeat_id}".encode()
+        request_path.write_bytes(request_bytes)
+        runs.append(
+            ExperimentTaskRun(
+                task_id="task-a",
+                protocol="end_to_end",
+                variant=ExperimentVariant.D,
+                planner_id="P2",
+                ranker_id="R2",
+                budget_preset="medium",
+                repeat_id=repeat_id,
+                status="completed",
+                manifest_path=str(manifest_path),
+                artifact_ids=(),
+                usage=usage,
+                pricing_snapshot_ids=("pricing-v1",),
+                pricing_status="estimated",
+                cost_label="estimated_from_normalized_schedule",
+                metrics={},
+            )
+        )
+        binding = {
+            "schema_version": "unseeded-replication-binding-v1",
+            "group_id": "group",
+            "task_id": "task-a",
+            "protocol": "end_to_end",
+            "variant": "D",
+            "budget_preset": "medium",
+            "repeat_id": repeat_id,
+            "request_sha256": hashlib.sha256(request_bytes).hexdigest(),
+            "receipt_identity": "d" * 64,
+            "manifest_provenance": {
+                "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+                "run_id": manifest.run_id,
+                "thread_id": manifest.thread_id,
+            },
+        }
+        binding_path = bindings / f"{binding['request_sha256']}.json"
+        binding_path.write_bytes(canonical_json_bytes(binding))
+        binding_paths[repeat_id] = binding_path
+
+    # A resume request has the same canonical raw idempotency key but a
+    # distinct request filename.  Summary must accept that binding when the
+    # other repeat is not part of the selected raw set.
+    second_binding = binding_paths[2].read_bytes()
+    binding_paths[2].unlink()
+    try:
+        assert len(_load_replication_bindings(root, group=group, runs=[runs[0]])) == 1
+    finally:
+        binding_paths[2].write_bytes(second_binding)
+
+    with pytest.raises(ValueError, match="receipt identity|duplicate"):
+        _load_replication_bindings(root, group=group, runs=runs)
 
 
 def test_summary_rejects_unseeded_completed_records_without_replication_binding(

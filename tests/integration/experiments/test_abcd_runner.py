@@ -703,6 +703,141 @@ async def test_unseeded_completed_fast_path_requires_replication_binding(
         )
 
 
+@pytest.mark.asyncio
+async def test_unseeded_resume_sidecar_uses_resume_request_for_fast_path(
+    tmp_path: Path,
+) -> None:
+    config, task = _config_and_task()
+    runner = ExperimentRunner(
+        launch_agent=SpyLauncher(),
+        task_loader={task.task_id: task},
+        experiment_root=tmp_path,
+        private_root=tmp_path / "private",
+        seed_supported=False,
+        preflight=False,
+    )
+    group_root = runner._group_root(config)
+    key = runner._idempotency_key(
+        config.experiment_group_id(),
+        "end_to_end",
+        "D",
+        task.task_id,
+        None,
+        1,
+        config.budget_preset,
+    )
+    usage = ResourceUsage.zero(cost_known=True)
+    request_hash = hashlib.sha256(
+        json.dumps(
+            task.request.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    config_hash = runner._core_config_sha256(
+        config=config,
+        task=task,
+        planner_id="P2",
+        ranker_id="R2",
+        seed=None,
+    )
+    group = json.loads((group_root / "group.json").read_bytes())
+    manifest = RunManifest.create(
+        {
+            "schema_version": "run-manifest-v1",
+            "run_id": "resume-run-1",
+            "thread_id": "resume-thread-1",
+            "code_commit": group["code_commit"],
+            "dependency_lock_sha256": "b" * 64,
+            "request_sha256": request_hash,
+            "config_sha256": config_hash,
+            "workflow_id": "research-v1",
+            "graph_version": "graph-v1",
+            "planner_id": "P2",
+            "provider_profiles": (),
+            "model_ids": (),
+            "prompt_versions": {},
+            "parser_versions": {},
+            "ranker_id": "R2",
+            "ranker_weights_version": None,
+            "budget": RunBudget.preset(config.budget_preset),
+            "usage": usage,
+            "usage_by_node": {},
+            "pricing_status": "estimated",
+            "pricing_snapshots": (config.pricing_snapshot,),
+            "provider_calls": (),
+            "node_executions": (),
+            "parsed_artifacts": (),
+            "evidence_hashes": (),
+            "source_snapshot_ids": (),
+            "artifact_ids": (),
+            "run_event_count": 0,
+            "run_events_sha256": "c" * 64,
+            "seed": None,
+            "seed_supported": False,
+            "cache_hit_count": 0,
+            "stop_reason": "SUFFICIENT",
+            "is_partial": False,
+            "failure_codes": (),
+            "started_at": datetime(2026, 9, 6, tzinfo=UTC),
+            "finished_at": datetime(2026, 9, 6, 0, 0, 1, tzinfo=UTC),
+        }
+    )
+    manifest_path = group_root / "artifacts" / f"{key}.run-manifest.json"
+    manifest_path.write_bytes(manifest.model_dump_json().encode())
+    existing = ExperimentTaskRun(
+        task_id=task.task_id,
+        protocol="end_to_end",
+        variant=ExperimentVariant.D,
+        planner_id="P2",
+        ranker_id="R2",
+        budget_preset=config.budget_preset,
+        repeat_id=1,
+        status="completed",
+        manifest_path=str(manifest_path),
+        artifact_ids=(),
+        usage=usage,
+        pricing_snapshot_ids=(config.pricing_snapshot.snapshot_id,),
+        pricing_status="estimated",
+        cost_label="estimated_from_normalized_schedule",
+        category=task.category,
+        metrics={},
+    )
+    (group_root / "raw" / f"{key}.json").write_bytes(
+        canonical_json_bytes(existing.model_dump(mode="json"))
+    )
+    resume_request = group_root / "requests" / f"{key}.resume.json"
+    resume_request.write_bytes(b"resume-request\n")
+    runner._bind_unseeded_receipt(
+        group_root=group_root,
+        config=config,
+        task=task,
+        protocol="end_to_end",
+        variant=ExperimentVariant.D,
+        budget=config.budget_preset,
+        repeat_id=1,
+        request_sha256=sha256_bytes(resume_request.read_bytes()),
+        receipt_identity="d" * 64,
+        manifest_provenance={
+            "manifest_sha256": sha256_bytes(manifest_path.read_bytes()),
+            "run_id": manifest.run_id,
+            "thread_id": manifest.thread_id,
+        },
+    )
+
+    result = await runner.run_one(
+        config=config,
+        protocol="end_to_end",
+        task_id=task.task_id,
+        variant=ExperimentVariant.D,
+        budget_preset=config.budget_preset,
+        repeat_id=1,
+    )
+
+    assert result == existing
+
+
 def test_unseeded_receipt_binding_rejects_cross_repeat_reuse(tmp_path: Path) -> None:
     config, task = _config_and_task()
     runner = ExperimentRunner(

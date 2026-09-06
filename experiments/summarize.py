@@ -18,7 +18,10 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Literal, cast
 
-from benchmarks.datasets.models import TaskCategory
+import yaml
+
+from benchmarks.datasets.models import RuntimeTask, TaskCategory
+from benchmarks.datasets.validator import sha256_bytes
 from benchmarks.evaluators.metrics import MetricValue
 from benchmarks.evaluators.pareto import analyze_pareto
 from benchmarks.evaluators.statistics import (
@@ -31,6 +34,7 @@ from benchmarks.evaluators.statistics import (
 )
 from deepresearch.domain import ResourceUsage, RunBudget
 from deepresearch.runtime.manifest import RunManifest
+from experiments.config import FormalExperimentConfig
 from experiments.models import (
     EvaluatorReferenceManifest,
     ExperimentTaskRun,
@@ -196,6 +200,7 @@ def _load_replication_bindings(
     rows: list[dict[str, object]] = []
     matched_indices: set[int] = set()
     matched_completed: set[int] = set()
+    receipt_owners: dict[str, int] = {}
     for path in sorted(binding_root.iterdir()):
         _assert_summary_path(path, label="replication binding artifact")
         if _is_link_or_reparse(path) or path.suffix != ".json" or not path.is_file():
@@ -214,6 +219,10 @@ def _load_replication_bindings(
             or not _is_sha256(typed.get("receipt_identity"))
             or type(typed.get("repeat_id")) is not int
             or typed["repeat_id"] not in cast(list[int], repeats)
+            or not isinstance(typed.get("task_id"), str)
+            or not isinstance(typed.get("protocol"), str)
+            or not isinstance(typed.get("variant"), str)
+            or not isinstance(typed.get("budget_preset"), str)
         ):
             raise ValueError("replication binding identity is invalid")
         provenance_value = typed.get("manifest_provenance")
@@ -277,17 +286,27 @@ def _load_replication_bindings(
             run.repeat_id,
             run.budget_preset,
         )
-        request_path = experiment_dir / "requests" / f"{request_key}.json"
-        _assert_summary_path(request_path, label="replication request provenance")
-        if (
-            not request_path.is_file()
-            or _is_link_or_reparse(request_path)
-            or hashlib.sha256(request_path.read_bytes()).hexdigest()
-            != typed["request_sha256"]
+        request_matches: list[Path] = []
+        for request_path in (
+            experiment_dir / "requests" / f"{request_key}.json",
+            experiment_dir / "requests" / f"{request_key}.resume.json",
         ):
-            raise ValueError("replication binding request provenance mismatch")
+            _assert_summary_path(request_path, label="replication request provenance")
+            if (
+                request_path.is_file()
+                and not _is_link_or_reparse(request_path)
+                and hashlib.sha256(request_path.read_bytes()).hexdigest()
+                == typed["request_sha256"]
+            ):
+                request_matches.append(request_path)
+        if len(request_matches) != 1:
+            raise ValueError("replication binding request provenance is ambiguous or missing")
         if matched_index in matched_indices:
             raise ValueError("duplicate replication binding for raw record")
+        receipt_identity = cast(str, typed["receipt_identity"])
+        if receipt_identity in receipt_owners:
+            raise ValueError("receipt identity is reused across raw records")
+        receipt_owners[receipt_identity] = matched_index
         matched_indices.add(matched_index)
         if run.status == "completed" and run.validity == "valid":
             matched_completed.add(matched_index)
@@ -398,6 +417,25 @@ def _setup_cost_section(
         ): task_id
         for task_id in ranker_task_ids
     }
+    config_path = experiment_dir / "config" / "formal.yaml"
+    _assert_summary_path(config_path, label="staged formal config")
+    if not config_path.is_file() or _is_link_or_reparse(config_path):
+        raise ValueError("staged formal config is missing or unsafe")
+    config_bytes = config_path.read_bytes()
+    if not _is_sha256(group.get("config_sha256")) or sha256_bytes(config_bytes) != group["config_sha256"]:
+        raise ValueError("staged formal config provenance mismatch")
+    # The sealed config is written as YAML/JSON with the model's JSON mode
+    # representation (dates, decimals and tuples are therefore represented by
+    # their YAML scalar/sequence forms).  Reconstruct it through the canonical
+    # config loader so those representation-level conversions are performed by
+    # Pydantic before provenance is checked below.
+    config = FormalExperimentConfig.model_validate(yaml.safe_load(config_bytes))
+    if config.experiment_group_id() != group_id:
+        raise ValueError("staged formal config group identity mismatch")
+    agent_input_root = experiment_dir / "agent-inputs"
+    _assert_summary_path(agent_input_root, label="staged runtime task root")
+    if not agent_input_root.is_dir() or _is_link_or_reparse(agent_input_root):
+        raise ValueError("staged runtime task root is missing or unsafe")
     completed_ranker = [
         run
         for run in runs
@@ -504,6 +542,27 @@ def _setup_cost_section(
         if typed["manifest_sha256"] != hashlib.sha256(manifest_bytes).hexdigest():
             raise ValueError("candidate pool setup manifest hash mismatch")
         manifest = RunManifest.model_validate_json(manifest_bytes, strict=True)
+        task_path = agent_input_root / f"{path.stem[:32]}.json"
+        _assert_summary_path(task_path, label="candidate pool runtime task")
+        if not task_path.is_file() or _is_link_or_reparse(task_path):
+            raise ValueError("candidate pool runtime task is missing or unsafe")
+        task = RuntimeTask.model_validate_json(task_path.read_bytes(), strict=True)
+        if (
+            task.task_id != expected_task_id
+            or canonical_sha256(task.model_dump(mode="json"))
+            != config.internal_runtime_task_hashes.get(expected_task_id)
+        ):
+            raise ValueError("candidate pool runtime task provenance mismatch")
+        try:
+            ExperimentRunner._validate_setup_manifest(  # pyright: ignore[reportPrivateUsage]
+                manifest,
+                config=config,
+                task=task,
+                seed=candidate_pool_seed,
+                planner_id="P1",
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("candidate pool setup manifest provenance mismatch") from error
         expected_budget = RunBudget.preset(cast(Literal["low", "medium", "high"], budget_preset))
         if (
             manifest.usage != usage
