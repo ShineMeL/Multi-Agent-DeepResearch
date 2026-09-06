@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[3]
 PUBLIC = ROOT / "benchmarks/datasets/frozen_ai_cs_60"
 PRIVATE = ROOT / "benchmarks/private/frozen_ai_cs_60"
 SNAPSHOTS = ROOT / "benchmarks/snapshots/frozen_ai_cs_60"
+EXPERIMENT_FIXTURES = ROOT / "tests/fixtures/experiments"
 
 
 def _public_manifest() -> DatasetManifest:
@@ -170,3 +171,46 @@ def test_frozen_version_refuses_replacement() -> None:
     assert all(
         hashlib.sha256(path.read_bytes()).hexdigest() == digest for path, digest in before.items()
     )
+
+
+def test_strict_replay_stop_fixture_contract_is_complete() -> None:
+    """Formal protocol tests remain offline and cover every terminal path."""
+
+    expected = {
+        "sufficient": ("SUFFICIENT", False),
+        "conflict": ("PLATEAU", True),
+        "plateau": ("PLATEAU", True),
+        "budget_exhausted": ("BUDGET_EXHAUSTED", True),
+        "blocked": ("BLOCKED", True),
+    }
+    for name, (stop_code, partial) in expected.items():
+        root = EXPERIMENT_FIXTURES / name
+        scenario = json.loads((root / "scenario.json").read_bytes())
+        assert scenario["fixture_version"] == "strict-replay-fixture-v1"
+        assert scenario["mode"] == "strict_replay"
+        assert scenario["stop_code"] == stop_code
+        assert scenario["is_partial"] is partial
+        files = {
+            relative: hashlib.sha256((root / relative).read_bytes()).hexdigest()
+            for relative in ("search.jsonl", "model.jsonl", "parsed.jsonl", "graph_events.jsonl")
+        }
+        assert all(len(digest) == 64 for digest in files.values())
+        assert all(
+            hashlib.sha256((root / relative).read_bytes()).hexdigest()
+            == scenario["artifact_hashes"][artifact_name]
+            for artifact_name, relative in scenario["artifact_files"].items()
+        )
+        events = [
+            json.loads(line)
+            for line in (root / "graph_events.jsonl").read_bytes().splitlines()
+        ]
+        assert [event["seq"] for event in events] == list(range(1, len(events) + 1))
+        if name == "plateau":
+            assert scenario["marginal_gains"] == [0.04, 0.03]
+            assert all(gain < 0.05 for gain in scenario["marginal_gains"])
+        if name == "blocked":
+            assert scenario["public_steps"] == [
+                "PROVIDER_FAILURE",
+                "ALTERNATIVE_STRATEGY",
+                "BLOCKED",
+            ]

@@ -14,6 +14,7 @@ from deepresearch.domain import RunStatus
 from deepresearch.planning import FixedPlanner
 from deepresearch.planning.stop import StopCode
 
+from .baseline_graph import BaselineRuntimeContext
 from .state import (
     ResearchState,
     blocked_need_from_checkpoint,
@@ -141,7 +142,11 @@ def build_research_graph(
     if initial_plan_generator is not dependencies.initial_plan_generator:
         raise ValueError("Plan node must own the configured initial_plan_generator")
 
-    graph = cast("Any", StateGraph(ResearchState))
+    # Use the same runtime context as the canonical Core graph.  In particular
+    # this keeps the injected monotonic/UTC/id hooks available to research
+    # nodes during strict replay; nodes remain state-only callables and the
+    # public dependency contract is unchanged.
+    graph = cast("Any", StateGraph(ResearchState, context_schema=BaselineRuntimeContext))
     graph.add_node("ValidateRequest", dependencies.validate_request)
     graph.add_node("Plan", dependencies.plan)
     graph.add_node("DecideNext", dependencies.decide_next)

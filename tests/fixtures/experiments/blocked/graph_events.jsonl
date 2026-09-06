@@ -1,0 +1,3 @@
+{"seq":1,"node":"Search","kind":"PROVIDER_FAILURE"}
+{"seq":2,"node":"Search","kind":"ALTERNATIVE_STRATEGY"}
+{"seq":3,"node":"DecideNext","kind":"BLOCKED"}

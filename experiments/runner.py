@@ -597,6 +597,35 @@ class ExperimentRunner:
             return None
         return ExperimentTaskRun.model_validate_json(path.read_bytes(), strict=True)
 
+    @staticmethod
+    def _validate_existing_identity(
+        existing: ExperimentTaskRun,
+        *,
+        task_id: str,
+        protocol: Protocol,
+        variant: ExperimentVariant | RankerComponentVariant,
+        budget: BudgetPreset,
+        seed: int | None,
+        repeat_id: int | None,
+    ) -> None:
+        """Keep an idempotent raw record bound to its request key.
+
+        The filename is only one half of the idempotency boundary.  A copied
+        or stale JSON record must not be returned as a successful resume merely
+        because it happens to parse as an ``ExperimentTaskRun``.  This check is
+        deliberately limited to the public request identity; Core artifact and
+        manifest integrity remains owned by the existing receipt validator.
+        """
+        if (
+            existing.task_id != task_id
+            or existing.protocol != protocol
+            or existing.variant != variant
+            or existing.budget_preset != budget
+            or existing.seed != seed
+            or existing.repeat_id != repeat_id
+        ):
+            raise RuntimeError("existing experiment record identity does not match request key")
+
     def _parse_receipt(self, receipt: object) -> AgentRunReceipt | None:
         if isinstance(receipt, AgentRunReceipt):
             return receipt
@@ -1295,6 +1324,15 @@ class ExperimentRunner:
         raw_path = self._raw_path(group_root, key)
         existing = self._load_existing(raw_path)
         if existing is not None:
+            self._validate_existing_identity(
+                existing,
+                task_id=task.task_id,
+                protocol=protocol,
+                variant=variant,
+                budget=budget,
+                seed=seed,
+                repeat_id=repeat_id,
+            )
             if existing.status == "completed":
                 raise RuntimeError("completed experiment record cannot be overwritten")
             raw_path.unlink()
@@ -1446,6 +1484,15 @@ class ExperimentRunner:
         raw_path = self._raw_path(group_root, key)
         existing = self._load_existing(raw_path)
         if existing is not None:
+            self._validate_existing_identity(
+                existing,
+                task_id=task_id,
+                protocol=protocol,
+                variant=variant,
+                budget=budget_preset,
+                seed=selected_seed,
+                repeat_id=selected_repeat,
+            )
             if existing.status == "completed":
                 if selected_repeat is not None:
                     self._validate_existing_unseeded_binding(
