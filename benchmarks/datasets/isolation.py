@@ -99,9 +99,28 @@ class AgentRuntimeGuard:
         snapshot_root: Path,
         run_root: Path,
     ) -> None:
-        self.runtime_root = Path(runtime_root).resolve()
-        self.snapshot_root = Path(snapshot_root).resolve()
-        self.run_root = Path(run_root).resolve()
+        # Keep the lexical identity supplied by the child environment.  Calling
+        # ``resolve`` here would follow a root symlink before the resolver can
+        # reject it, allowing an attacker to substitute an otherwise allowed
+        # tree.  Roots are trusted only when their complete existing prefix is
+        # free of links/reparse points.
+        self.runtime_root = self._root(Path(runtime_root), label="runtime")
+        self.snapshot_root = self._root(Path(snapshot_root), label="snapshot")
+        self.run_root = self._root(Path(run_root), label="run")
+
+    @classmethod
+    def _root(cls, path: Path, *, label: str) -> Path:
+        absolute = path.absolute()
+        if ".." in absolute.parts:
+            raise GoldAccessViolation(f"{label} root contains traversal")
+        current = absolute
+        while current != Path(current.anchor):
+            if cls._is_link_or_reparse(current):
+                raise GoldAccessViolation(f"allowed {label} root is a symlink")
+            current = current.parent
+        if cls._is_link_or_reparse(current):
+            raise GoldAccessViolation(f"allowed {label} root is a symlink")
+        return absolute
 
     @staticmethod
     def _is_link_or_reparse(path: Path) -> bool:
@@ -124,6 +143,8 @@ class AgentRuntimeGuard:
         suffix: str | None = None,
     ) -> Path:
         candidate = Path(path)
+        if ".." in candidate.parts:
+            raise GoldAccessViolation(f"path traversal is not allowed for {label} input")
         # ``resolve`` alone follows a redirecting child symlink.  Check the
         # lexical chain first so an attacker cannot substitute an allowed
         # input between validation and open.

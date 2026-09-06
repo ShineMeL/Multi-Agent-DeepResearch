@@ -37,8 +37,89 @@ def _load_formal(path: Path) -> FormalExperimentConfig:
         raise typer.BadParameter("formal experiment config is invalid") from None
 
 
-def _runner(config: FormalExperimentConfig) -> ExperimentRunner:
-    return ExperimentRunner(config_source=None)
+def _require_clean_worktree(repo_root: Path) -> None:
+    try:
+        status = subprocess.run(
+            ["git", "-C", str(repo_root), "status", "--porcelain", "--untracked-files=all"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.splitlines()
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError("unable to verify clean worktree") from error
+    if status:
+        raise ValueError("worktree must be clean before freezing formal config")
+
+
+def _oracle_bindings(config: FormalExperimentConfig, repo_root: Path):
+    from benchmarks.datasets.models import AnnotatedQuestion, PrivateDatasetManifest
+    from benchmarks.datasets.validator import sha256_bytes
+    from benchmarks.evaluators.oracle import OracleEvidenceProvider
+    from deepresearch.providers.frozen_index import FrozenCorpusSnapshot
+
+    private_root = repo_root / "benchmarks" / "private" / config.dataset_id
+    manifest_path = private_root / "private_manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError("sealed private manifest is required for ORACLE")
+    private_bytes = manifest_path.read_bytes()
+    if sha256_bytes(private_bytes) != config.private_manifest_sha256:
+        raise ValueError("sealed private manifest hash mismatch")
+    private = PrivateDatasetManifest.model_validate_json(private_bytes, strict=True)
+    if (private.dataset_id, private.version) != (config.dataset_id, config.dataset_version):
+        raise ValueError("sealed private dataset identity mismatch")
+    questions: dict[str, AnnotatedQuestion] = {}
+    for relative in private.private_test_runtime_files:
+        relative_path = Path(relative)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise ValueError("sealed private runtime path is unsafe")
+        path = private_root / relative
+        if not path.is_file():
+            raise ValueError("sealed private runtime input is unavailable")
+        for line in path.read_bytes().splitlines():
+            question = AnnotatedQuestion.model_validate_json(line, strict=True)
+            if question.task_id in config.oracle_task_ids:
+                questions[question.task_id] = question
+    if set(questions) != set(config.oracle_task_ids):
+        raise ValueError("sealed ORACLE task inputs are incomplete")
+    snapshots = {
+        task_id: FrozenCorpusSnapshot.load(
+            repo_root / "benchmarks" / "snapshots" / config.dataset_id / task_id,
+            task_id=task_id,
+        )
+        for task_id in config.oracle_task_ids
+    }
+    approved = {
+        task_id: tuple(sorted({span.evidence_id for span in questions[task_id].gold_evidence_spans}))
+        for task_id in config.oracle_task_ids
+    }
+    records = {
+        task_id: {record.evidence_id: record for record in snapshots[task_id].records}
+        for task_id in config.oracle_task_ids
+    }
+    provider = OracleEvidenceProvider(
+        approved_ids_by_task=approved,
+        dataset_version=config.dataset_version,
+        private_manifest_sha256=config.private_manifest_sha256,
+        evaluator_version=config.evaluator_version,
+        evaluation_timestamp=config.evaluation_timestamp,
+        formal=True,
+        snapshots_by_task=snapshots,
+    )
+    return provider, records
+
+
+def _runner(
+    config: FormalExperimentConfig,
+    source: Path,
+    *,
+    with_oracle: bool = False,
+) -> ExperimentRunner:
+    kwargs: dict[str, object] = {"config_source": source.resolve()}
+    if with_oracle:
+        provider, records = _oracle_bindings(config, Path.cwd().resolve())
+        kwargs["oracle_provider"] = provider
+        kwargs["oracle_records_loader"] = records
+    return ExperimentRunner(**kwargs)  # type: ignore[arg-type]
 
 
 @config_app.command("freeze")
@@ -51,10 +132,23 @@ def freeze(
     output: Annotated[Path, typer.Option("--output")],
 ) -> None:
     """Freeze a formal config from the fixed evaluator roots."""
-    del model_lock, r1_model_lock, serving_environment_lock
     try:
         repo_root = Path.cwd().resolve()
+        _require_clean_worktree(repo_root)
         template = load_template(source)
+        expected_locks = {
+            "model lock": repo_root / template.model_lock_path,
+            "R1 model lock": repo_root / template.r1_model_lock_path,
+            "serving environment lock": repo_root / template.serving_environment_lock_path,
+        }
+        supplied_locks = {
+            "model lock": model_lock,
+            "R1 model lock": r1_model_lock,
+            "serving environment lock": serving_environment_lock,
+        }
+        for label, supplied in supplied_locks.items():
+            if supplied.resolve(strict=True) != expected_locks[label].resolve(strict=True):
+                raise ValueError(f"{label} does not match the sealed template reference")
         private_root = private_manifest.resolve().parent
         config = freeze_config(template, repo_root=repo_root, private_root=private_root)
         # freeze_config itself writes atomically and refuses replacement when
@@ -83,11 +177,7 @@ def validate(
     try:
         loaded = _load_formal(config)
         if require_clean_worktree:
-            status = subprocess.run(
-                ["git", "status", "--porcelain"], capture_output=True, text=True, check=True
-            ).stdout.splitlines()
-            if any(not line.endswith("experiments/") for line in status):
-                raise ValueError("worktree is not clean")
+            _require_clean_worktree(Path.cwd().resolve())
         if verify_current_tree:
             from experiments.config import code_tree_sha256
 
@@ -112,7 +202,7 @@ def _run(coro: object) -> object:
 @experiment_app.command("run-ranker")
 def run_ranker(config: Annotated[Path, typer.Option("--config")]) -> None:
     loaded = _load_formal(config)
-    _run(_runner(loaded).run_ranker_component(config=loaded, task_ids=loaded.main_test_task_ids))
+    _run(_runner(loaded, config).run_ranker_component(config=loaded, task_ids=loaded.main_test_task_ids))
 
 
 @experiment_app.command("run-planner")
@@ -121,7 +211,7 @@ def run_planner(
     ranker: Annotated[Literal["R1", "R2"], typer.Option("--ranker")],
 ) -> None:
     loaded = _load_formal(config)
-    _run(_runner(loaded).run_planner_policy(config=loaded, task_ids=loaded.main_test_task_ids, ranker_id=ranker))
+    _run(_runner(loaded, config).run_planner_policy(config=loaded, task_ids=loaded.main_test_task_ids, ranker_id=ranker))
 
 
 @experiment_app.command("run")
@@ -133,19 +223,19 @@ def run(
     requested = tuple(item.strip() for item in variants.split(",") if item.strip())
     if requested != ("A", "B", "C", "D"):
         _fail("--variants must be exactly A,B,C,D")
-    _run(_runner(loaded).run_abcd(config=loaded))
+    _run(_runner(loaded, config).run_abcd(config=loaded))
 
 
 @experiment_app.command("run-stability")
 def run_stability(config: Annotated[Path, typer.Option("--config")]) -> None:
     loaded = _load_formal(config)
-    _run(_runner(loaded).run_variant(ExperimentVariant.D, config=loaded, task_ids=loaded.stability_task_ids))
+    _run(_runner(loaded, config).run_variant(ExperimentVariant.D, config=loaded, task_ids=loaded.stability_task_ids))
 
 
 @experiment_app.command("run-cost-subset")
 def run_cost_subset(config: Annotated[Path, typer.Option("--config")]) -> None:
     loaded = _load_formal(config)
-    _run(_runner(loaded).run_cost_subset(config=loaded))
+    _run(_runner(loaded, config).run_cost_subset(config=loaded))
 
 
 @experiment_app.command("run-reference")
@@ -157,7 +247,11 @@ def run_reference(
     requested = {item.strip() for item in variants.split(",") if item.strip()}
     if requested != {"P0", "ORACLE"}:
         _fail("--variants must be exactly P0,ORACLE")
-    _run(_runner(loaded).run_reference(config=loaded, task_ids=loaded.p0_task_ids))
+    _run(
+        _runner(loaded, config, with_oracle=True).run_reference(
+            config=loaded, task_ids=loaded.p0_task_ids
+        )
+    )
 
 
 @experiment_app.command("summarize")

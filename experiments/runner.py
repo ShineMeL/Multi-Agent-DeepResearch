@@ -10,12 +10,17 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import json
 import os
 import subprocess
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal, cast
 
+import yaml
+from pydantic import JsonValue
+
+from benchmarks.datasets.isolation import GoldIsolationGuard
 from benchmarks.datasets.models import RuntimeTask
 from benchmarks.datasets.validator import canonical_json_bytes, sha256_bytes
 from benchmarks.processes.agent import (
@@ -30,7 +35,12 @@ from benchmarks.processes.evaluator import (
     stage_authorized_runtime_task,
     stage_sealed_config,
 )
-from deepresearch.domain import ResourceUsage
+from deepresearch.domain import ResourceUsage, RunBudget, RunConfig, RunResult
+from deepresearch.runtime import CheckpointRef
+from deepresearch.runtime.manifest import (
+    RunManifest,
+    _canonical_bytes,  # pyright: ignore[reportPrivateUsage]
+)
 from experiments.config import FormalExperimentConfig, preflight_config
 from experiments.models import (
     COMPONENT_IDS,
@@ -38,7 +48,7 @@ from experiments.models import (
     ExperimentTaskRun,
     ExperimentVariant,
     RankerComponentVariant,
-    canonical_sha256,
+    task_run_from_manifest,
 )
 
 Protocol = Literal["ranker_component", "planner_policy", "end_to_end", "reference"]
@@ -97,8 +107,10 @@ def _git_commit(root: Path) -> str:
             text=True,
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError):
-        commit = "unknown"
-    return commit if len(commit) == 40 else "unknown"
+        raise RuntimeError("git commit identity is unavailable") from None
+    if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
+        raise RuntimeError("git commit identity is unavailable")
+    return commit
 
 
 class ExperimentRunner:
@@ -125,6 +137,7 @@ class ExperimentRunner:
         seed_supported: bool = True,
         oracle_provider: object | None = None,
         oracle_records_loader: Mapping[str, Mapping[str, object]] | None = None,
+        preflight: bool = True,
     ) -> None:
         self._launch_agent = launch_agent or self._default_launch_agent
         self._evaluator = evaluator
@@ -145,6 +158,7 @@ class ExperimentRunner:
         self.seed_supported = seed_supported
         self.oracle_provider = oracle_provider
         self.oracle_records_loader = oracle_records_loader or {}
+        self.preflight = preflight
 
     async def _default_launch_agent(self, request: AgentRunRequest) -> object:
         """Launch the typed child entrypoint with an explicit environment.
@@ -216,36 +230,100 @@ class ExperimentRunner:
             dataset_private_root / "private_manifest.json"
         ).is_file():
             private_root = dataset_private_root
-        if (private_root / "private_manifest.json").is_file():
+        if self.preflight:
+            if not (private_root / "private_manifest.json").is_file():
+                raise RuntimeError("sealed private manifest is required before an experiment")
+            self._assert_clean_result_tree(config.experiment_group_id())
             preflight_config(config, repo_root=self.repo_root, private_root=private_root)
         group = config.experiment_group_id()
         root = (self.experiment_root / group).resolve()
         self.experiment_root.mkdir(parents=True, exist_ok=True)
         root.mkdir(parents=True, exist_ok=True)
+        config_path = root / "config" / "formal.yaml"
+        if self.config_source is not None:
+            source = self.config_source.resolve(strict=True)
+            if not source.is_file() or source.is_symlink():
+                raise RuntimeError("sealed config source is not a regular file")
+            source_bytes = source.read_bytes()
+            try:
+                staged_config = FormalExperimentConfig.model_validate(yaml.safe_load(source_bytes))
+            except (TypeError, ValueError, yaml.YAMLError) as error:
+                raise RuntimeError("sealed config source is invalid") from error
+            if staged_config != config:
+                raise RuntimeError("sealed config source disagrees with requested config")
+            config_hash = sha256_bytes(source_bytes)
+            stage_sealed_config(
+                source,
+                expected_sha256=config_hash,
+                group_run_root=root,
+            )
+        else:
+            config_bytes = _canonical(config.model_dump(mode="json"))
+            _write_immutable(config_path, config_bytes)
+            config_hash = sha256_bytes(config_bytes)
         payload = {
             "schema_version": "formal-experiment-group-v1",
             "group_id": group,
-            "config_sha256": canonical_sha256(config.model_dump(mode="json")),
+            "config_sha256": config_hash,
             "code_commit": _git_commit(self.repo_root),
             "dataset_version": config.dataset_version,
+            "private_manifest_sha256": config.private_manifest_sha256,
+            "evaluator_version": config.evaluator_version,
             "protocols": ["ranker_component", "planner_policy", "end_to_end", "reference"],
+            "protocol_task_ids": {
+                "ranker_component": list(config.main_test_task_ids),
+                "planner_policy": list(config.main_test_task_ids),
+                "end_to_end": list(config.main_test_task_ids),
+                "reference": list(config.p0_task_ids),
+            },
+            "oracle_task_ids": list(config.oracle_task_ids),
+            "expected_variants": {
+                "ranker_component": ["R0", "R1", "R2"],
+                "planner_policy": ["A", "B", "C", "D"],
+                "end_to_end": ["A", "B", "C", "D"],
+                "reference": ["P0"],
+            },
+            "budgets": list(config.budget_sensitivity_presets),
+            "required_budgets": {
+                "ranker_component": [config.budget_preset],
+                "planner_policy": [config.budget_preset],
+                "end_to_end": [config.budget_preset],
+                "reference": [config.budget_preset],
+            },
+            "cost_subset_task_ids": list(config.cost_subset_task_ids),
+            "replication": {
+                "mode": "seeds" if self.seed_supported else "independent_repeats",
+                "seed_values": list(config.replication.seed_values)
+                if self.seed_supported
+                else [],
+                "repeat_ids": []
+                if self.seed_supported
+                else list(range(1, config.replication.unseeded_repeat_count + 1)),
+            },
         }
         _write_immutable(root / "group.json", _canonical(payload))
-        config_path = root / "config" / "formal.yaml"
-        config_bytes = _canonical(config.model_dump(mode="json"))
-        if self.config_source is not None and self.config_source.exists():
-            expected = sha256_bytes(self.config_source.read_bytes())
-            staged = stage_sealed_config(
-                self.config_source,
-                expected_sha256=expected,
-                group_run_root=root,
-            )
-            config_bytes = staged.read_bytes()
-        else:
-            _write_immutable(config_path, config_bytes)
         for directory in ("agent-inputs", "requests", "candidate-pools", "resume-checkpoints", "raw", "artifacts"):
             (root / directory).mkdir(parents=True, exist_ok=True)
         return root
+
+    def _assert_clean_result_tree(self, group_id: str) -> None:
+        try:
+            output = subprocess.run(
+                ["git", "-C", str(self.repo_root), "status", "--porcelain", "--untracked-files=all"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+        except (OSError, subprocess.SubprocessError) as error:
+            raise RuntimeError("unable to verify clean result-affecting tree") from error
+        allowed_prefixes = {
+            f"experiments/{group_id}/",
+            f"experiments\\{group_id}\\",
+        }
+        for line in output:
+            relative = line[3:].replace("\\", "/") if len(line) >= 3 else line
+            if not any(relative.startswith(prefix.replace("\\", "/")) for prefix in allowed_prefixes):
+                raise RuntimeError("result-affecting worktree is not clean")
 
     def _task_sync(self, task_id: str) -> RuntimeTask:
         loader = self._task_loader
@@ -295,6 +373,73 @@ class ExperimentRunner:
         payload = path.read_bytes()
         return path, sha256_bytes(payload)
 
+    @staticmethod
+    def _validate_setup_manifest(
+        manifest: RunManifest,
+        *,
+        config: FormalExperimentConfig,
+        task: RuntimeTask,
+        seed: int,
+        planner_id: str,
+    ) -> None:
+        request_hash = sha256_bytes(_canonical_bytes(task.request.model_dump(mode="json")))
+        if manifest.request_sha256 != request_hash:
+            raise ValueError("candidate pool manifest request identity mismatch")
+        if manifest.workflow_id != "research-v1" or manifest.planner_id != planner_id:
+            raise ValueError("candidate pool manifest workflow identity mismatch")
+        if manifest.seed != seed or not manifest.seed_supported:
+            raise ValueError("candidate pool manifest seed identity mismatch")
+        if manifest.config_sha256 != ExperimentRunner._core_config_sha256(
+            config=config,
+            task=task,
+            planner_id=manifest.planner_id,
+            ranker_id=manifest.ranker_id,
+            seed=seed,
+        ):
+            raise ValueError("candidate pool manifest config identity mismatch")
+        if manifest.budget.model_dump(mode="json", exclude={"used_by_node"}) != RunBudget.preset(
+            task.request.budget_preset
+        ).model_dump(mode="json", exclude={"used_by_node"}):
+            raise ValueError("candidate pool manifest budget mismatch")
+        if manifest.pricing_status != "estimated" or manifest.pricing_snapshots != (
+            config.pricing_snapshot,
+        ):
+            raise ValueError("candidate pool manifest pricing mismatch")
+        if manifest.usage.cost_usd is None:
+            raise ValueError("candidate pool manifest usage is not cost-verified")
+
+    @staticmethod
+    def _core_config_sha256(
+        *,
+        config: FormalExperimentConfig,
+        task: RuntimeTask,
+        planner_id: str,
+        ranker_id: str,
+        seed: int | None,
+    ) -> str:
+        run_config = RunConfig(
+            request=task.request,
+            workflow_id="research-v1",
+            planner_id=cast(Any, planner_id),
+            ranker_id=cast(Any, ranker_id),
+            budget=RunBudget.preset(cast(Any, task.request.budget_preset)),
+            prompt_versions={
+                "planner": config.prompt_version,
+                "writer": config.writer_prompt_version,
+                "judge": config.judge_prompt_version,
+            },
+            ranker_weights_version=config.ranker_weights_version,
+            seed=seed,
+        )
+        payload = json.dumps(
+            run_config.model_dump(mode="json"),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
     def _seed_or_repeat(
         self,
         config: FormalExperimentConfig,
@@ -313,7 +458,7 @@ class ExperimentRunner:
         return None, repeat_id
 
     @staticmethod
-    def _idempotency_key(
+    def idempotency_key(
         group_id: str,
         protocol: str,
         variant: str,
@@ -333,6 +478,21 @@ class ExperimentRunner:
         }
         return hashlib.sha256(_canonical(token)).hexdigest()
 
+    @staticmethod
+    def _idempotency_key(
+        group_id: str,
+        protocol: str,
+        variant: str,
+        task_id: str,
+        seed: int | None,
+        repeat_id: int | None,
+        budget: str,
+    ) -> str:
+        """Backward-compatible private alias for existing callers/tests."""
+        return ExperimentRunner.idempotency_key(
+            group_id, protocol, variant, task_id, seed, repeat_id, budget
+        )
+
     def _raw_path(self, group_root: Path, key: str) -> Path:
         return group_root / "raw" / f"{key}.json"
 
@@ -346,10 +506,68 @@ class ExperimentRunner:
             return receipt
         if isinstance(receipt, Mapping):
             try:
-                return AgentRunReceipt.model_validate(receipt)
+                return AgentRunReceipt.model_validate(receipt, strict=True)
             except (TypeError, ValueError):
                 return None
         return None
+
+    @staticmethod
+    def _failure_record(
+        *,
+        config: FormalExperimentConfig,
+        group_root: Path,
+        protocol: Protocol,
+        variant: ExperimentVariant | RankerComponentVariant,
+        task: RuntimeTask,
+        budget: BudgetPreset,
+        seed: int | None,
+        repeat_id: int | None,
+        candidate_pool_hash: str | None,
+        key: str,
+        error_code: str,
+    ) -> ExperimentTaskRun:
+        if isinstance(variant, RankerComponentVariant):
+            planner_id, ranker_id = "P1", variant.value
+        else:
+            planner_id, ranker_id = COMPONENT_IDS[variant.value]
+        return ExperimentTaskRun(
+            task_id=task.task_id,
+            protocol=protocol,
+            variant=variant,
+            planner_id=planner_id,
+            ranker_id=ranker_id,
+            budget_preset=budget,
+            seed=seed,
+            repeat_id=repeat_id,
+            status="failed",
+            validity="invalid",
+            error_code=error_code,
+            candidate_pool_hash=candidate_pool_hash,
+            manifest_path=str((group_root / "artifacts" / f"{key}.run-manifest.json").resolve()),
+            artifact_ids=(),
+            usage=ResourceUsage.zero(cost_known=False),
+            pricing_snapshot_ids=(config.pricing_snapshot.snapshot_id,),
+            pricing_status="estimated",
+            cost_label="estimated_from_normalized_schedule",
+        )
+
+    @staticmethod
+    def _read_verified_artifact(
+        path: str,
+        *,
+        expected_sha256: str,
+        group_root: Path,
+    ) -> tuple[Path, bytes]:
+        candidate = Path(path)
+        if ".." in candidate.parts or candidate.is_symlink():
+            raise ValueError("agent artifact path is unsafe")
+        resolved = candidate.resolve(strict=True)
+        if not resolved.is_file() or not resolved.is_relative_to(group_root.resolve()):
+            raise ValueError("agent artifact path is outside the experiment group")
+        payload = resolved.read_bytes()
+        if sha256_bytes(payload) != expected_sha256:
+            raise ValueError("agent artifact hash mismatch")
+        return resolved, payload
 
     def _record(
         self,
@@ -365,47 +583,115 @@ class ExperimentRunner:
         candidate_pool_hash: str | None,
         receipt: object,
         key: str,
+        forced_error_code: str | None = None,
     ) -> ExperimentTaskRun:
         parsed = self._parse_receipt(receipt)
-        status: Literal["completed", "failed"] = "completed"
-        error_code: str | None = None
-        if parsed is not None and parsed.status != "completed":
-            status = "failed"
-            error_code = parsed.error_code or "AGENT_FAILED"
-        if parsed is not None:
-            manifest_path = parsed.manifest_path
-            artifact_ids = parsed.artifact_ids
-        else:
-            manifest_path = str((group_root / "artifacts" / f"{key}.run-manifest.json").resolve())
-            artifact_ids = ()
-        usage = ResourceUsage.zero(cost_known=True)
-        if isinstance(variant, RankerComponentVariant):
-            planner_id, ranker_id = "P1", variant.value
-        else:
-            planner_id, ranker_id = COMPONENT_IDS[variant.value]
-        run = ExperimentTaskRun(
-            task_id=task.task_id,
-            protocol=protocol,
-            variant=variant,
-            planner_id=planner_id,
-            ranker_id=ranker_id,
-            budget_preset=budget,
-            seed=seed,
-            repeat_id=repeat_id,
-            status=status,
-            validity="valid" if status == "completed" else "invalid",
-            error_code=error_code,
-            candidate_pool_hash=candidate_pool_hash,
-            manifest_path=manifest_path,
-            artifact_ids=artifact_ids,
-            usage=usage,
-            pricing_snapshot_ids=(config.pricing_snapshot.snapshot_id,),
-            pricing_status="estimated",
-            cost_label="estimated_from_normalized_schedule",
-        )
+        error_code = forced_error_code or "AGENT_RECEIPT_INVALID"
+        run: ExperimentTaskRun
+        try:
+            # A launcher/evaluator failure is authoritative.  Even if a child
+            # happened to leave a syntactically valid receipt behind, that
+            # receipt was not accepted by the failed boundary and must never
+            # be promoted to a completed experiment record.
+            if forced_error_code is not None:
+                raise ValueError("forced runner failure")
+            if parsed is None or parsed.task_id != task.task_id:
+                raise ValueError("receipt identity is invalid")
+            manifest_path, manifest_bytes = self._read_verified_artifact(
+                parsed.manifest_path,
+                expected_sha256=parsed.manifest_sha256,
+                group_root=group_root,
+            )
+            _, result_bytes = self._read_verified_artifact(
+                parsed.run_result_path,
+                expected_sha256=parsed.run_result_sha256,
+                group_root=group_root,
+            )
+            result_payload = RunResult.model_validate_json(result_bytes, strict=True)
+            manifest = RunManifest.model_validate_json(manifest_bytes, strict=True)
+            if isinstance(variant, RankerComponentVariant):
+                expected_components = ("P1", variant.value)
+            else:
+                expected_components = COMPONENT_IDS[variant.value]
+            if (manifest.planner_id, manifest.ranker_id) != expected_components:
+                raise ValueError("run manifest component identity does not match variant")
+            if manifest.config_sha256 != self._core_config_sha256(
+                config=config,
+                task=task,
+                planner_id=manifest.planner_id,
+                ranker_id=manifest.ranker_id,
+                seed=seed,
+            ):
+                raise ValueError("run manifest config identity mismatch")
+            group_metadata = json.loads((group_root / "group.json").read_bytes())
+            typed_group_metadata = cast(dict[str, object], group_metadata)
+            if typed_group_metadata.get("code_commit") != manifest.code_commit:
+                raise ValueError("run manifest code identity mismatch")
+            if (
+                result_payload.status != parsed.status
+                or result_payload.run_id != manifest.run_id
+                or result_payload.thread_id != manifest.thread_id
+                or result_payload.final_usage != manifest.usage
+            ):
+                raise ValueError("run result identity/accounting does not match manifest")
+            result_artifacts = tuple(
+                artifact_id
+                for artifact_id in (
+                    result_payload.report_artifact_id,
+                    result_payload.evidence_graph_artifact_id,
+                    result_payload.manifest_artifact_id,
+                )
+                if artifact_id is not None
+            )
+            if not set(result_artifacts).issubset(set(manifest.artifact_ids)):
+                raise ValueError("run result artifact identity does not match manifest")
+            if tuple(parsed.artifact_ids) != tuple(manifest.artifact_ids):
+                raise ValueError("receipt artifact identity does not match manifest")
+            run = task_run_from_manifest(
+                manifest,
+                config=config,
+                task=task,
+                protocol=protocol,
+                variant=variant,
+                manifest_path=str(manifest_path),
+                status=parsed.status,
+                seed=seed,
+                repeat_id=repeat_id,
+                candidate_pool_hash=candidate_pool_hash,
+            )
+            if parsed.status != "completed":
+                run = ExperimentTaskRun.model_validate(
+                    {
+                        **run.model_dump(mode="json"),
+                        "validity": "invalid",
+                        "error_code": parsed.error_code or run.error_code or "AGENT_FAILED",
+                    },
+                    strict=True,
+                )
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError):
+            if forced_error_code is None:
+                if parsed is not None and parsed.status != "completed":
+                    error_code = parsed.error_code or "AGENT_FAILED"
+                elif parsed is not None:
+                    error_code = "AGENT_MANIFEST_INVALID"
+            run = self._failure_record(
+                config=config,
+                group_root=group_root,
+                protocol=protocol,
+                variant=variant,
+                task=task,
+                budget=budget,
+                seed=seed,
+                repeat_id=repeat_id,
+                candidate_pool_hash=candidate_pool_hash,
+                key=key,
+                error_code=error_code,
+            )
         raw_path = self._raw_path(group_root, key)
         existing = self._load_existing(raw_path)
-        if existing is not None and existing.status != "completed":
+        if existing is not None:
+            if existing.status == "completed":
+                raise RuntimeError("completed experiment record cannot be overwritten")
             raw_path.unlink()
         _write_immutable(raw_path, _canonical(run.model_dump(mode="json")))
         return run
@@ -424,6 +710,9 @@ class ExperimentRunner:
         repeat_id: int | None,
         candidate_pool_path: Path | None = None,
         candidate_pool_hash: str | None = None,
+        resume_checkpoint_path: Path | None = None,
+        resume_checkpoint_sha256: str | None = None,
+        resume_checkpoint_ref: CheckpointRef | None = None,
     ) -> tuple[AgentRunRequest, StagedRuntimeTask, str]:
         staged = stage_authorized_runtime_task(
             task,
@@ -461,6 +750,11 @@ class ExperimentRunner:
                     "variant": variant.value,
                     "candidate_pool_path": str(candidate_pool_path.resolve()) if candidate_pool_path else None,
                     "candidate_pool_sha256": candidate_pool_hash,
+                    "resume_checkpoint_path": str(resume_checkpoint_path.resolve())
+                    if resume_checkpoint_path
+                    else None,
+                    "resume_checkpoint_sha256": resume_checkpoint_sha256,
+                    "resume_checkpoint_ref": resume_checkpoint_ref,
                 }
             )
         else:
@@ -472,11 +766,43 @@ class ExperimentRunner:
                     "variant": variant.value,
                     "candidate_pool_path": str(candidate_pool_path.resolve()) if candidate_pool_path else None,
                     "candidate_pool_sha256": candidate_pool_hash,
+                    "resume_checkpoint_path": str(resume_checkpoint_path.resolve())
+                    if resume_checkpoint_path
+                    else None,
+                    "resume_checkpoint_sha256": resume_checkpoint_sha256,
+                    "resume_checkpoint_ref": resume_checkpoint_ref,
                 }
             )
         request_path = group_root / "requests" / f"{request_key}.json"
+        if resume_checkpoint_path is not None:
+            request_path = group_root / "requests" / f"{request_key}.resume.json"
         _write_immutable(request_path, _canonical(request.model_dump(mode="json")))
         return request, staged, request_key
+
+    def _stage_resume_checkpoint(
+        self,
+        *,
+        group_root: Path,
+        key: str,
+        source: Path,
+        ref: CheckpointRef,
+    ) -> tuple[Path, str]:
+        from benchmarks.processes.agent import verify_checkpoint_identity
+
+        source = Path(source)
+        if ".." in source.parts or source.is_symlink():
+            raise ValueError("resume checkpoint source is unsafe")
+        if source.name != f"{key}.sqlite3":
+            raise ValueError("resume checkpoint is not bound to the experiment key")
+        source = source.resolve(strict=True)
+        if not source.is_file() or not source.is_relative_to((group_root / "artifacts").resolve()):
+            raise ValueError("resume checkpoint must be a prior group artifact")
+        verify_checkpoint_identity(source, ref)
+        payload = source.read_bytes()
+        destination = group_root / "resume-checkpoints" / f"{key}.sqlite3"
+        _write_immutable(destination, payload)
+        digest = sha256_bytes(destination.read_bytes())
+        return destination, digest
 
     async def run_one(
         self,
@@ -491,6 +817,8 @@ class ExperimentRunner:
         resume: bool = False,
         candidate_pool_path: Path | None = None,
         candidate_pool_hash: str | None = None,
+        resume_checkpoint_path: Path | None = None,
+        resume_checkpoint_ref: CheckpointRef | None = None,
     ) -> ExperimentTaskRun:
         if variant == ExperimentVariant.ORACLE:
             raise ValueError("ORACLE is evaluator-only")
@@ -516,6 +844,61 @@ class ExperimentRunner:
                 return existing
             if not resume:
                 raise RuntimeError("failed experiment key requires explicit resume")
+        elif resume:
+            return self._record(
+                config=config,
+                group_root=group_root,
+                protocol=protocol,
+                variant=variant,
+                task=task,
+                budget=budget_preset,
+                seed=selected_seed,
+                repeat_id=selected_repeat,
+                candidate_pool_hash=candidate_pool_hash,
+                receipt=None,
+                key=key,
+                forced_error_code="RESUME_CHECKPOINT_INVALID",
+            )
+        staged_checkpoint: Path | None = None
+        staged_checkpoint_sha256: str | None = None
+        if resume:
+            if resume_checkpoint_path is None or resume_checkpoint_ref is None:
+                return self._record(
+                    config=config,
+                    group_root=group_root,
+                    protocol=protocol,
+                    variant=variant,
+                    task=task,
+                    budget=budget_preset,
+                    seed=selected_seed,
+                    repeat_id=selected_repeat,
+                    candidate_pool_hash=candidate_pool_hash,
+                    receipt=None,
+                    key=key,
+                    forced_error_code="RESUME_CHECKPOINT_INVALID",
+                )
+            try:
+                staged_checkpoint, staged_checkpoint_sha256 = self._stage_resume_checkpoint(
+                    group_root=group_root,
+                    key=key,
+                    source=resume_checkpoint_path,
+                    ref=resume_checkpoint_ref,
+                )
+            except (OSError, ValueError, TypeError):
+                return self._record(
+                    config=config,
+                    group_root=group_root,
+                    protocol=protocol,
+                    variant=variant,
+                    task=task,
+                    budget=budget_preset,
+                    seed=selected_seed,
+                    repeat_id=selected_repeat,
+                    candidate_pool_hash=candidate_pool_hash,
+                    receipt=None,
+                    key=key,
+                    forced_error_code="RESUME_CHECKPOINT_INVALID",
+                )
         request, _, _ = await self._stage_request(
             config=config,
             group_root=group_root,
@@ -528,9 +911,44 @@ class ExperimentRunner:
             repeat_id=selected_repeat,
             candidate_pool_path=candidate_pool_path,
             candidate_pool_hash=candidate_pool_hash,
+            resume_checkpoint_path=staged_checkpoint,
+            resume_checkpoint_sha256=staged_checkpoint_sha256,
+            resume_checkpoint_ref=resume_checkpoint_ref,
         )
-        receipt = await self._call_launcher(request)
-        await self._call_evaluator(request, receipt)
+        try:
+            receipt = await self._call_launcher(request)
+        except Exception:  # noqa: BLE001 - child failures become auditable records
+            return self._record(
+                config=config,
+                group_root=group_root,
+                protocol=protocol,
+                variant=variant,
+                task=task,
+                budget=budget_preset,
+                seed=selected_seed,
+                repeat_id=selected_repeat,
+                candidate_pool_hash=candidate_pool_hash,
+                receipt=None,
+                key=key,
+                forced_error_code="AGENT_LAUNCH_FAILED",
+            )
+        try:
+            await self._call_evaluator(request, receipt)
+        except Exception:  # noqa: BLE001 - evaluator validation becomes an auditable record
+            return self._record(
+                config=config,
+                group_root=group_root,
+                protocol=protocol,
+                variant=variant,
+                task=task,
+                budget=budget_preset,
+                seed=selected_seed,
+                repeat_id=selected_repeat,
+                candidate_pool_hash=candidate_pool_hash,
+                receipt=receipt,
+                key=key,
+                forced_error_code="EVALUATOR_VALIDATION_FAILED",
+            )
         return self._record(
             config=config,
             group_root=group_root,
@@ -552,18 +970,15 @@ class ExperimentRunner:
 
     async def _candidate_pool(
         self, *, config: FormalExperimentConfig, task: RuntimeTask
-    ) -> tuple[Path, str]:
+    ) -> tuple[Path, str] | None:
         group_root = self._group_root(config)
-        path = group_root / "candidate-pools" / f"{task.task_id}-{config.replication.candidate_pool_seed}.json"
-        payload = _canonical(
-            {"task_id": task.task_id, "seed": config.replication.candidate_pool_seed, "version": "formal-v1"}
-        )
         request_key = self._idempotency_key(
             config.experiment_group_id(), "ranker_component", "POOL", task.task_id,
             config.replication.candidate_pool_seed, None, config.budget_preset,
         )
+        path = group_root / "candidate-pools" / f"{request_key}.json"
         request_path = group_root / "requests" / f"{request_key}.json"
-        if not request_path.exists():
+        try:
             staged = stage_authorized_runtime_task(
                 task,
                 config=config,
@@ -578,23 +993,73 @@ class ExperimentRunner:
                 runtime_task_path=staged.runtime_task_path,
                 runtime_task_sha256=staged.runtime_task_sha256,
                 base_runtime_task_sha256=staged.base_runtime_task_sha256,
-                snapshot_dir=str(self._snapshot_dir(task).resolve()),
-                run_dir=str(group_root.resolve()),
-                config_path=str(cfg_path.resolve()),
+                snapshot_dir=str(self._snapshot_dir(task).absolute()),
+                run_dir=str(group_root.absolute()),
+                config_path=str(cfg_path.absolute()),
                 config_sha256=cfg_hash,
                 seed=config.replication.candidate_pool_seed,
                 budget_preset=config.budget_preset,
             )
             _write_immutable(request_path, _canonical(request.model_dump(mode="json")))
             receipt = await self._call_launcher(request)
-            if isinstance(receipt, AgentCandidatePoolReceipt):
-                received = Path(receipt.candidate_pool_path)
-                if received.is_file() and sha256_bytes(received.read_bytes()) == receipt.candidate_pool_sha256:
-                    _write_immutable(path, received.read_bytes())
-        if not path.is_file():
-            _write_immutable(path, payload)
-        digest = sha256_bytes(path.read_bytes())
-        return path, digest
+            if not isinstance(receipt, AgentCandidatePoolReceipt):
+                receipt = AgentCandidatePoolReceipt.model_validate(receipt, strict=True)
+            if receipt.task_id != task.task_id:
+                raise ValueError("candidate pool receipt task identity mismatch")
+            received, candidate_bytes = self._read_verified_artifact(
+                receipt.candidate_pool_path,
+                expected_sha256=receipt.candidate_pool_sha256,
+                group_root=group_root,
+            )
+            if received.parent != (group_root / "staging").resolve():
+                raise ValueError("candidate pool must be staged outside protected inputs")
+            candidate_payload = json.loads(candidate_bytes)
+            if not isinstance(candidate_payload, dict):
+                raise TypeError("candidate pool payload is invalid")
+            candidate_payload = cast(dict[str, object], candidate_payload)
+            GoldIsolationGuard(
+                runtime_root=group_root / "agent-inputs",
+                snapshot_root=self.snapshot_root,
+                private_root=self.private_root,
+            ).validate_run_payload(cast(JsonValue, candidate_payload))
+            if candidate_payload.get("task_id") != task.task_id:
+                raise ValueError("candidate pool task identity mismatch")
+            evidence_ids = candidate_payload.get("evidence_ids")
+            if (
+                not isinstance(evidence_ids, list)
+                or any(not isinstance(item, str) or not item for item in cast(list[object], evidence_ids))
+                or cast(list[object], evidence_ids)
+                != sorted(set(cast(list[str], evidence_ids)))
+            ):
+                raise ValueError("candidate pool evidence IDs are not canonical")
+            typed_evidence_ids = cast(list[str], evidence_ids)
+            if sha256_bytes(_canonical(typed_evidence_ids)) != receipt.evidence_ids_sha256:
+                raise ValueError("candidate pool evidence hash mismatch")
+            _, manifest_bytes = self._read_verified_artifact(
+                receipt.manifest_path,
+                expected_sha256=receipt.manifest_sha256,
+                group_root=group_root,
+            )
+            manifest = RunManifest.model_validate_json(manifest_bytes, strict=True)
+            self._validate_setup_manifest(
+                manifest,
+                config=config,
+                task=task,
+                seed=config.replication.candidate_pool_seed,
+                planner_id="P1",
+            )
+            if receipt.usage != manifest.usage or receipt.pricing_snapshot_ids != tuple(
+                item.snapshot_id for item in manifest.pricing_snapshots
+            ):
+                raise ValueError("candidate pool receipt accounting mismatch")
+            # Promotion is the only write to the protected shared pool tree.
+            _write_immutable(path, candidate_bytes)
+            return path, sha256_bytes(candidate_bytes)
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError):
+            # A missing/invalid setup receipt is a failed protocol arm.  An
+            # empty or evaluator-authored fallback pool would turn failure into
+            # an apparently comparable ranker result, so fail closed here.
+            return None
 
     async def _run_variants(
         self,
@@ -610,7 +1075,43 @@ class ExperimentRunner:
         for task_id in task_ids:
             task = await self._task(task_id)
             if protocol == "ranker_component":
-                pools[task_id] = await self._candidate_pool(config=config, task=task)
+                pool = await self._candidate_pool(config=config, task=task)
+                if pool is None:
+                    for variant in variants:
+                        for seed, repeat in await self._replications(config):
+                            key = self._idempotency_key(
+                                config.experiment_group_id(),
+                                protocol,
+                                variant.value,
+                                task_id,
+                                seed,
+                                repeat,
+                                budget or config.budget_preset,
+                            )
+                            failed = self._failure_record(
+                                config=config,
+                                group_root=self._group_root(config),
+                                protocol=protocol,
+                                variant=variant,
+                                task=task,
+                                budget=budget or config.budget_preset,
+                                seed=seed,
+                                repeat_id=repeat,
+                                candidate_pool_hash=None,
+                                key=key,
+                                error_code="CANDIDATE_POOL_INVALID",
+                            )
+                            raw_path = self._raw_path(self._group_root(config), key)
+                            existing = self._load_existing(raw_path)
+                            if existing is not None and existing.status == "completed":
+                                runs.append(existing)
+                            else:
+                                if existing is not None:
+                                    raw_path.unlink()
+                                _write_immutable(raw_path, _canonical(failed.model_dump(mode="json")))
+                                runs.append(failed)
+                    continue
+                pools[task_id] = pool
             for variant in variants:
                 for seed, repeat in await self._replications(config):
                     path, digest = pools.get(task_id, (None, None))  # type: ignore[assignment]
@@ -710,9 +1211,9 @@ class ExperimentRunner:
             task_ids=tuple(task_ids or config.p0_task_ids),
         )
         if self.oracle_provider is None:
-            return result
+            raise RuntimeError("evaluator ORACLE provider is required for reference runs")
         provider = cast(Any, self.oracle_provider)
-        selected = tuple(task_ids or config.oracle_task_ids)
+        selected = tuple(config.oracle_task_ids)
         oracle_results: list[object] = []
         for task_id in selected:
             records = self.oracle_records_loader.get(task_id)

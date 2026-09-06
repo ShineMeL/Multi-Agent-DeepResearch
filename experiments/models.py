@@ -235,22 +235,25 @@ class ExperimentTaskRun(SealedModel):
                 not isinstance(self.variant, RankerComponentVariant)
                 or self.ranker_id != self.variant.value
                 or self.planner_id != "P1"
-                or self.candidate_pool_hash is None
             ):
                 raise ValueError("ranker component requires P1, matching R variant and pool hash")
+            if self.status == "completed" and self.candidate_pool_hash is None:
+                raise ValueError("successful ranker component requires a verified pool hash")
         elif (
             not isinstance(self.variant, ExperimentVariant)
             or COMPONENT_IDS[self.variant] != (self.planner_id, self.ranker_id)
             or (self.variant == ExperimentVariant.P0) != (self.protocol == "reference")
         ):
             raise ValueError("variant/protocol/component mismatch")
-        if (self.validity == "invalid" or self.error_code == "REPLAY_MISS") and (
+        if self.error_code == "REPLAY_MISS" and (
             self.status,
             self.validity,
             self.error_code,
         ) != ("failed", "invalid", "REPLAY_MISS"):
             raise ValueError("REPLAY_MISS must be failed and invalid")
-        if self.status == "completed" and (self.error_code or self.usage.cost_usd is None):
+        if self.status == "completed" and (
+            self.validity != "valid" or self.error_code or self.usage.cost_usd is None
+        ):
             raise ValueError("successful formal records require verified estimated usage")
         return self
 

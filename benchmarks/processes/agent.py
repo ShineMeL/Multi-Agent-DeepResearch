@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -13,9 +14,24 @@ from typing import Annotated, Any, Literal, cast
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
+from benchmarks.datasets.models import RuntimeTask
 from benchmarks.datasets.validator import sha256_bytes
 from deepresearch.domain import ResourceUsage, RunStatus
 from deepresearch.runtime import CheckpointRef
+
+
+def _require_hash(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None or value == "0" * 64:
+        raise ValueError("request hashes must be non-zero lowercase SHA-256")
+    return value
+
+
+def _require_absolute_path(value: str) -> str:
+    if not value or not Path(value).is_absolute() or ".." in Path(value).parts:
+        raise ValueError("paths must be absolute and non-traversing")
+    return value
 
 
 class AgentRequestBase(BaseModel):
@@ -43,14 +59,22 @@ class AgentRequestBase(BaseModel):
     )
     @classmethod
     def validate_hash(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        if re.fullmatch(r"[0-9a-f]{64}", value) is None or value == "0" * 64:
-            raise ValueError("request hashes must be non-zero lowercase SHA-256")
-        return value
+        return _require_hash(value)
 
     @model_validator(mode="after")
     def validate_resume_fields(self) -> AgentRequestBase:
+        if not self.task_id.strip():
+            raise ValueError("request task_id must not be empty")
+        for name, path in (
+            ("runtime_task_path", self.runtime_task_path),
+            ("snapshot_dir", self.snapshot_dir),
+            ("run_dir", self.run_dir),
+            ("config_path", self.config_path),
+        ):
+            if not path or not Path(path).is_absolute() or ".." in Path(path).parts:
+                raise ValueError(f"request {name} must be an absolute non-traversing path")
+        if self.resume_checkpoint_path is not None:
+            _require_absolute_path(self.resume_checkpoint_path)
         values = (
             self.resume_checkpoint_path,
             self.resume_checkpoint_sha256,
@@ -79,6 +103,16 @@ class AgentVariantRunRequest(AgentRequestBase):
     budget_preset: Literal["low", "medium", "high"]
     candidate_pool_path: str | None = None
     candidate_pool_sha256: str | None = None
+
+    @field_validator("candidate_pool_path")
+    @classmethod
+    def validate_candidate_pool_path(cls, value: str | None) -> str | None:
+        return None if value is None else _require_absolute_path(value)
+
+    @field_validator("candidate_pool_sha256")
+    @classmethod
+    def validate_candidate_pool_hash(cls, value: str | None) -> str | None:
+        return _require_hash(value)
 
     @model_validator(mode="after")
     def validate_pool_contract(self) -> AgentVariantRunRequest:
@@ -112,14 +146,19 @@ AgentRunRequestAdapter: TypeAdapter[AgentCandidatePoolRequest | AgentVariantRunR
 class AgentCandidatePoolReceipt(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    task_id: str
-    candidate_pool_path: str
+    task_id: str = Field(min_length=1)
+    candidate_pool_path: str = Field(min_length=1)
     candidate_pool_sha256: str
     evidence_ids_sha256: str
-    manifest_path: str
+    manifest_path: str = Field(min_length=1)
     manifest_sha256: str
     usage: ResourceUsage
-    pricing_snapshot_ids: tuple[str, ...]
+    pricing_snapshot_ids: tuple[str, ...] = Field(min_length=1)
+
+    @field_validator("candidate_pool_path", "manifest_path")
+    @classmethod
+    def validate_paths(cls, value: str) -> str:
+        return _require_absolute_path(value)
 
     @field_validator(
         "candidate_pool_sha256", "evidence_ids_sha256", "manifest_sha256"
@@ -130,23 +169,35 @@ class AgentCandidatePoolReceipt(BaseModel):
             raise ValueError("receipt hashes must be non-zero lowercase SHA-256")
         return value
 
+    @field_validator("pricing_snapshot_ids")
+    @classmethod
+    def validate_pricing_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not item.strip() for item in value):
+            raise ValueError("pricing snapshot IDs must be non-empty")
+        return value
+
 
 class AgentRunReceipt(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    task_id: str
+    task_id: str = Field(min_length=1)
     status: RunStatus
     error_code: str | None = None
-    run_result_path: str
-    manifest_path: str
+    run_result_path: str = Field(min_length=1)
+    manifest_path: str = Field(min_length=1)
     run_result_sha256: str
     manifest_sha256: str
     artifact_ids: tuple[str, ...]
 
+    @field_validator("run_result_path", "manifest_path")
+    @classmethod
+    def validate_paths(cls, value: str) -> str:
+        return _require_absolute_path(value)
+
     @field_validator("run_result_sha256", "manifest_sha256")
     @classmethod
     def validate_hash(cls, value: str) -> str:
-        if re.fullmatch(r"[0-9a-f]{64}", value) is None or value == "0" * 64:
+        if _require_hash(value) is None:
             raise ValueError("receipt hashes must be non-zero lowercase SHA-256")
         return value
 
@@ -159,7 +210,7 @@ def _canonical_json(value: object) -> bytes:
     )
 
 
-def _verify_snapshot(snapshot_dir: Path) -> None:
+def _verify_snapshot(snapshot_dir: Path, *, task: RuntimeTask | None = None) -> None:
     manifest_path = snapshot_dir / "manifest.sha256"
     if not manifest_path.is_file():
         raise ValueError("snapshot manifest is missing")
@@ -170,7 +221,11 @@ def _verify_snapshot(snapshot_dir: Path) -> None:
     file_hashes = raw_manifest.get("file_sha256")
     if not isinstance(file_hashes, dict) or not file_hashes:
         raise ValueError("snapshot manifest has no file hashes")
-    for filename, expected in cast("dict[object, object]", file_hashes).items():
+    typed_hashes = cast("dict[object, object]", file_hashes)
+    required = {"documents.jsonl", "index.json", "snapshot.json"}
+    if task is not None and set(typed_hashes) != required:
+        raise ValueError("snapshot manifest file set is invalid")
+    for filename, expected in typed_hashes.items():
         if not isinstance(filename, str) or Path(filename).name != filename:
             raise ValueError("snapshot manifest contains an unsafe filename")
         if (
@@ -185,6 +240,55 @@ def _verify_snapshot(snapshot_dir: Path) -> None:
             raise ValueError(f"snapshot file is missing: {filename}")
         if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
             raise ValueError(f"snapshot hash mismatch: {filename}")
+    snapshot_payload = json.loads((snapshot_dir / "snapshot.json").read_bytes())
+    if not isinstance(snapshot_payload, dict):
+        raise TypeError("snapshot metadata is invalid")
+    typed_snapshot = cast("dict[str, object]", snapshot_payload)
+    if task is not None:
+        for name in ("task_id", "snapshot_id", "corpus_version", "index_version"):
+            if typed_snapshot.get(name) != getattr(task, name):
+                raise ValueError(f"snapshot {name} does not match RuntimeTask")
+    for filename, field in (("documents.jsonl", "documents_sha256"), ("index.json", "index_sha256")):
+        expected = typed_snapshot.get(field)
+        if expected is not None and expected != hashlib.sha256((snapshot_dir / filename).read_bytes()).hexdigest():
+            raise ValueError(f"snapshot {field} does not match file")
+
+
+def verify_checkpoint_identity(path: Path, ref: CheckpointRef) -> None:
+    """Prove the requested checkpoint tuple exists before opening Core state."""
+    from benchmarks.datasets.isolation import GoldAccessViolation
+
+    try:
+        uri = f"file:{path.as_posix()}?mode=ro"
+        with sqlite3.connect(uri, uri=True) as connection:
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(checkpoints)")
+            }
+            if not {"thread_id", "checkpoint_id"}.issubset(columns):
+                raise GoldAccessViolation("checkpoint identity source is invalid")
+            if "checkpoint_ns" in columns:
+                cursor = connection.execute(
+                    "SELECT 1 FROM checkpoints WHERE thread_id = ? AND checkpoint_id = ? "
+                    "AND checkpoint_ns = '' LIMIT 1",
+                    (ref.thread_id, ref.checkpoint_id),
+                )
+            else:
+                cursor = connection.execute(
+                    "SELECT 1 FROM checkpoints WHERE thread_id = ? AND checkpoint_id = ? LIMIT 1",
+                    (ref.thread_id, ref.checkpoint_id),
+                )
+            if cursor.fetchone() is None:
+                raise GoldAccessViolation("checkpoint identity is not present in verified source")
+    except GoldAccessViolation:
+        raise
+    except (OSError, sqlite3.Error) as error:
+        raise GoldAccessViolation("checkpoint identity source is invalid") from error
+
+
+def _verify_checkpoint_identity(path: Path, ref: CheckpointRef) -> None:  # pyright: ignore[reportUnusedFunction]
+    """Compatibility alias for the focused isolation tests."""
+    verify_checkpoint_identity(path, ref)
 
 
 def _write_probe(path: Path, payload: dict[str, str]) -> None:
@@ -232,6 +336,7 @@ def load_authorized_agent_inputs(
     guard.validate_payload(task.model_dump(mode="json"))
     if task.task_id != request.task_id:
         raise GoldAccessViolation("runtime task identity mismatch")
+    _verify_snapshot(snapshot_dir, task=task)
 
     from experiments.config import FormalExperimentConfig, authorized_staged_task
 
@@ -266,12 +371,9 @@ def load_authorized_agent_inputs(
         checkpoint = guard.resolve_resume_checkpoint(
             Path(request.resume_checkpoint_path), expected_sha256=request.resume_checkpoint_sha256
         )
-        # The source is immutable and only the evaluator can stage it.  A
-        # SQLite identity check is performed by the evaluator in formal mode;
-        # the agent verifies the requested file is at least a regular input.
         if not checkpoint.is_file() or request.resume_checkpoint_ref is None:
             raise GoldAccessViolation("checkpoint identity is incomplete")
-    del snapshot_dir
+        verify_checkpoint_identity(checkpoint, request.resume_checkpoint_ref)
     return task, config
 
 
@@ -329,7 +431,7 @@ def _run_request(args: argparse.Namespace) -> int:
     )
     request_path = guard.resolve_request(args.request)
     raw = request_path.read_bytes()
-    request = AgentRunRequestAdapter.validate_json(raw)
+    request = AgentRunRequestAdapter.validate_json(raw, strict=True)
     guard.validate_payload(request.model_dump(mode="json"))
     task, config = load_authorized_agent_inputs(request, guard=guard)
     # Only after all path/hash/budget authorization does the agent import the
@@ -343,9 +445,14 @@ def _run_request(args: argparse.Namespace) -> int:
     output_root = guard.resolve_output(Path(args.receipt))
     usage = ResourceUsage.zero(cost_known=True)
     if isinstance(request, AgentCandidatePoolRequest):
-        candidate_root = run_root / "candidate-pools"
+        # Candidate pools are an evaluator-promoted input.  The child may
+        # publish only into its writable staging subtree; it must never write
+        # directly into the shared protected pool directory.
+        candidate_root = run_root / "staging"
         candidate_root.mkdir(parents=True, exist_ok=True)
-        candidate = candidate_root / f"{request.task_id}-{request.budget_preset}.json"
+        candidate = guard.resolve_output(
+            candidate_root / f"{request.task_id}-{request.budget_preset}-candidate-pool.json"
+        )
         candidate_payload: dict[str, object] = {
             "task_id": request.task_id,
             "evidence_ids": [],
@@ -451,4 +558,5 @@ __all__ = [
     "AgentVariantRunRequest",
     "load_authorized_agent_inputs",
     "main",
+    "verify_checkpoint_identity",
 ]

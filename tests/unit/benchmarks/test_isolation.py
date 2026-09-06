@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -9,6 +11,7 @@ import pytest
 from benchmarks.datasets.isolation import GoldAccessViolation, GoldIsolationGuard
 from benchmarks.datasets.models import AnnotatedQuestion, RuntimeTask
 from benchmarks.processes.evaluator import materialize_agent_runtime_task
+from deepresearch.runtime import CheckpointRef
 
 EXAMPLE = Path(__file__).parents[2] / ".." / "benchmarks" / "datasets" / "templates" / "question.example.json"
 
@@ -129,3 +132,57 @@ def test_agent_runtime_guard_verifies_task15_input_roots_and_hashes(tmp_path: Pa
         guard.resolve_staged_config(config / "formal.yaml", expected_sha256="0" * 64)
     with pytest.raises(GoldAccessViolation):
         guard.resolve_output(config / "formal.yaml")
+
+
+def test_agent_runtime_guard_rejects_lexical_traversal_and_root_symlink(
+    tmp_path: Path,
+) -> None:
+    from benchmarks.datasets.isolation import AgentRuntimeGuard
+
+    runtime = tmp_path / "runtime"
+    snapshots = tmp_path / "snapshots"
+    run = tmp_path / "run"
+    requests = run / "requests"
+    for directory in (runtime, snapshots, requests):
+        directory.mkdir(parents=True)
+    request = requests / "request.json"
+    request.write_text("{}", encoding="utf-8")
+    guard = AgentRuntimeGuard(runtime_root=runtime, snapshot_root=snapshots, run_root=run)
+    with pytest.raises(GoldAccessViolation):
+        guard.resolve_request(requests / ".." / "requests" / "request.json")
+
+    linked_runtime = tmp_path / "runtime-link"
+    linked_runtime.symlink_to(runtime, target_is_directory=True)
+    with pytest.raises(GoldAccessViolation):
+        AgentRuntimeGuard(runtime_root=linked_runtime, snapshot_root=snapshots, run_root=run)
+
+
+def test_agent_checkpoint_identity_must_exist_in_verified_sqlite_source(
+    tmp_path: Path,
+) -> None:
+    from benchmarks.processes.agent import _verify_checkpoint_identity
+
+    path = tmp_path / "resume.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE checkpoints (thread_id TEXT, checkpoint_ns TEXT, checkpoint_id TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO checkpoints VALUES (?, ?, ?)",
+            ("thread-1", "", "cp-1"),
+        )
+    ref = CheckpointRef(
+        checkpoint_id="cp-1",
+        thread_id="thread-1",
+        created_at=datetime(2026, 9, 1, tzinfo=UTC),
+    )
+    _verify_checkpoint_identity(path, ref)
+    with pytest.raises(GoldAccessViolation, match="checkpoint identity"):
+        _verify_checkpoint_identity(
+            path,
+            CheckpointRef(
+                checkpoint_id="cp-other",
+                thread_id="thread-1",
+                created_at=ref.created_at,
+            ),
+        )
