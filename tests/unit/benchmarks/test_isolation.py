@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -93,3 +94,38 @@ def test_materialization_rejects_private_destination(tmp_path: Path) -> None:
             request_id="request-1",
             forbidden_private_root=private_root,
         )
+
+
+def test_agent_runtime_guard_verifies_task15_input_roots_and_hashes(tmp_path: Path) -> None:
+    from benchmarks.datasets.isolation import AgentRuntimeGuard
+
+    runtime = tmp_path / "runtime"
+    snapshots = tmp_path / "snapshots"
+    run = tmp_path / "run"
+    requests = run / "requests"
+    config = run / "config"
+    pools = run / "candidate-pools"
+    checkpoints = run / "resume-checkpoints"
+    for directory in (runtime, snapshots, requests, config, pools, checkpoints):
+        directory.mkdir(parents=True)
+    (runtime / "task.json").write_text("{}", encoding="utf-8")
+    (requests / "request.json").write_text("{}", encoding="utf-8")
+    (config / "formal.yaml").write_text("sealed: true\n", encoding="utf-8")
+    (pools / "pool.json").write_text('{"evidence_ids": []}\n', encoding="utf-8")
+    (checkpoints / "resume.sqlite3").write_bytes(b"checkpoint")
+    guard = AgentRuntimeGuard(runtime_root=runtime, snapshot_root=snapshots, run_root=run)
+    digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    assert guard.resolve_request(requests / "request.json") == (requests / "request.json").resolve()
+    assert guard.resolve_staged_config(
+        config / "formal.yaml", expected_sha256=digest(config / "formal.yaml")
+    ) == (config / "formal.yaml").resolve()
+    assert guard.resolve_candidate_pool(
+        pools / "pool.json", expected_sha256=digest(pools / "pool.json")
+    ) == (pools / "pool.json").resolve()
+    assert guard.resolve_resume_checkpoint(
+        checkpoints / "resume.sqlite3", expected_sha256=digest(checkpoints / "resume.sqlite3")
+    ) == (checkpoints / "resume.sqlite3").resolve()
+    with pytest.raises(GoldAccessViolation):
+        guard.resolve_staged_config(config / "formal.yaml", expected_sha256="0" * 64)
+    with pytest.raises(GoldAccessViolation):
+        guard.resolve_output(config / "formal.yaml")

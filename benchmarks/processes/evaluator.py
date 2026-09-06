@@ -6,12 +6,53 @@ import json
 import os
 import subprocess
 import sys
+import uuid
 from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
 
 from benchmarks.datasets.isolation import GoldAccessViolation
 from benchmarks.datasets.models import RuntimeTask
+from benchmarks.datasets.validator import sha256_bytes
+from experiments.config import FormalExperimentConfig, authorized_staged_task
+from experiments.models import SealedModel, Sha256, canonical_sha256
+
+
+class StagedRuntimeTask(SealedModel):
+    """Hash binding for the immutable task copy passed to an agent child."""
+
+    runtime_task_path: str
+    runtime_task_sha256: Sha256
+    base_runtime_task_sha256: Sha256
+
+
+def _publish_no_replace_bytes(path: Path, payload: bytes) -> Path:
+    """Publish bytes without replacing an existing artifact."""
+    path = Path(path)
+    if path.is_symlink():
+        raise GoldAccessViolation("artifact destination cannot be a symlink")
+    if path.exists():
+        if path.is_file() and path.read_bytes() == payload:
+            return path
+        raise FileExistsError(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staging = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.staging")
+    try:
+        with staging.open("xb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        from benchmarks.scripts.build_snapshot import (  # pyright: ignore[reportPrivateUsage]
+            _publish_no_replace,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        _publish_no_replace(staging, path)  # pyright: ignore[reportPrivateUsage]
+        return path
+    finally:
+        try:
+            staging.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _canonical_json(value: object) -> bytes:
@@ -44,29 +85,72 @@ def materialize_agent_runtime_task(
     target = input_root / f"{request_id}.json"
     if private_root == target or private_root in target.parents:
         raise GoldAccessViolation("agent task destination is evaluator-only")
-    if target.exists():
-        raise FileExistsError("agent task destination already exists")
-
     payload = _canonical_json(task.model_dump(mode="json"))
-    staging = target.with_name(f".{target.name}.{os.getpid()}.staging")
-    try:
-        with staging.open("xb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(staging, target)
-        with target.open("rb") as handle:
-            if handle.read() != payload:
-                raise GoldAccessViolation("materialized runtime task failed byte validation")
-        restored = RuntimeTask.model_validate_json(payload, strict=True)
-        if _canonical_json(restored.model_dump(mode="json")) != payload:
-            raise GoldAccessViolation("materialized runtime task failed schema validation")
-    finally:
-        try:
-            staging.unlink()
-        except FileNotFoundError:
-            pass
+    _publish_no_replace_bytes(target, payload)
+    with target.open("rb") as handle:
+        if handle.read() != payload:
+            raise GoldAccessViolation("materialized runtime task failed byte validation")
+    restored = RuntimeTask.model_validate_json(payload, strict=True)
+    if _canonical_json(restored.model_dump(mode="json")) != payload:
+        raise GoldAccessViolation("materialized runtime task failed schema validation")
     return target
+
+
+def stage_sealed_config(
+    source_path: Path,
+    *,
+    expected_sha256: str,
+    group_run_root: Path,
+) -> Path:
+    """Copy a verified repository seal into the ignored group input root."""
+    source = Path(source_path).resolve(strict=True)
+    if not source.is_file() or source.is_symlink():
+        raise GoldAccessViolation("sealed config source is not a regular file")
+    payload = source.read_bytes()
+    if sha256_bytes(payload) != expected_sha256:
+        raise GoldAccessViolation("sealed config source hash mismatch")
+    destination = Path(group_run_root).resolve() / "config" / "formal.yaml"
+    return _publish_no_replace_bytes(destination, payload).resolve()
+
+
+def stage_authorized_runtime_task(
+    base_task: RuntimeTask,
+    *,
+    config: FormalExperimentConfig,
+    budget_preset: str,
+    agent_input_root: Path,
+    request_id: str,
+    forbidden_private_root: Path,
+) -> StagedRuntimeTask:
+    """Create the selected budget copy and bind it to the sealed base hash."""
+    if budget_preset not in config.budget_sensitivity_presets:
+        raise GoldAccessViolation("budget preset is not sealed for this experiment")
+    base_hash = canonical_sha256(base_task.model_dump(mode="json"))
+    authorized = config.internal_runtime_task_hashes.get(base_task.task_id)
+    if authorized is None:
+        authorized = config.external_runtime_task_hashes.get(base_task.task_id)
+    if authorized != base_hash:
+        raise GoldAccessViolation("base RuntimeTask is not authorized by the sealed config")
+    selected = base_task.model_copy(
+        update={"request": base_task.request.model_copy(update={"budget_preset": budget_preset})}
+    )
+    authorized_staged_task(
+        config,
+        selected,
+        staged_sha256=canonical_sha256(selected.model_dump(mode="json")),
+        budget_preset=budget_preset,  # type: ignore[arg-type]
+    )
+    staged_path = materialize_agent_runtime_task(
+        selected,
+        agent_input_root=agent_input_root,
+        request_id=request_id,
+        forbidden_private_root=forbidden_private_root,
+    )
+    return StagedRuntimeTask(
+        runtime_task_path=str(staged_path.resolve()),
+        runtime_task_sha256=sha256_bytes(staged_path.read_bytes()),
+        base_runtime_task_sha256=base_hash,
+    )
 
 
 def _safe_environment(*, root: Path, runtime_root: Path, snapshot_root: Path, run_root: Path) -> dict[str, str]:
@@ -75,13 +159,14 @@ def _safe_environment(*, root: Path, runtime_root: Path, snapshot_root: Path, ru
         for key in ("PATH", "SystemRoot", "TEMP", "TMP", "PYTHONIOENCODING")
         if key in os.environ
     }
-    environment["PYTHONPATH"] = os.pathsep.join(
-        [str(root), str(root / "src"), os.environ.get("PYTHONPATH", "")]
-    )
+    environment["PYTHONPATH"] = os.pathsep.join([str(root), str(root / "src")])
     environment["DEEPRESEARCH_BENCHMARK_RUNTIME_ROOT"] = str(runtime_root)
     environment["DEEPRESEARCH_BENCHMARK_SNAPSHOT_ROOT"] = str(snapshot_root)
     environment["DEEPRESEARCH_BENCHMARK_RUN_ROOT"] = str(run_root)
     environment.pop("DEEPRESEARCH_BENCHMARK_GOLD_ROOT", None)
+    for key in tuple(os.environ):
+        if key.startswith("DEEPRESEARCH_PROVIDER_"):
+            environment[key] = os.environ[key]
     return environment
 
 
@@ -216,4 +301,11 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["main", "materialize_agent_runtime_task", "probe_agent"]
+__all__ = [
+    "StagedRuntimeTask",
+    "main",
+    "materialize_agent_runtime_task",
+    "probe_agent",
+    "stage_authorized_runtime_task",
+    "stage_sealed_config",
+]

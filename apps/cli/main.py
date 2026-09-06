@@ -78,6 +78,13 @@ from deepresearch import __version__
 
 app = typer.Typer(no_args_is_help=True)
 
+# The formal benchmark command group is imported after the baseline app has
+# been created; its evaluator-side modules never participate in ``research``
+# provider composition.
+from apps.cli.experiment import experiment_app
+
+app.add_typer(experiment_app, name="experiment")
+
 
 @dataclass(frozen=True)
 class _ResearchOptions:

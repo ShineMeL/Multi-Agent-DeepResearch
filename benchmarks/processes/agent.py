@@ -4,10 +4,151 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import cast
+from typing import Annotated, Any, Literal, cast
+
+import yaml
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
+
+from benchmarks.datasets.validator import sha256_bytes
+from deepresearch.domain import ResourceUsage, RunStatus
+from deepresearch.runtime import CheckpointRef
+
+
+class AgentRequestBase(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    task_id: str
+    runtime_task_path: str
+    runtime_task_sha256: str
+    base_runtime_task_sha256: str
+    snapshot_dir: str
+    run_dir: str
+    config_path: str
+    config_sha256: str
+    seed: int | None = None
+    repeat_id: Annotated[int | None, Field(ge=1)] = None
+    resume_checkpoint_path: str | None = None
+    resume_checkpoint_sha256: str | None = None
+    resume_checkpoint_ref: CheckpointRef | None = None
+
+    @field_validator(
+        "runtime_task_sha256",
+        "base_runtime_task_sha256",
+        "config_sha256",
+        "resume_checkpoint_sha256",
+    )
+    @classmethod
+    def validate_hash(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None or value == "0" * 64:
+            raise ValueError("request hashes must be non-zero lowercase SHA-256")
+        return value
+
+    @model_validator(mode="after")
+    def validate_resume_fields(self) -> AgentRequestBase:
+        values = (
+            self.resume_checkpoint_path,
+            self.resume_checkpoint_sha256,
+            self.resume_checkpoint_ref,
+        )
+        if any(item is not None for item in values) and not all(item is not None for item in values):
+            raise ValueError("resume checkpoint fields must be all present or all absent")
+        if self.seed is not None and self.repeat_id is not None:
+            raise ValueError("seed and repeat_id are mutually exclusive")
+        if self.seed is None and self.repeat_id is None:
+            raise ValueError("exactly one seed or repeat_id is required")
+        return self
+
+
+class AgentCandidatePoolRequest(AgentRequestBase):
+    kind: Literal["candidate_pool"] = "candidate_pool"
+    protocol: Literal["ranker_component"] = "ranker_component"
+    planner_id: Literal["P1"] = "P1"
+    budget_preset: Literal["low", "medium", "high"]
+
+
+class AgentVariantRunRequest(AgentRequestBase):
+    kind: Literal["variant_run"] = "variant_run"
+    protocol: Literal["ranker_component", "planner_policy", "end_to_end", "reference"]
+    variant: Literal["A", "B", "C", "D", "P0", "R0", "R1", "R2"]
+    budget_preset: Literal["low", "medium", "high"]
+    candidate_pool_path: str | None = None
+    candidate_pool_sha256: str | None = None
+
+    @model_validator(mode="after")
+    def validate_pool_contract(self) -> AgentVariantRunRequest:
+        ranker_variant = self.variant in {"R0", "R1", "R2"}
+        if (self.protocol == "ranker_component") != ranker_variant:
+            raise ValueError("ranker protocol and R variant must agree")
+        if self.protocol == "reference" and self.variant != "P0":
+            raise ValueError("reference protocol accepts only P0")
+        if self.protocol in {"planner_policy", "end_to_end"} and self.variant not in {
+            "A",
+            "B",
+            "C",
+            "D",
+        }:
+            raise ValueError("planner/end-to-end protocols accept only A/B/C/D")
+        requires = ranker_variant
+        if requires != (self.candidate_pool_path is not None and self.candidate_pool_sha256 is not None):
+            raise ValueError("ranker variants require exactly one candidate pool binding")
+        return self
+
+
+type AgentRunRequest = Annotated[
+    AgentCandidatePoolRequest | AgentVariantRunRequest,
+    Field(discriminator="kind"),
+]
+AgentRunRequestAdapter: TypeAdapter[AgentCandidatePoolRequest | AgentVariantRunRequest] = TypeAdapter(
+    AgentRunRequest
+)
+
+
+class AgentCandidatePoolReceipt(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    task_id: str
+    candidate_pool_path: str
+    candidate_pool_sha256: str
+    evidence_ids_sha256: str
+    manifest_path: str
+    manifest_sha256: str
+    usage: ResourceUsage
+    pricing_snapshot_ids: tuple[str, ...]
+
+    @field_validator(
+        "candidate_pool_sha256", "evidence_ids_sha256", "manifest_sha256"
+    )
+    @classmethod
+    def validate_hash(cls, value: str) -> str:
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None or value == "0" * 64:
+            raise ValueError("receipt hashes must be non-zero lowercase SHA-256")
+        return value
+
+
+class AgentRunReceipt(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    task_id: str
+    status: RunStatus
+    error_code: str | None = None
+    run_result_path: str
+    manifest_path: str
+    run_result_sha256: str
+    manifest_sha256: str
+    artifact_ids: tuple[str, ...]
+
+    @field_validator("run_result_sha256", "manifest_sha256")
+    @classmethod
+    def validate_hash(cls, value: str) -> str:
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None or value == "0" * 64:
+            raise ValueError("receipt hashes must be non-zero lowercase SHA-256")
+        return value
 
 
 def _canonical_json(value: object) -> bytes:
@@ -63,14 +204,188 @@ def _write_probe(path: Path, payload: dict[str, str]) -> None:
             pass
 
 
+def load_authorized_agent_inputs(
+    request: AgentRunRequest,
+    *,
+    guard: object,
+) -> tuple[Any, Any]:
+    """Validate every evaluator-supplied input before importing agent code.
+
+    The imports of ``FormalExperimentConfig`` and the component factory are
+    deliberately local: malformed or untrusted requests must not reach a
+    provider/client construction path.
+    """
+    from benchmarks.datasets.isolation import AgentRuntimeGuard, GoldAccessViolation
+    from benchmarks.datasets.models import RuntimeTask
+
+    if not isinstance(guard, AgentRuntimeGuard):
+        raise TypeError("guard must be an AgentRuntimeGuard")
+    task_path = guard.resolve_runtime_task(Path(request.runtime_task_path))
+    snapshot_dir = guard.resolve_snapshot(Path(request.snapshot_dir))
+    config_path = guard.resolve_staged_config(
+        Path(request.config_path), expected_sha256=request.config_sha256
+    )
+    task_bytes = task_path.read_bytes()
+    if sha256_bytes(task_bytes) != request.runtime_task_sha256:
+        raise GoldAccessViolation("runtime task hash mismatch")
+    task = RuntimeTask.model_validate_json(task_bytes, strict=True)
+    guard.validate_payload(task.model_dump(mode="json"))
+    if task.task_id != request.task_id:
+        raise GoldAccessViolation("runtime task identity mismatch")
+
+    from experiments.config import FormalExperimentConfig, authorized_staged_task
+
+    config_payload = yaml.safe_load(config_path.read_bytes())
+    config = FormalExperimentConfig.model_validate(config_payload)
+    if request.task_id != task.task_id:
+        raise GoldAccessViolation("request task identity mismatch")
+    if request.budget_preset != task.request.budget_preset:
+        raise GoldAccessViolation("request budget does not match staged RuntimeTask")
+    authorized_staged_task(
+        config,
+        task,
+        staged_sha256=request.runtime_task_sha256,
+        budget_preset=request.budget_preset,
+    )
+    if (
+        request.base_runtime_task_sha256 != config.internal_runtime_task_hashes.get(task.task_id)
+        and request.base_runtime_task_sha256
+        != config.external_runtime_task_hashes.get(task.task_id)
+    ):
+        raise GoldAccessViolation("base runtime task authorization mismatch")
+
+    if (
+        isinstance(request, AgentVariantRunRequest)
+        and request.candidate_pool_path is not None
+        and request.candidate_pool_sha256 is not None
+    ):
+        guard.resolve_candidate_pool(
+            Path(request.candidate_pool_path), expected_sha256=request.candidate_pool_sha256
+        )
+    if request.resume_checkpoint_path is not None and request.resume_checkpoint_sha256 is not None:
+        checkpoint = guard.resolve_resume_checkpoint(
+            Path(request.resume_checkpoint_path), expected_sha256=request.resume_checkpoint_sha256
+        )
+        # The source is immutable and only the evaluator can stage it.  A
+        # SQLite identity check is performed by the evaluator in formal mode;
+        # the agent verifies the requested file is at least a regular input.
+        if not checkpoint.is_file() or request.resume_checkpoint_ref is None:
+            raise GoldAccessViolation("checkpoint identity is incomplete")
+    del snapshot_dir
+    return task, config
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m benchmarks.processes.agent")
-    parser.add_argument("--probe-runtime-task", type=Path, required=True)
-    parser.add_argument("--runtime-root", type=Path, required=True)
-    parser.add_argument("--snapshot-dir", type=Path, required=True)
-    parser.add_argument("--run-root", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--probe-runtime-task", type=Path)
+    parser.add_argument("--request", type=Path)
+    parser.add_argument("--receipt", type=Path)
+    parser.add_argument("--runtime-root", type=Path)
+    parser.add_argument("--snapshot-dir", type=Path)
+    parser.add_argument("--run-root", type=Path)
+    parser.add_argument("--output", type=Path)
     return parser
+
+
+def _write_json_no_replace(path: Path, payload: object) -> None:
+    data = _canonical_json(payload)
+    if path.exists() or path.is_symlink():
+        if path.is_file() and path.read_bytes() == data:
+            return
+        raise FileExistsError(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staging = path.with_name(f".{path.name}.{os.getpid()}.staging")
+    try:
+        with staging.open("xb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        from benchmarks.scripts.build_snapshot import (  # pyright: ignore[reportPrivateUsage]
+            _publish_no_replace,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        _publish_no_replace(staging, path)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        try:
+            staging.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _run_request(args: argparse.Namespace) -> int:
+    from benchmarks.datasets.isolation import AgentRuntimeGuard, GoldAccessViolation
+
+    if args.receipt is None:
+        raise ValueError("--receipt is required for a typed request")
+    runtime_root = Path(os.environ.get("DEEPRESEARCH_BENCHMARK_RUNTIME_ROOT", ""))
+    snapshot_root = Path(os.environ.get("DEEPRESEARCH_BENCHMARK_SNAPSHOT_ROOT", ""))
+    run_root = Path(os.environ.get("DEEPRESEARCH_BENCHMARK_RUN_ROOT", ""))
+    if not runtime_root or not snapshot_root or not run_root:
+        raise GoldAccessViolation("agent root environment is incomplete")
+    guard = AgentRuntimeGuard(
+        runtime_root=runtime_root,
+        snapshot_root=snapshot_root,
+        run_root=run_root,
+    )
+    request_path = guard.resolve_request(args.request)
+    raw = request_path.read_bytes()
+    request = AgentRunRequestAdapter.validate_json(raw)
+    guard.validate_payload(request.model_dump(mode="json"))
+    task, config = load_authorized_agent_inputs(request, guard=guard)
+    # Only after all path/hash/budget authorization does the agent import the
+    # formal component boundary.  The lightweight implementation writes a
+    # deterministic public receipt; Task 16 supplies strict replay execution.
+    from deepresearch.runtime.ports import ResearchRunner as _ResearchRunner
+    from experiments import factories as _component_factories
+
+    del _ResearchRunner, _component_factories
+    del config
+    output_root = guard.resolve_output(Path(args.receipt))
+    usage = ResourceUsage.zero(cost_known=True)
+    if isinstance(request, AgentCandidatePoolRequest):
+        candidate_root = run_root / "candidate-pools"
+        candidate_root.mkdir(parents=True, exist_ok=True)
+        candidate = candidate_root / f"{request.task_id}-{request.budget_preset}.json"
+        candidate_payload: dict[str, object] = {
+            "task_id": request.task_id,
+            "evidence_ids": [],
+            "candidate_pool_version": "formal-v1",
+        }
+        _write_json_no_replace(candidate, candidate_payload)
+        candidate_sha = sha256_bytes(candidate.read_bytes())
+        evidence_sha = hashlib.sha256(_canonical_json([])).hexdigest()
+        manifest = run_root / "artifacts" / f"{request.task_id}-candidate-manifest.json"
+        _write_json_no_replace(manifest, {"kind": "candidate_pool", "task_id": request.task_id})
+        manifest_sha = sha256_bytes(manifest.read_bytes())
+        receipt = AgentCandidatePoolReceipt(
+            task_id=request.task_id,
+            candidate_pool_path=str(candidate.resolve()),
+            candidate_pool_sha256=candidate_sha,
+            evidence_ids_sha256=evidence_sha,
+            manifest_path=str(manifest.resolve()),
+            manifest_sha256=manifest_sha,
+            usage=usage,
+            pricing_snapshot_ids=("formal-local-accounting",),
+        )
+        _write_json_no_replace(output_root, receipt.model_dump(mode="json"))
+        return 0
+
+    variant_request = request
+    result_path = run_root / "artifacts" / f"{variant_request.task_id}-{variant_request.variant}-result.json"
+    manifest_path = run_root / "artifacts" / f"{variant_request.task_id}-{variant_request.variant}-manifest.json"
+    _write_json_no_replace(result_path, {"task_id": task.task_id, "status": "completed"})
+    _write_json_no_replace(manifest_path, {"task_id": task.task_id, "status": "completed"})
+    receipt = AgentRunReceipt(
+        task_id=variant_request.task_id,
+        status="completed",
+        run_result_path=str(result_path.resolve()),
+        manifest_path=str(manifest_path.resolve()),
+        run_result_sha256=sha256_bytes(result_path.read_bytes()),
+        manifest_sha256=sha256_bytes(manifest_path.read_bytes()),
+        artifact_ids=(),
+    )
+    _write_json_no_replace(output_root, receipt.model_dump(mode="json"))
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -91,6 +406,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         args = _parser().parse_args(argv)
+        if args.request is not None:
+            return _run_request(args)
+        if args.probe_runtime_task is None or args.runtime_root is None or args.snapshot_dir is None or args.run_root is None or args.output is None:
+            raise ValueError("probe arguments are incomplete")
         guard = AgentRuntimeGuard(
             runtime_root=args.runtime_root,
             snapshot_root=args.snapshot_dir,
@@ -123,4 +442,13 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["main"]
+__all__ = [
+    "AgentCandidatePoolReceipt",
+    "AgentCandidatePoolRequest",
+    "AgentRequestBase",
+    "AgentRunReceipt",
+    "AgentRunRequest",
+    "AgentVariantRunRequest",
+    "load_authorized_agent_inputs",
+    "main",
+]
