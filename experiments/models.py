@@ -8,14 +8,21 @@ from datetime import datetime
 from enum import StrEnum
 from pathlib import PurePosixPath
 from types import MappingProxyType
-from typing import Annotated, Any, Literal, Self, cast, override
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Self, cast, override
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_serializer, model_validator
 
+from benchmarks.datasets.models import RuntimeTask
 from benchmarks.datasets.validator import canonical_json_bytes, sha256_bytes
 from benchmarks.evaluators.metrics import MetricValue
-from deepresearch.domain import ResourceUsage, RunStatus
-from deepresearch.runtime.manifest import PricingSnapshot, RunManifest
+from deepresearch.domain import ResourceUsage, RunBudget, RunStatus
+from deepresearch.runtime.manifest import (
+    RunManifest,
+    _canonical_bytes,  # pyright: ignore[reportPrivateUsage]
+)
+
+if TYPE_CHECKING:
+    from experiments.config import FormalExperimentConfig
 
 
 def canonical_sha256(value: object) -> str:
@@ -275,33 +282,52 @@ class ExperimentRunResult(SealedModel):
 def task_run_from_manifest(
     manifest: RunManifest,
     *,
-    sealed_pricing: PricingSnapshot,
-    task_id: str,
+    config: FormalExperimentConfig,
+    task: RuntimeTask,
     protocol: ProtocolName,
     variant: ExperimentVariant | RankerComponentVariant,
-    budget_preset: BudgetPreset,
     manifest_path: str,
     status: RunStatus,
     seed: int | None = None,
     repeat_id: int | None = None,
     candidate_pool_hash: str | None = None,
 ) -> ExperimentTaskRun:
-    """Copy reconciled Core accounting only after canonical manifest verification."""
+    """Bind a verified Core manifest to its authorized staged request and budget."""
+    from experiments.config import authorized_staged_task
+
+    task = RuntimeTask.model_validate_json(task.model_dump_json(), strict=True)
+    authorized_staged_task(
+        config,
+        task,
+        staged_sha256=canonical_sha256(task.model_dump(mode="json")),
+        budget_preset=task.request.budget_preset,
+    )
     manifest = RunManifest.model_validate_json(manifest.model_dump_json())
-    if manifest.pricing_status != "estimated" or manifest.pricing_snapshots != (sealed_pricing,):
+    if manifest.pricing_status != "estimated" or manifest.pricing_snapshots != (
+        config.pricing_snapshot,
+    ):
         raise ValueError("manifest pricing must exactly equal the sealed pricing snapshot")
+    # Core hashes ResearchRequest without the benchmark JSONL trailing newline.
+    request_hash = sha256_bytes(_canonical_bytes(task.request.model_dump(mode="json")))
+    if manifest.request_sha256 != request_hash:
+        raise ValueError("manifest request hash does not match the authorized staged task")
+    expected_limits = RunBudget.preset(task.request.budget_preset).model_dump(
+        mode="json", exclude={"used_by_node"}
+    )
+    if manifest.budget.model_dump(mode="json", exclude={"used_by_node"}) != expected_limits:
+        raise ValueError("manifest budget limits do not match the authorized request preset")
     if manifest.workflow_id != "research-v1" or manifest.seed != seed:
         raise ValueError("formal manifest workflow/seed mismatch")
     replay_miss = "REPLAY_MISS" in manifest.failure_codes
     if replay_miss and status != "failed":
         raise ValueError("REPLAY_MISS must have failed status")
     return ExperimentTaskRun(
-        task_id=task_id,
+        task_id=task.task_id,
         protocol=protocol,
         variant=variant,
         planner_id=manifest.planner_id,
         ranker_id=manifest.ranker_id,
-        budget_preset=budget_preset,
+        budget_preset=task.request.budget_preset,
         seed=seed,
         repeat_id=repeat_id,
         status=status,

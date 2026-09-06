@@ -21,8 +21,8 @@ from deepresearch.providers.frozen_search import (
 from deepresearch.providers.parsers.html import HtmlParser
 from deepresearch.providers.parsers.pdf import PdfParser
 from deepresearch.providers.types import ParsedDocument
-from experiments.config import FormalExperimentConfig
-from experiments.models import COMPONENT_IDS, ExperimentVariant
+from experiments.config import FormalExperimentConfig, authorized_staged_task
+from experiments.models import COMPONENT_IDS, ExperimentVariant, canonical_sha256
 
 
 class ComponentContainer(Protocol):
@@ -133,8 +133,15 @@ def formal_run_config(
     if variant == ExperimentVariant.ORACLE:
         raise ValueError("ORACLE is evaluator-only")
     planner_id, ranker_id = COMPONENT_IDS[variant]
-    if task.request.budget_preset not in config.budget_sensitivity_presets:
-        raise ValueError("budget must belong to sealed sensitivity set")
+    task = RuntimeTask.model_validate_json(task.model_dump_json(), strict=True)
+    authorized_staged_task(
+        config,
+        task,
+        staged_sha256=canonical_sha256(task.model_dump(mode="json")),
+        budget_preset=task.request.budget_preset,
+    )
+    if budget != RunBudget.preset(task.request.budget_preset):
+        raise ValueError("formal run budget must match the request preset with unused counters")
     return RunConfig(
         request=task.request,
         workflow_id="research-v1",
