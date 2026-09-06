@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import stat
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
@@ -29,6 +30,7 @@ from benchmarks.evaluators.statistics import (
     paired_stratified_bootstrap,
 )
 from deepresearch.domain import ResourceUsage
+from deepresearch.runtime.manifest import RunManifest
 from experiments.models import (
     EvaluatorReferenceManifest,
     ExperimentTaskRun,
@@ -56,8 +58,32 @@ def _canonical(value: object) -> bytes:
     )
 
 
+def _is_link_or_reparse(path: Path) -> bool:
+    try:
+        details = path.lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISLNK(details.st_mode) or bool(
+        getattr(details, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    )
+
+
+def _assert_summary_path(path: Path, *, label: str) -> Path:
+    absolute = path.absolute()
+    current = absolute
+    while current != Path(current.anchor):
+        if _is_link_or_reparse(current):
+            raise ValueError(f"{label} contains a symlink or reparse point")
+        current = current.parent
+    if _is_link_or_reparse(current):
+        raise ValueError(f"{label} contains a symlink or reparse point")
+    return absolute
+
+
 def _write_reusable(path: Path, payload: bytes) -> None:
-    if path.is_symlink():
+    _assert_summary_path(path.parent, label="summary output parent")
+    if _is_link_or_reparse(path):
         raise FileExistsError(path)
     if path.exists():
         if path.is_file() and path.read_bytes() == payload:
@@ -161,16 +187,58 @@ def _resource_metric(name: str, value: float) -> MetricValue:
 
 
 def _setup_cost_section(experiment_dir: Path) -> dict[str, object]:
+    from experiments.runner import ExperimentRunner
+
     setup_root = experiment_dir / "candidate-pool-setup"
     usages: list[ResourceUsage] = []
     pricing_snapshot_ids: set[str] = set()
+    _assert_summary_path(setup_root, label="candidate pool setup root")
     if not setup_root.exists():
         return {"count": 0, "usage": {}, "pricing_snapshot_ids": []}
     if setup_root.is_symlink() or not setup_root.is_dir():
         raise ValueError("candidate pool setup root is unsafe")
+    group_payload = json.loads((experiment_dir / "group.json").read_bytes())
+    if not isinstance(group_payload, dict):
+        raise TypeError("experiment group metadata is invalid")
+    group = cast(dict[str, object], group_payload)
+    group_id = group.get("group_id")
+    budget_preset = group.get("budget_preset")
+    candidate_pool_seed = group.get("candidate_pool_seed")
+    pricing_snapshot_id = group.get("pricing_snapshot_id")
+    task_map_value = group.get("protocol_task_ids")
+    task_map = (
+        cast(dict[str, object], task_map_value)
+        if isinstance(task_map_value, dict)
+        else None
+    )
+    ranker_task_values = None if task_map is None else task_map.get("ranker_component")
+    if (
+        not isinstance(group_id, str)
+        or not isinstance(budget_preset, str)
+        or not isinstance(candidate_pool_seed, int)
+        or not isinstance(pricing_snapshot_id, str)
+        or task_map is None
+        or not isinstance(ranker_task_values, list)
+    ):
+        raise TypeError("candidate pool setup identity is not sealed")
+    expected_pool_keys = {
+        ExperimentRunner.idempotency_key(
+            group_id,
+            "ranker_component",
+            "POOL",
+            task_id,
+            candidate_pool_seed,
+            None,
+            budget_preset,
+        )
+        for task_id in cast(list[object], ranker_task_values)
+        if isinstance(task_id, str)
+    }
     for path in sorted(setup_root.glob("*.json")):
         if path.is_symlink() or not path.is_file():
             raise ValueError("candidate pool setup artifact is unsafe")
+        if path.stem not in expected_pool_keys:
+            raise ValueError("candidate pool setup filename is not sealed")
         payload = json.loads(path.read_bytes())
         if not isinstance(payload, dict):
             raise TypeError("candidate pool setup artifact is invalid")
@@ -182,6 +250,7 @@ def _setup_cost_section(experiment_dir: Path) -> dict[str, object]:
             "pool_key",
             "candidate_pool_sha256",
             "evidence_ids_sha256",
+            "manifest_path",
             "manifest_sha256",
             "usage",
             "pricing_snapshot_ids",
@@ -191,6 +260,65 @@ def _setup_cost_section(experiment_dir: Path) -> dict[str, object]:
         usage = ResourceUsage.model_validate_json(_canonical(typed["usage"]), strict=True)
         if usage.cost_usd is None or typed["pricing_status"] != "estimated":
             raise ValueError("candidate pool setup cost is not verified")
+        if (
+            typed["group_id"] != group_id
+            or typed["pool_key"] != path.stem
+            or typed["pool_key"] not in expected_pool_keys
+            or not isinstance(typed["task_id"], str)
+            or not isinstance(typed["manifest_path"], str)
+        ):
+            raise ValueError("candidate pool setup identity is invalid")
+        candidate_path = experiment_dir / "candidate-pools" / f"{path.stem}.json"
+        _assert_summary_path(candidate_path, label="candidate pool artifact")
+        if candidate_path.is_symlink() or not candidate_path.is_file():
+            raise ValueError("candidate pool artifact is missing or unsafe")
+        candidate_bytes = candidate_path.read_bytes()
+        if typed["candidate_pool_sha256"] != hashlib.sha256(candidate_bytes).hexdigest():
+            raise ValueError("candidate pool setup hash mismatch")
+        candidate_payload = json.loads(candidate_bytes)
+        if not isinstance(candidate_payload, dict):
+            raise TypeError("candidate pool artifact is invalid")
+        candidate = cast(dict[str, object], candidate_payload)
+        if candidate.get("task_id") != typed["task_id"]:
+            raise ValueError("candidate pool task identity mismatch")
+        evidence_ids_value = candidate.get("evidence_ids")
+        evidence_ids = (
+            cast(list[object], evidence_ids_value)
+            if isinstance(evidence_ids_value, list)
+            else None
+        )
+        if evidence_ids is None:
+            raise ValueError("candidate pool evidence hash mismatch")
+        if any(not isinstance(item, str) or not item for item in evidence_ids):
+            raise ValueError("candidate pool evidence hash mismatch")
+        typed_evidence_ids = cast(list[str], evidence_ids)
+        if typed_evidence_ids != sorted(set(typed_evidence_ids)):
+            raise ValueError("candidate pool evidence hash mismatch")
+        if typed["evidence_ids_sha256"] != hashlib.sha256(
+            _canonical(typed_evidence_ids)
+        ).hexdigest():
+            raise ValueError("candidate pool evidence hash mismatch")
+        manifest_path = Path(typed["manifest_path"])
+        _assert_summary_path(manifest_path, label="candidate pool setup manifest")
+        if (
+            not manifest_path.is_absolute()
+            or ".." in manifest_path.parts
+            or manifest_path.is_symlink()
+            or not manifest_path.is_file()
+            or manifest_path.parent != (experiment_dir / "artifacts").resolve()
+        ):
+            raise ValueError("candidate pool setup manifest path is unsafe")
+        manifest_bytes = manifest_path.read_bytes()
+        if typed["manifest_sha256"] != hashlib.sha256(manifest_bytes).hexdigest():
+            raise ValueError("candidate pool setup manifest hash mismatch")
+        manifest = RunManifest.model_validate_json(manifest_bytes, strict=True)
+        if (
+            manifest.usage != usage
+            or tuple(item.snapshot_id for item in manifest.pricing_snapshots)
+            != (pricing_snapshot_id,)
+            or typed["pricing_snapshot_ids"] != [pricing_snapshot_id]
+        ):
+            raise ValueError("candidate pool setup accounting mismatch")
         raw_pricing_ids = typed["pricing_snapshot_ids"]
         raw_pricing_items = (
             cast(list[object], raw_pricing_ids)
@@ -269,9 +397,12 @@ def _seed_records(
     for run in runs:
         if run.status != "completed" or run.validity != "valid":
             raise ValueError("quality summary requires valid completed raw records")
-        category = run.category or categories.get(run.task_id)
-        if category is None:
-            raise ValueError("task category is required for quality summary")
+        sealed_category = categories.get(run.task_id)
+        if sealed_category is None:
+            raise ValueError("task category is missing from sealed group metadata")
+        if run.category != sealed_category:
+            raise ValueError("raw task category disagrees with sealed group metadata")
+        category = sealed_category
         missing = [name for name in required_quality[run.protocol] if name not in run.metrics]
         if missing:
             raise ValueError("raw record is missing a quality metric")
@@ -693,9 +824,12 @@ def _reference_metadata(
     expected_task_ids: Sequence[str],
     expected_private_manifest_sha256: str,
     expected_evaluator_version: str,
+    expected_dataset_version: str,
 ) -> dict[str, object]:
     oracle_path = experiment_dir / "oracle-reference.jsonl"
     manifest_path = experiment_dir / "evaluator-reference-manifest.json"
+    _assert_summary_path(oracle_path, label="oracle reference")
+    _assert_summary_path(manifest_path, label="evaluator reference manifest")
     if oracle_path.exists() != manifest_path.exists():
         raise ValueError("reference artifacts are incomplete")
     if not oracle_path.exists():
@@ -725,6 +859,7 @@ def _reference_metadata(
         if (
             result.private_manifest_sha256 != manifest.private_manifest_sha256
             or result.evaluator_version != manifest.evaluator_version
+            or result.dataset_version != expected_dataset_version
             or result.created_at != manifest.created_at
         ):
             raise ValueError("oracle reference evaluator identity mismatch")
@@ -740,6 +875,7 @@ def _reference_metadata(
 
 def _verify_manifest(experiment_dir: Path) -> None:
     manifest_path = experiment_dir / "manifest.sha256"
+    _assert_summary_path(manifest_path, label="experiment manifest")
     if not manifest_path.is_file():
         raise ValueError("experiment manifest is missing")
     payload = json.loads(manifest_path.read_bytes())
@@ -765,6 +901,7 @@ def _verify_manifest(experiment_dir: Path) -> None:
         ):
             raise ValueError("experiment manifest contains unsafe entries")
         path = experiment_dir / name
+        _assert_summary_path(path, label=f"experiment artifact {name}")
         if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
             raise ValueError("experiment artifact hash mismatch")
 
@@ -938,7 +1075,12 @@ def summarize_experiment(
     group_id = cast(str, group["group_id"])
     private_manifest_sha256 = raw_group.get("private_manifest_sha256")
     evaluator_version = raw_group.get("evaluator_version")
-    if not isinstance(private_manifest_sha256, str) or not isinstance(evaluator_version, str):
+    dataset_version = raw_group.get("dataset_version")
+    if (
+        not isinstance(private_manifest_sha256, str)
+        or not isinstance(evaluator_version, str)
+        or not isinstance(dataset_version, str)
+    ):
         raise TypeError("experiment group evaluator identity is incomplete")
     oracle_task_ids = _string_list(raw_group.get("oracle_task_ids"), field="oracle_task_ids")
     if len(set(oracle_task_ids)) != len(oracle_task_ids):
@@ -978,6 +1120,7 @@ def summarize_experiment(
             expected_task_ids=oracle_task_ids,
             expected_private_manifest_sha256=private_manifest_sha256,
             expected_evaluator_version=evaluator_version,
+            expected_dataset_version=dataset_version,
         )
         if reference.get("status") != "present":
             raise ValueError("oracle reference artifacts are missing")
@@ -998,6 +1141,7 @@ def summarize_experiment(
         expected_task_ids=oracle_task_ids,
         expected_private_manifest_sha256=private_manifest_sha256,
         expected_evaluator_version=evaluator_version,
+        expected_dataset_version=dataset_version,
     )
     if reference.get("status") != "present":
         raise ValueError("oracle reference artifacts are missing")

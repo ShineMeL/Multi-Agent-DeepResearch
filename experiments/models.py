@@ -212,7 +212,7 @@ class ExperimentTaskRun(SealedModel):
     ranker_id: str
     budget_preset: BudgetPreset
     seed: int | None = None
-    repeat_id: Annotated[int | None, Field(ge=0)] = None
+    repeat_id: Annotated[int | None, Field(ge=1)] = None
     status: RunStatus
     validity: Literal["valid", "invalid"] = "valid"
     error_code: str | None = None

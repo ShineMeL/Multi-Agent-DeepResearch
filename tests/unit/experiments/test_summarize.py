@@ -24,6 +24,10 @@ def _write_full_group(root: Path) -> Path:
     (root / "raw").mkdir(parents=True)
     group = {
         "group_id": "group",
+        "dataset_version": "dataset-v1",
+        "budget_preset": "medium",
+        "candidate_pool_seed": 7,
+        "pricing_snapshot_id": "pricing-v1",
         "private_manifest_sha256": "b" * 64,
         "evaluator_version": "evaluator-v1",
         "protocols": ["ranker_component", "planner_policy", "end_to_end", "reference"],
@@ -223,6 +227,17 @@ def test_summary_fails_closed_when_raw_records_have_no_quality_metrics(tmp_path:
         summarize_experiment(root, bootstrap_resamples=4)
 
 
+def test_summary_does_not_trust_raw_category_over_sealed_group_category(tmp_path: Path) -> None:
+    root = _write_full_group(tmp_path / "group")
+    raw_path = next((root / "raw").glob("*.json"))
+    payload = json.loads(raw_path.read_bytes())
+    payload["category"] = "fact_checking"
+    raw_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="category"):
+        summarize_experiment(root, bootstrap_resamples=4)
+
+
 def test_summary_rejects_raw_filename_that_is_not_the_sealed_identity(tmp_path: Path) -> None:
     root = _write_full_group(tmp_path / "group")
     raw_paths = sorted((root / "raw").glob("*.json"))
@@ -241,6 +256,43 @@ def test_verify_only_detects_tampered_oracle_reference_artifact(tmp_path: Path) 
     )
 
     with pytest.raises(ValueError, match="artifact hash"):
+        summarize_experiment(root, verify_only=True)
+
+
+def test_summary_rejects_oracle_dataset_version_tamper(tmp_path: Path) -> None:
+    root = _write_full_group(tmp_path / "group")
+    oracle_path = root / "oracle-reference.jsonl"
+    payload = json.loads(oracle_path.read_bytes())
+    payload["dataset_version"] = "wrong-dataset"
+    oracle_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    manifest_path = root / "evaluator-reference-manifest.json"
+    manifest_payload = json.loads(manifest_path.read_bytes())
+    manifest_payload["oracle_results_sha256"] = canonical_sha256([payload])
+    manifest_path.write_text(json.dumps(manifest_payload, sort_keys=True), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="dataset|identity|artifact hash"):
+        summarize_experiment(root, bootstrap_resamples=4)
+
+
+def test_summary_rejects_extra_candidate_setup_artifact(tmp_path: Path) -> None:
+    root = _write_full_group(tmp_path / "group")
+    setup_root = root / "candidate-pool-setup"
+    setup_root.mkdir()
+    (setup_root / "extra.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="candidate pool setup"):
+        summarize_experiment(root, bootstrap_resamples=4)
+
+
+def test_summary_verify_only_rejects_output_artifact_symlink(tmp_path: Path) -> None:
+    root = _write_full_group(tmp_path / "group")
+    summarize_experiment(root, bootstrap_resamples=4)
+    target = tmp_path / "summary-target.json"
+    target.write_bytes((root / "summary.json").read_bytes())
+    (root / "summary.json").unlink()
+    (root / "summary.json").symlink_to(target)
+
+    with pytest.raises(ValueError, match="symlink|reparse|artifact"):
         summarize_experiment(root, verify_only=True)
 
 

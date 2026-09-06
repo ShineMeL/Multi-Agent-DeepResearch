@@ -441,12 +441,22 @@ def _parser() -> argparse.ArgumentParser:
 
 def _write_json_no_replace(path: Path, payload: object) -> None:
     data = _canonical_json(payload)
-    if path.exists() or path.is_symlink():
-        if path.is_file() and path.read_bytes() == data:
+    absolute = path.absolute()
+    current = absolute.parent
+    while current != Path(current.anchor):
+        if _is_link_or_reparse(current):
+            raise ValueError("agent artifact parent contains a symlink or reparse point")
+        current = current.parent
+    if _is_link_or_reparse(current):
+        raise ValueError("agent artifact parent contains a symlink or reparse point")
+    if _is_link_or_reparse(absolute):
+        raise ValueError("agent artifact path is a symlink or reparse point")
+    if absolute.exists() or absolute.is_symlink():
+        if absolute.is_file() and absolute.read_bytes() == data:
             return
-        raise FileExistsError(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    staging = path.with_name(f".{path.name}.{os.getpid()}.staging")
+        raise FileExistsError(absolute)
+    absolute.parent.mkdir(parents=True, exist_ok=True)
+    staging = absolute.with_name(f".{absolute.name}.{os.getpid()}.staging")
     try:
         with staging.open("xb") as handle:
             handle.write(data)
@@ -456,7 +466,7 @@ def _write_json_no_replace(path: Path, payload: object) -> None:
             _publish_no_replace,  # pyright: ignore[reportPrivateUsage]
         )
 
-        _publish_no_replace(staging, path)  # pyright: ignore[reportPrivateUsage]
+        _publish_no_replace(staging, absolute)  # pyright: ignore[reportPrivateUsage]
     finally:
         try:
             staging.unlink()
@@ -469,11 +479,18 @@ def _run_request(args: argparse.Namespace) -> int:
 
     if args.receipt is None:
         raise ValueError("--receipt is required for a typed request")
-    runtime_root = Path(os.environ.get("DEEPRESEARCH_BENCHMARK_RUNTIME_ROOT", ""))
-    snapshot_root = Path(os.environ.get("DEEPRESEARCH_BENCHMARK_SNAPSHOT_ROOT", ""))
-    run_root = Path(os.environ.get("DEEPRESEARCH_BENCHMARK_RUN_ROOT", ""))
-    if not runtime_root or not snapshot_root or not run_root:
-        raise GoldAccessViolation("agent root environment is incomplete")
+    def environment_root(name: str) -> Path:
+        raw = os.environ.get(name)
+        if raw is None or not raw.strip():
+            raise GoldAccessViolation("agent root environment is incomplete")
+        path = Path(raw)
+        if not path.is_absolute() or ".." in path.parts:
+            raise GoldAccessViolation("agent root environment is invalid")
+        return path
+
+    runtime_root = environment_root("DEEPRESEARCH_BENCHMARK_RUNTIME_ROOT")
+    snapshot_root = environment_root("DEEPRESEARCH_BENCHMARK_SNAPSHOT_ROOT")
+    run_root = environment_root("DEEPRESEARCH_BENCHMARK_RUN_ROOT")
     guard = AgentRuntimeGuard(
         runtime_root=runtime_root,
         snapshot_root=snapshot_root,
@@ -498,7 +515,7 @@ def _run_request(args: argparse.Namespace) -> int:
         # Candidate pools are an evaluator-promoted input.  The child may
         # publish only into its writable staging subtree; it must never write
         # directly into the shared protected pool directory.
-        candidate_root = run_root / "staging"
+        candidate_root = guard.resolve_output(guard.run_root / "staging")
         candidate_root.mkdir(parents=True, exist_ok=True)
         candidate = guard.resolve_output(
             candidate_root / f"{request.task_id}-{request.budget_preset}-candidate-pool.json"
@@ -511,7 +528,9 @@ def _run_request(args: argparse.Namespace) -> int:
         _write_json_no_replace(candidate, candidate_payload)
         candidate_sha = sha256_bytes(candidate.read_bytes())
         evidence_sha = hashlib.sha256(_canonical_json([])).hexdigest()
-        manifest = run_root / "artifacts" / f"{request.task_id}-candidate-manifest.json"
+        manifest = guard.resolve_output(
+            guard.run_root / "artifacts" / f"{request.task_id}-candidate-manifest.json"
+        )
         _write_json_no_replace(manifest, {"kind": "candidate_pool", "task_id": request.task_id})
         manifest_sha = sha256_bytes(manifest.read_bytes())
         receipt = AgentCandidatePoolReceipt(
@@ -528,8 +547,16 @@ def _run_request(args: argparse.Namespace) -> int:
         return 0
 
     variant_request = request
-    result_path = run_root / "artifacts" / f"{variant_request.task_id}-{variant_request.variant}-result.json"
-    manifest_path = run_root / "artifacts" / f"{variant_request.task_id}-{variant_request.variant}-manifest.json"
+    result_path = guard.resolve_output(
+        guard.run_root
+        / "artifacts"
+        / f"{variant_request.task_id}-{variant_request.variant}-result.json"
+    )
+    manifest_path = guard.resolve_output(
+        guard.run_root
+        / "artifacts"
+        / f"{variant_request.task_id}-{variant_request.variant}-manifest.json"
+    )
     _write_json_no_replace(result_path, {"task_id": task.task_id, "status": "completed"})
     _write_json_no_replace(manifest_path, {"task_id": task.task_id, "status": "completed"})
     receipt = AgentRunReceipt(
@@ -558,7 +585,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         assert_agent_environment(os.environ)
     except GoldAccessViolation as error:
-        print(error.code, file=sys.stderr)
+        print(f"{error.code}: {error}", file=sys.stderr)
         return 3
 
     try:
@@ -588,7 +615,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
     except GoldAccessViolation as error:
-        print(error.code, file=sys.stderr)
+        print(f"{error.code}: {error}", file=sys.stderr)
         return 3
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         print("SNAPSHOT_OR_RUNTIME_INVALID", file=sys.stderr)

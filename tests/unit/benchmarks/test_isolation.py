@@ -157,6 +157,19 @@ def test_agent_runtime_guard_rejects_lexical_traversal_and_root_symlink(
         AgentRuntimeGuard(runtime_root=linked_runtime, snapshot_root=snapshots, run_root=run)
 
 
+def test_agent_artifact_output_rejects_artifacts_subtree_symlink(tmp_path: Path) -> None:
+    from benchmarks.processes.agent import _write_json_no_replace
+
+    run = tmp_path / "run"
+    run.mkdir()
+    target = tmp_path / "artifact-target"
+    target.mkdir()
+    (run / "artifacts").symlink_to(target, target_is_directory=True)
+
+    with pytest.raises((GoldAccessViolation, ValueError, OSError), match="symlink|reparse|artifact"):
+        _write_json_no_replace(run / "artifacts" / "result.json", {"status": "ok"})
+
+
 def test_snapshot_manifest_rejects_file_symlink(tmp_path: Path) -> None:
     from benchmarks.processes.agent import _verify_snapshot
 

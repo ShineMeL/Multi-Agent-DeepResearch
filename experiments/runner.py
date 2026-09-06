@@ -180,15 +180,23 @@ class ExperimentRunner:
         self._task_loader = task_loader
         self.experiment_root = Path(experiment_root)
         self.repo_root = (repo_root or Path.cwd()).resolve()
-        self.private_root = (
-            Path(private_root).resolve()
+        private_root_path = _assert_lexically_safe(
+            Path(private_root)
             if private_root is not None
-            else self.repo_root / "benchmarks" / "private"
+            else self.repo_root / "benchmarks" / "private",
+            label="private root",
+        )
+        snapshot_root_path = _assert_lexically_safe(
+            Path(snapshot_root)
+            if snapshot_root is not None
+            else self.repo_root / "benchmarks" / "snapshots",
+            label="snapshot root",
+        )
+        self.private_root = (
+            private_root_path.resolve()
         )
         self.snapshot_root = (
-            Path(snapshot_root).resolve()
-            if snapshot_root is not None
-            else self.repo_root / "benchmarks" / "snapshots"
+            snapshot_root_path.resolve()
         )
         self.config_source = (
             _assert_lexically_safe(Path(config_source), label="sealed config source")
@@ -347,6 +355,9 @@ class ExperimentRunner:
                 "reference": [config.budget_preset],
             },
             "cost_subset_task_ids": list(config.cost_subset_task_ids),
+            "budget_preset": config.budget_preset,
+            "candidate_pool_seed": config.replication.candidate_pool_seed,
+            "pricing_snapshot_id": config.pricing_snapshot.snapshot_id,
             "replication": {
                 "mode": "seeds" if self.seed_supported else "independent_repeats",
                 "seed_supported": self.seed_supported,
@@ -442,6 +453,16 @@ class ExperimentRunner:
         path = group_root / "config" / "formal.yaml"
         payload = path.read_bytes()
         return path, sha256_bytes(payload)
+
+    @staticmethod
+    def _is_sha256(value: object) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and value == value.lower()
+            and value != "0" * 64
+            and all(character in "0123456789abcdef" for character in value)
+        )
 
     @staticmethod
     def _validate_setup_manifest(
@@ -602,9 +623,122 @@ class ExperimentRunner:
             parsed[name] = typed
         return parsed
 
+    def _bind_unseeded_receipt(
+        self,
+        *,
+        group_root: Path,
+        config: FormalExperimentConfig,
+        task: RuntimeTask,
+        protocol: Protocol,
+        variant: ExperimentVariant | RankerComponentVariant,
+        budget: BudgetPreset,
+        repeat_id: int,
+        request_sha256: str,
+        receipt_identity: str,
+        manifest_provenance: Mapping[str, object],
+    ) -> None:
+        """Persist the missing repeat identity beside the Core receipt.
+
+        Core's public receipt/manifest intentionally has no ``repeat_id``.
+        This evaluator-owned, content-addressed sidecar binds that receipt to
+        the sealed request identity and prevents one manifest from being
+        accepted for two unseeded repeats.
+        """
+        if self.seed_supported:
+            raise ValueError("unseeded receipt binding is not valid for seeded runs")
+        if repeat_id < 1 or repeat_id > config.replication.unseeded_repeat_count:
+            raise ValueError("repeat_id is outside the sealed replication policy")
+        if not self._is_sha256(request_sha256) or not self._is_sha256(receipt_identity):
+            raise ValueError("replication binding hashes are invalid")
+        required_provenance = {"manifest_sha256", "run_id", "thread_id"}
+        if set(manifest_provenance) != required_provenance:
+            raise ValueError("manifest provenance is incomplete")
+        manifest_sha256 = manifest_provenance["manifest_sha256"]
+        if not self._is_sha256(manifest_sha256):
+            raise ValueError("manifest provenance hash is invalid")
+        run_id = manifest_provenance["run_id"]
+        thread_id = manifest_provenance["thread_id"]
+        if (
+            not isinstance(run_id, str)
+            or not run_id
+            or not isinstance(thread_id, str)
+            or not thread_id
+        ):
+            raise ValueError("manifest provenance identity is invalid")
+        payload: dict[str, object] = {
+            "schema_version": "unseeded-replication-binding-v1",
+            "group_id": config.experiment_group_id(),
+            "task_id": task.task_id,
+            "protocol": protocol,
+            "variant": variant.value,
+            "budget_preset": budget,
+            "repeat_id": repeat_id,
+            "request_sha256": request_sha256,
+            "receipt_identity": receipt_identity,
+            "manifest_provenance": {
+                "manifest_sha256": manifest_sha256,
+                "run_id": run_id,
+                "thread_id": thread_id,
+            },
+        }
+        binding_root = group_root / "artifacts" / "replication-bindings"
+        _assert_lexically_safe(binding_root, label="replication binding directory")
+        for path in sorted(binding_root.glob("*.json")) if binding_root.is_dir() else ():
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("replication binding artifact is unsafe")
+            existing = json.loads(path.read_bytes())
+            if not isinstance(existing, dict):
+                raise TypeError("replication binding artifact is invalid")
+            typed_existing = cast(dict[str, object], existing)
+            if set(typed_existing) != set(payload):
+                raise ValueError("replication binding schema is invalid")
+            existing_request_sha256 = typed_existing.get("request_sha256")
+            existing_receipt_identity = typed_existing.get("receipt_identity")
+            existing_repeat_id = typed_existing.get("repeat_id")
+            existing_provenance = typed_existing.get("manifest_provenance")
+            if (
+                not isinstance(existing_request_sha256, str)
+                or not self._is_sha256(existing_request_sha256)
+                or path.stem != existing_request_sha256
+                or not isinstance(existing_receipt_identity, str)
+                or not self._is_sha256(existing_receipt_identity)
+                or type(existing_repeat_id) is not int
+                or existing_repeat_id < 1
+                or existing_repeat_id > config.replication.unseeded_repeat_count
+                or not isinstance(existing_provenance, dict)
+            ):
+                raise ValueError("replication binding identity is invalid")
+            typed_provenance = cast(dict[object, object], existing_provenance)
+            if set(typed_provenance) != {"manifest_sha256", "run_id", "thread_id"}:
+                raise ValueError("replication binding provenance is invalid")
+            if (
+                not self._is_sha256(typed_provenance["manifest_sha256"])
+                or not isinstance(typed_provenance["run_id"], str)
+                or not typed_provenance["run_id"]
+                or not isinstance(typed_provenance["thread_id"], str)
+                or not typed_provenance["thread_id"]
+            ):
+                raise ValueError("replication binding provenance is invalid")
+            if (
+                typed_existing.get("group_id") != config.experiment_group_id()
+                or typed_existing.get("task_id") != task.task_id
+                or typed_existing.get("protocol") != protocol
+                or typed_existing.get("variant") != variant.value
+                or typed_existing.get("budget_preset") != budget
+            ):
+                raise ValueError("replication binding experiment identity mismatch")
+            if (
+                existing_receipt_identity == receipt_identity
+                and existing_repeat_id != repeat_id
+            ):
+                raise ValueError("receipt identity is bound to another repeat")
+        binding_path = binding_root / f"{request_sha256}.json"
+        _write_immutable(binding_path, _canonical(payload))
+
     def _validate_agent_receipt(
         self,
         *,
+        request: AgentRunRequest,
         config: FormalExperimentConfig,
         group_root: Path,
         protocol: Protocol,
@@ -700,6 +834,25 @@ class ExperimentRunner:
             repeat_id=repeat_id,
             candidate_pool_hash=candidate_pool_hash,
         )
+        if not self.seed_supported:
+            if request.seed is not None or request.repeat_id != repeat_id:
+                raise ValueError("request repeat identity does not match receipt binding")
+            self._bind_unseeded_receipt(
+                group_root=group_root,
+                config=config,
+                task=task,
+                protocol=protocol,
+                variant=variant,
+                budget=budget,
+                repeat_id=cast(int, repeat_id),
+                request_sha256=sha256_bytes(_canonical(request.model_dump(mode="json"))),
+                receipt_identity=sha256_bytes(_canonical(parsed.model_dump(mode="json"))),
+                manifest_provenance={
+                    "manifest_sha256": parsed.manifest_sha256,
+                    "run_id": manifest.run_id,
+                    "thread_id": manifest.thread_id,
+                },
+            )
         return _ValidatedAgentRun(
             receipt=parsed,
             manifest=manifest,
@@ -1109,22 +1262,38 @@ class ExperimentRunner:
                     key=key,
                     forced_error_code="RESUME_CHECKPOINT_INVALID",
                 )
-        request, _, _ = await self._stage_request(
-            config=config,
-            group_root=group_root,
-            task=task,
-            task_id=task_id,
-            protocol=protocol,
-            variant=variant,
-            budget=budget_preset,
-            seed=selected_seed,
-            repeat_id=selected_repeat,
-            candidate_pool_path=candidate_pool_path,
-            candidate_pool_hash=candidate_pool_hash,
-            resume_checkpoint_path=staged_checkpoint,
-            resume_checkpoint_sha256=staged_checkpoint_sha256,
-            resume_checkpoint_ref=resume_checkpoint_ref,
-        )
+        try:
+            request, _, _ = await self._stage_request(
+                config=config,
+                group_root=group_root,
+                task=task,
+                task_id=task_id,
+                protocol=protocol,
+                variant=variant,
+                budget=budget_preset,
+                seed=selected_seed,
+                repeat_id=selected_repeat,
+                candidate_pool_path=candidate_pool_path,
+                candidate_pool_hash=candidate_pool_hash,
+                resume_checkpoint_path=staged_checkpoint,
+                resume_checkpoint_sha256=staged_checkpoint_sha256,
+                resume_checkpoint_ref=resume_checkpoint_ref,
+            )
+        except Exception:  # noqa: BLE001 - staging failures are auditable
+            return self._record(
+                config=config,
+                group_root=group_root,
+                protocol=protocol,
+                variant=variant,
+                task=task,
+                budget=budget_preset,
+                seed=selected_seed,
+                repeat_id=selected_repeat,
+                candidate_pool_hash=candidate_pool_hash,
+                receipt=None,
+                key=key,
+                forced_error_code="AGENT_REQUEST_STAGE_FAILED",
+            )
         try:
             receipt = await self._call_launcher(request)
         except Exception:  # noqa: BLE001 - child failures become auditable records
@@ -1144,6 +1313,7 @@ class ExperimentRunner:
             )
         try:
             validated = self._validate_agent_receipt(
+                request=request,
                 config=config,
                 group_root=group_root,
                 protocol=protocol,
@@ -1220,6 +1390,8 @@ class ExperimentRunner:
         setup_path = group_root / "candidate-pool-setup" / f"{request_key}.json"
         request_path = group_root / "requests" / f"{request_key}.json"
         try:
+            _assert_lexically_safe(path.parent, label="candidate pool input subtree")
+            _assert_lexically_safe(setup_path.parent, label="candidate pool setup subtree")
             # Setup is immutable and paid once per (group, task, pool seed).
             # Reusing a promoted pool without its matching setup accounting is
             # ambiguous, so a partial or inconsistent pair fails closed.
@@ -1242,6 +1414,7 @@ class ExperimentRunner:
                     "pool_key",
                     "candidate_pool_sha256",
                     "evidence_ids_sha256",
+                    "manifest_path",
                     "manifest_sha256",
                     "usage",
                     "pricing_snapshot_ids",
@@ -1256,12 +1429,18 @@ class ExperimentRunner:
                     or typed_setup["pricing_status"] != "estimated"
                 ):
                     raise ValueError("candidate pool setup identity mismatch")
+                if setup_path.name != f"{request_key}.json":
+                    raise ValueError("candidate pool setup filename is not pool-bound")
+                if not self._is_sha256(typed_setup["candidate_pool_sha256"]):
+                    raise ValueError("candidate pool setup candidate hash is invalid")
+                if not self._is_sha256(typed_setup["evidence_ids_sha256"]):
+                    raise ValueError("candidate pool setup evidence hash is invalid")
+                if not self._is_sha256(typed_setup["manifest_sha256"]):
+                    raise ValueError("candidate pool setup manifest hash is invalid")
                 candidate_bytes = path.read_bytes()
                 candidate_hash = sha256_bytes(candidate_bytes)
                 if typed_setup["candidate_pool_sha256"] != candidate_hash:
                     raise ValueError("candidate pool setup hash mismatch")
-                if not isinstance(typed_setup["evidence_ids_sha256"], str):
-                    raise ValueError("candidate pool setup evidence hash is invalid")
                 setup_usage = ResourceUsage.model_validate_json(
                     _canonical(typed_setup["usage"]), strict=True
                 )
@@ -1269,8 +1448,28 @@ class ExperimentRunner:
                 if (
                     setup_usage.cost_usd is None
                     or setup_pricing != [config.pricing_snapshot.snapshot_id]
+                    or not isinstance(typed_setup["manifest_path"], str)
                 ):
                     raise ValueError("candidate pool setup accounting is inconsistent")
+                manifest_path, manifest_bytes = self._read_verified_artifact(
+                    typed_setup["manifest_path"],
+                    expected_sha256=cast(str, typed_setup["manifest_sha256"]),
+                    group_root=group_root,
+                )
+                if manifest_path.parent != (group_root / "artifacts").resolve():
+                    raise ValueError("candidate pool setup manifest is not an artifact")
+                manifest = RunManifest.model_validate_json(manifest_bytes, strict=True)
+                self._validate_setup_manifest(
+                    manifest,
+                    config=config,
+                    task=task,
+                    seed=config.replication.candidate_pool_seed,
+                    planner_id="P1",
+                )
+                if manifest.usage != setup_usage or tuple(
+                    item.snapshot_id for item in manifest.pricing_snapshots
+                ) != tuple(cast(list[str], setup_pricing)):
+                    raise ValueError("candidate pool setup manifest accounting mismatch")
                 candidate_payload = json.loads(candidate_bytes)
                 if not isinstance(candidate_payload, dict):
                     raise ValueError("candidate pool payload is invalid")
@@ -1384,6 +1583,7 @@ class ExperimentRunner:
                         "pool_key": request_key,
                         "candidate_pool_sha256": sha256_bytes(candidate_bytes),
                         "evidence_ids_sha256": receipt.evidence_ids_sha256,
+                        "manifest_path": str(receipt.manifest_path),
                         "manifest_sha256": receipt.manifest_sha256,
                         "usage": manifest.usage.model_dump(mode="json"),
                         "pricing_snapshot_ids": list(receipt.pricing_snapshot_ids),
@@ -1397,6 +1597,51 @@ class ExperimentRunner:
             # empty or evaluator-authored fallback pool would turn failure into
             # an apparently comparable ranker result, so fail closed here.
             return None
+
+    def _record_candidate_pool_failure(
+        self,
+        *,
+        config: FormalExperimentConfig,
+        group_root: Path,
+        task: RuntimeTask,
+        variant: RankerComponentVariant,
+        budget: BudgetPreset,
+        seed: int | None,
+        repeat_id: int | None,
+        key: str,
+    ) -> ExperimentTaskRun:
+        failed = self._failure_record(
+            config=config,
+            group_root=group_root,
+            protocol="ranker_component",
+            variant=variant,
+            task=task,
+            budget=budget,
+            seed=seed,
+            repeat_id=repeat_id,
+            candidate_pool_hash=None,
+            key=key,
+            error_code="CANDIDATE_POOL_INVALID",
+        )
+        raw_path = self._raw_path(group_root, key)
+        existing = self._load_existing(raw_path)
+        if existing is not None:
+            if existing.status == "completed":
+                # A completed record is immutable and must not be reused when
+                # its required pool has become invalid. Keep an additional
+                # auditable failure outside ``raw/`` rather than replacing the
+                # completed idempotency record or deleting a prior failure.
+                audit_path = (
+                    group_root
+                    / "artifacts"
+                    / "candidate-pool-failures"
+                    / f"{key}.json"
+                )
+                _write_immutable(audit_path, _canonical(failed.model_dump(mode="json")))
+                return failed
+            return existing
+        _write_immutable(raw_path, _canonical(failed.model_dump(mode="json")))
+        return failed
 
     async def _run_variants(
         self,
@@ -1412,7 +1657,46 @@ class ExperimentRunner:
         for task_id in task_ids:
             task = await self._task(task_id)
             if protocol == "ranker_component":
-                pool = await self._candidate_pool(config=config, task=task)
+                group_root = self._group_root(config)
+                pool_key = self._idempotency_key(
+                    config.experiment_group_id(),
+                    "ranker_component",
+                    "POOL",
+                    task.task_id,
+                    config.replication.candidate_pool_seed,
+                    None,
+                    config.budget_preset,
+                )
+                pool_path = group_root / "candidate-pools" / f"{pool_key}.json"
+                setup_path = group_root / "candidate-pool-setup" / f"{pool_key}.json"
+                replications = await self._replications(config)
+                prior_arm_attempt = any(
+                    self._load_existing(
+                        self._raw_path(
+                            group_root,
+                            self._idempotency_key(
+                                config.experiment_group_id(),
+                                protocol,
+                                variant.value,
+                                task_id,
+                                seed,
+                                repeat,
+                                budget or config.budget_preset,
+                            ),
+                        )
+                    )
+                    is not None
+                    for variant in variants
+                    for seed, repeat in replications
+                )
+                # Once a consumer attempt exists, a missing promoted pool is
+                # not permission to launch setup again. That would let a
+                # deleted pool silently resurrect completed/failed arms without
+                # an explicit resume decision.
+                if prior_arm_attempt and not (pool_path.exists() or setup_path.exists()):
+                    pool = None
+                else:
+                    pool = await self._candidate_pool(config=config, task=task)
                 if pool is None:
                     for variant in variants:
                         for seed, repeat in await self._replications(config):
@@ -1425,28 +1709,19 @@ class ExperimentRunner:
                                 repeat,
                                 budget or config.budget_preset,
                             )
-                            failed = self._failure_record(
+                            if not isinstance(variant, RankerComponentVariant):
+                                raise TypeError("ranker protocol variant is invalid")
+                            failed = self._record_candidate_pool_failure(
                                 config=config,
                                 group_root=self._group_root(config),
-                                protocol=protocol,
                                 variant=variant,
                                 task=task,
                                 budget=budget or config.budget_preset,
                                 seed=seed,
                                 repeat_id=repeat,
-                                candidate_pool_hash=None,
                                 key=key,
-                                error_code="CANDIDATE_POOL_INVALID",
                             )
-                            raw_path = self._raw_path(self._group_root(config), key)
-                            existing = self._load_existing(raw_path)
-                            if existing is not None and existing.status == "completed":
-                                runs.append(existing)
-                            else:
-                                if existing is not None:
-                                    raw_path.unlink()
-                                _write_immutable(raw_path, _canonical(failed.model_dump(mode="json")))
-                                runs.append(failed)
+                            runs.append(failed)
                     continue
                 pools[task_id] = pool
             for variant in variants:
