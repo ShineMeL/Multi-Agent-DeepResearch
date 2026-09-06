@@ -261,6 +261,50 @@ class DatasetValidator:
                     f"task {question.task_id}: direct-support evidence {span.evidence_id} "
                     "was published after evaluation_cutoff"
                 )
+        if question.category == TaskCategory.SOURCE_CONFLICT:
+            errors.extend(self._validate_source_conflict(question, snapshot))
+        return _stable_messages(errors)
+
+    @staticmethod
+    def _validate_source_conflict(
+        question: AnnotatedQuestion, snapshot: FrozenCorpusSnapshot
+    ) -> tuple[str, ...]:
+        families = {record.evidence_id: record.source_family_id for record in snapshot.records}
+        evidence_relations: dict[str, set[str]] = {}
+        context_claims: set[str] = set()
+        independent_conflict = False
+        for group in question.gold_claim_links:
+            sides: dict[str, set[str]] = {"support": set(), "contradict": set()}
+            relations = {link.relation for link in group.evidence_links}
+            if relations == {"context"}:
+                context_claims.add(group.claim_id)
+            for link in group.evidence_links:
+                evidence_relations.setdefault(link.evidence_id, set()).add(link.relation)
+                if link.relation in sides and link.evidence_id in families:
+                    sides[link.relation].add(families[link.evidence_id])
+            independent_conflict |= any(
+                support != contradict
+                for support in sides["support"]
+                for contradict in sides["contradict"]
+            )
+        errors: list[str] = []
+        if not independent_conflict:
+            errors.append(
+                f"task {question.task_id}: source_conflict requires independent support and "
+                "contradict evidence for the same claim"
+            )
+        for span in question.gold_evidence_spans:
+            if evidence_relations.get(span.evidence_id) == {"context"} and span.relevance_grade > 1:
+                errors.append(
+                    f"task {question.task_id}: context-only evidence must have relevance_grade <= 1 "
+                    f"({span.evidence_id})"
+                )
+        for need in question.information_needs:
+            if need.importance > 0.1 and context_claims.intersection(need.acceptable_claim_ids):
+                errors.append(
+                    f"task {question.task_id}: context-only claims cannot carry high-importance "
+                    f"needs ({need.need_id})"
+                )
         return _stable_messages(errors)
 
     def validate_records(

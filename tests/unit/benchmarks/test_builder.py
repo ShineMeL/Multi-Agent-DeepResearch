@@ -120,6 +120,13 @@ def _write_complete_private_dataset(private_root: Path, snapshot_root: Path) -> 
                     ),
                 }
             )
+            if category == TaskCategory.SOURCE_CONFLICT:
+                payload = question.model_dump(mode="json")
+                payload["gold_claim_links"][0]["evidence_links"].append(
+                    {"evidence_id": "ev-pdf", "relation": "contradict"}
+                )
+                payload["gold_claim_links"][1]["evidence_links"][0]["relation"] = "support"
+                question = AnnotatedQuestion.model_validate_json(json.dumps(payload), strict=True)
             records.append(_write_snapshot(question, snapshot_root))
         (batches / f"{category.value}.jsonl").write_bytes(
             b"".join(record.model_dump_json().encode("utf-8") + b"\n" for record in records)

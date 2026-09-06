@@ -30,6 +30,63 @@ def _question() -> AnnotatedQuestion:
     return AnnotatedQuestion.model_validate_json(TEMPLATE.read_bytes(), strict=True)
 
 
+@pytest.mark.parametrize(
+    ("case", "expected_error"),
+    [
+        ("valid", None),
+        ("missing_contradiction", "independent support and contradict"),
+        ("different_claims", "independent support and contradict"),
+        ("same_family", "independent support and contradict"),
+        ("background_grade", "context-only evidence must have relevance_grade <= 1"),
+        ("background_need", "context-only claims cannot carry high-importance needs"),
+    ],
+)
+def test_source_conflict_requires_independent_sides_and_bounded_context(
+    tmp_path: Path, case: str, expected_error: str | None
+) -> None:
+    # Entirely synthetic: no private benchmark prompts, claims or source identities.
+    payload = _question().model_dump(mode="json")
+    payload["category"] = "source_conflict"
+    background = dict(payload["gold_evidence_spans"][0])
+    background.update(evidence_id="ev-context", source_id="src-context", relevance_grade=1)
+    payload["gold_evidence_spans"].append(background)
+    payload["candidate_source_ids"].append("src-context")
+    payload["gold_source_family_ids"].append("example.test/context")
+    payload["gold_claim_links"][0]["evidence_links"] = [
+        {"evidence_id": "ev-html", "relation": "support"},
+        {"evidence_id": "ev-pdf", "relation": "contradict"},
+    ]
+    payload["gold_claim_links"][1]["evidence_links"] = [
+        {"evidence_id": "ev-html", "relation": "support"},
+        {"evidence_id": "ev-context", "relation": "context"},
+    ]
+    if case == "missing_contradiction":
+        payload["gold_claim_links"][0]["evidence_links"].pop()
+    elif case == "different_claims":
+        link = payload["gold_claim_links"][0]["evidence_links"].pop()
+        payload["gold_claim_links"][1]["evidence_links"] = [link]
+    elif case == "same_family":
+        payload["gold_claim_links"][0]["evidence_links"][1]["evidence_id"] = "ev-html"
+    elif case == "background_grade":
+        background["relevance_grade"] = 3
+    elif case == "background_need":
+        payload["gold_claim_links"][1]["evidence_links"].pop(0)
+    question = _write_snapshot(
+        AnnotatedQuestion.model_validate_json(json.dumps(payload), strict=True), tmp_path
+    )
+
+    report = DatasetValidator(snapshot_root=tmp_path).validate_records(
+        (question,), batch_id="synthetic-conflict", expected_category=TaskCategory.SOURCE_CONFLICT,
+        expected_count=1,
+    )
+
+    if expected_error is None:
+        assert report.valid, report.errors
+    else:
+        assert not report.valid
+        assert any(expected_error in error for error in report.errors)
+
+
 def test_batch_requires_exactly_ten_records(tmp_path: Path) -> None:
     batch_path = tmp_path / "technical_survey.jsonl"
     batch_path.write_bytes(
