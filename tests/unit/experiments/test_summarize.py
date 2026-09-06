@@ -32,9 +32,14 @@ def _write_full_group(root: Path) -> Path:
     config, task = _config_and_task()
     task = task.model_copy(update={"task_id": "test-a"})
     pricing = config.pricing_snapshot.model_copy(update={"snapshot_id": "pricing-v1"})
+    replication = config.replication.model_copy(
+        update={"seed_values": (1,), "candidate_pool_seed": 7}
+    )
     config = config.model_copy(
         update={
             "pricing_snapshot": pricing,
+            "replication": replication,
+            "budget_sensitivity_presets": ("medium",),
             "main_test_task_ids": ("test-a",),
             "stability_task_ids": ("test-a",),
             "cost_subset_task_ids": ("test-a",),
@@ -52,13 +57,14 @@ def _write_full_group(root: Path) -> Path:
     (root / "config").mkdir()
     (root / "config" / "formal.yaml").write_bytes(config_bytes)
     group = {
+        "schema_version": "formal-experiment-group-v1",
         "group_id": group_id,
-        "dataset_version": "dataset-v1",
+        "dataset_version": config.dataset_version,
         "budget_preset": "medium",
         "candidate_pool_seed": 7,
         "pricing_snapshot_id": "pricing-v1",
         "code_commit": "a" * 40,
-        "private_manifest_sha256": "b" * 64,
+        "private_manifest_sha256": config.private_manifest_sha256,
         "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
         "evaluator_version": "evaluator-v1",
         "protocols": ["ranker_component", "planner_policy", "end_to_end", "reference"],
@@ -76,7 +82,7 @@ def _write_full_group(root: Path) -> Path:
             "end_to_end": ["A", "B", "C", "D"],
             "reference": ["P0"],
         },
-        "budgets": ["medium"],
+        "budgets": list(config.budget_sensitivity_presets),
         "required_budgets": {
             "ranker_component": ["medium"],
             "planner_policy": ["medium"],
@@ -293,8 +299,8 @@ def _write_full_group(root: Path) -> Path:
     created_at = datetime(2026, 9, 6, tzinfo=UTC)
     oracle_result = OracleReferenceResult(
         task_id="test-a",
-        dataset_version="dataset-v1",
-        private_manifest_sha256="b" * 64,
+        dataset_version=config.dataset_version,
+        private_manifest_sha256=config.private_manifest_sha256,
         frozen_snapshot_id="snapshot-test-a",
         approved_id_set_sha256="c" * 64,
         metric_values={
@@ -408,6 +414,19 @@ def test_summary_rejects_extra_candidate_setup_artifact(tmp_path: Path) -> None:
     (setup_root / "extra.json").write_text("{}", encoding="utf-8")
 
     with pytest.raises(ValueError, match="candidate pool setup"):
+        summarize_experiment(root, bootstrap_resamples=4)
+
+
+def test_summary_rejects_group_category_seal_tampering(tmp_path: Path) -> None:
+    root = _write_full_group(tmp_path / "group")
+    group_path = root / "group.json"
+    group = json.loads(group_path.read_bytes())
+    # Keep the forged value within the public enum.  The rejection must come
+    # from the staged RuntimeTask provenance, not merely enum validation.
+    group["task_categories"]["test-a"] = "method_comparison"
+    group_path.write_bytes(canonical_json_bytes(group))
+
+    with pytest.raises(ValueError, match="group|budget|seal|config"):
         summarize_experiment(root, bootstrap_resamples=4)
 
 
@@ -578,6 +597,11 @@ def test_summary_rejects_receipt_identity_reused_across_unseeded_repeats(
     binding_paths[2].unlink()
     try:
         assert len(_load_replication_bindings(root, group=group, runs=[runs[0]])) == 1
+        failed_run = runs[0].model_copy(
+            update={"status": "failed", "validity": "invalid", "error_code": "EVALUATOR_VALIDATION_FAILED"}
+        )
+        with pytest.raises(ValueError, match="failed raw record|completed"):
+            _load_replication_bindings(root, group=group, runs=[failed_run])
     finally:
         binding_paths[2].write_bytes(second_binding)
 
@@ -617,7 +641,7 @@ def test_summary_rejects_unseeded_completed_records_without_replication_binding(
         path.unlink()
         renamed.write_bytes(json.dumps(payload, sort_keys=True).encode("utf-8"))
 
-    with pytest.raises(ValueError, match="replication binding|sidecar"):
+    with pytest.raises(ValueError, match="replication binding|sidecar|replication seal"):
         summarize_experiment(root, bootstrap_resamples=4)
 
 

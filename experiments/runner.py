@@ -481,6 +481,8 @@ class ExperimentRunner:
             raise ValueError("candidate pool manifest request identity mismatch")
         if manifest.workflow_id != "research-v1" or manifest.planner_id != planner_id:
             raise ValueError("candidate pool manifest workflow identity mismatch")
+        if manifest.ranker_id != "R1":
+            raise ValueError("candidate pool manifest producer identity mismatch")
         if manifest.seed != seed or not manifest.seed_supported:
             raise ValueError("candidate pool manifest seed identity mismatch")
         if manifest.config_sha256 != ExperimentRunner._core_config_sha256(
@@ -731,7 +733,7 @@ class ExperimentRunner:
             ):
                 raise ValueError("replication binding experiment identity mismatch")
             if existing_receipt_identity == receipt_identity:
-                raise ValueError("receipt identity is already bound to a raw record")
+                raise ValueError("receipt identity is already bound to another repeat/raw record")
         binding_path = binding_root / f"{request_sha256}.json"
         _write_immutable(binding_path, _canonical(payload))
 
@@ -846,6 +848,8 @@ class ExperimentRunner:
                 or raw_run.repeat_id != typed_repeat_id
             ):
                 raise RuntimeError("replication binding sidecar has no matching raw record")
+            if raw_run.status != "completed" or raw_run.validity != "valid":
+                raise RuntimeError("replication binding sidecar belongs to a failed raw record")
             receipt_identity = cast(str, typed["receipt_identity"])
             if receipt_identity in receipt_owners:
                 raise RuntimeError("receipt identity is reused across raw records")
@@ -922,6 +926,45 @@ class ExperimentRunner:
             raise RuntimeError("completed unseeded record requires exactly one replication binding sidecar")
         if raw_by_key.get(key) != existing:
             raise RuntimeError("completed raw record does not match canonical idempotency record")
+
+    def _remove_unseeded_receipt_binding(
+        self,
+        *,
+        group_root: Path,
+        request_sha256: str,
+        receipt_identity: str,
+    ) -> None:
+        """Atomically retire a binding whose evaluator attempt was rejected.
+
+        Receipt validation creates the sidecar before the evaluator callback so
+        that all later provenance checks can use the same identity.  If that
+        callback fails, the sidecar must not survive the failed raw record: a
+        later resume would otherwise see two receipts for one idempotency key.
+        The sidecar is content-addressed by the request hash, so unlinking the
+        exact file is an atomic publication boundary and avoids broad cleanup.
+        """
+        binding_root = group_root / "artifacts" / "replication-bindings"
+        _assert_lexically_safe(binding_root, label="replication binding directory")
+        if not binding_root.exists():
+            return
+        if not binding_root.is_dir() or _is_link_or_reparse(binding_root):
+            raise RuntimeError("replication binding directory is unsafe")
+        path = binding_root / f"{request_sha256}.json"
+        _assert_lexically_safe(path, label="replication binding sidecar")
+        if not path.exists():
+            return
+        if _is_link_or_reparse(path) or not path.is_file():
+            raise RuntimeError("replication binding sidecar is unsafe")
+        payload = json.loads(path.read_bytes())
+        if not isinstance(payload, dict):
+            raise TypeError("replication binding sidecar is invalid")
+        typed = cast(dict[str, object], payload)
+        if (
+            typed.get("request_sha256") != request_sha256
+            or typed.get("receipt_identity") != receipt_identity
+        ):
+            raise RuntimeError("replication binding sidecar identity mismatch")
+        path.unlink()
 
     def _validate_agent_receipt(
         self,
@@ -1123,6 +1166,7 @@ class ExperimentRunner:
         repeat_id: int | None,
         candidate_pool_hash: str | None,
         receipt: object,
+        request: AgentRunRequest | None = None,
         key: str,
         forced_error_code: str | None = None,
         metrics: Mapping[str, MetricValue] | None = None,
@@ -1236,6 +1280,17 @@ class ExperimentRunner:
                 candidate_pool_hash=candidate_pool_hash,
                 key=key,
                 error_code=error_code,
+            )
+        if (
+            forced_error_code is not None
+            and request is not None
+            and parsed is not None
+            and not self.seed_supported
+        ):
+            self._remove_unseeded_receipt_binding(
+                group_root=group_root,
+                request_sha256=sha256_bytes(_canonical(request.model_dump(mode="json"))),
+                receipt_identity=sha256_bytes(_canonical(parsed.model_dump(mode="json"))),
             )
         raw_path = self._raw_path(group_root, key)
         existing = self._load_existing(raw_path)
@@ -1555,6 +1610,7 @@ class ExperimentRunner:
                 repeat_id=selected_repeat,
                 candidate_pool_hash=candidate_pool_hash,
                 receipt=validated.receipt,
+                request=request,
                 key=key,
                 forced_error_code="EVALUATOR_VALIDATION_FAILED",
             )

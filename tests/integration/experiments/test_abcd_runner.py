@@ -13,7 +13,11 @@ import yaml
 from benchmarks.datasets.isolation import AgentRuntimeGuard, GoldAccessViolation, GoldIsolationGuard
 from benchmarks.datasets.models import AnnotatedQuestion
 from benchmarks.datasets.validator import canonical_json_bytes, sha256_bytes
-from benchmarks.processes.agent import AgentVariantRunRequest, load_authorized_agent_inputs
+from benchmarks.processes.agent import (
+    AgentRunReceipt,
+    AgentVariantRunRequest,
+    load_authorized_agent_inputs,
+)
 from benchmarks.processes.evaluator import stage_authorized_runtime_task, stage_sealed_config
 from deepresearch.domain import ResourceUsage, RunBudget
 from deepresearch.runtime import CheckpointRef
@@ -838,6 +842,77 @@ async def test_unseeded_resume_sidecar_uses_resume_request_for_fast_path(
     assert result == existing
 
 
+@pytest.mark.asyncio
+async def test_evaluator_failure_removes_unseeded_receipt_sidecar(
+    tmp_path: Path,
+) -> None:
+    config, task = _config_and_task()
+    runner = ExperimentRunner(
+        launch_agent=SpyLauncher(),
+        task_loader={task.task_id: task},
+        experiment_root=tmp_path,
+        private_root=tmp_path / "private",
+        seed_supported=False,
+        preflight=False,
+    )
+    group_root = runner._group_root(config)
+    request, _, key = await runner._stage_request(
+        config=config,
+        group_root=group_root,
+        task=task,
+        task_id=task.task_id,
+        protocol="end_to_end",
+        variant=ExperimentVariant.D,
+        budget=config.budget_preset,
+        seed=None,
+        repeat_id=1,
+    )
+    receipt = AgentRunReceipt(
+        task_id=task.task_id,
+        status="completed",
+        run_result_path=str((group_root / "artifacts" / "result.json").absolute()),
+        manifest_path=str((group_root / "artifacts" / "manifest.json").absolute()),
+        run_result_sha256="a" * 64,
+        manifest_sha256="b" * 64,
+        artifact_ids=(),
+    )
+    runner._bind_unseeded_receipt(
+        group_root=group_root,
+        config=config,
+        task=task,
+        protocol="end_to_end",
+        variant=ExperimentVariant.D,
+        budget=config.budget_preset,
+        repeat_id=1,
+        request_sha256=sha256_bytes(canonical_json_bytes(request.model_dump(mode="json"))),
+        receipt_identity=sha256_bytes(canonical_json_bytes(receipt.model_dump(mode="json"))),
+        manifest_provenance={
+            "manifest_sha256": "d" * 64,
+            "run_id": "failed-run",
+            "thread_id": "failed-thread",
+        },
+    )
+
+    failed = runner._record(
+        config=config,
+        group_root=group_root,
+        protocol="end_to_end",
+        variant=ExperimentVariant.D,
+        task=task,
+        budget=config.budget_preset,
+        seed=None,
+        repeat_id=1,
+        candidate_pool_hash=None,
+        receipt=receipt,
+        request=request,
+        key=key,
+        forced_error_code="EVALUATOR_VALIDATION_FAILED",
+    )
+
+    assert failed.status == "failed"
+    assert list((group_root / "artifacts" / "replication-bindings").glob("*.json")) == []
+
+
 def test_unseeded_receipt_binding_rejects_cross_repeat_reuse(tmp_path: Path) -> None:
     config, task = _config_and_task()
     runner = ExperimentRunner(
@@ -1025,6 +1100,29 @@ async def test_promoted_candidate_pool_is_setup_once_and_reused(tmp_path: Path) 
         ),
         encoding="utf-8",
     )
+    forged_manifest = manifest.model_copy(
+        update={
+            "ranker_id": "R2",
+            "config_sha256": runner._core_config_sha256(
+                config=config,
+                task=task,
+                planner_id="P1",
+                ranker_id="R2",
+                seed=config.replication.candidate_pool_seed,
+            ),
+        }
+    )
+    forged_bytes = forged_manifest.model_dump_json().encode()
+    manifest_path.write_bytes(forged_bytes)
+    forged_setup = json.loads(setup.read_bytes())
+    forged_setup["manifest_sha256"] = sha256_bytes(forged_bytes)
+    setup.write_bytes(canonical_json_bytes(forged_setup))
+    assert await runner._candidate_pool(config=config, task=task) is None
+    manifest_path.write_bytes(manifest.model_dump_json().encode())
+    setup_payload = json.loads(setup.read_bytes())
+    setup_payload["manifest_sha256"] = manifest_sha256
+    setup.write_bytes(canonical_json_bytes(setup_payload))
+
     first = await runner._candidate_pool(config=config, task=task)
     second = await runner._candidate_pool(config=config, task=task)
     assert first == second == (pool, sha256_bytes(pool_payload))

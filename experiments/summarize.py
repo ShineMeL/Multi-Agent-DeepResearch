@@ -251,6 +251,8 @@ def _load_replication_bindings(
         if not candidates:
             raise ValueError("replication binding has no matching completed raw record")
         matched_index, run = candidates[0]
+        if run.status != "completed" or run.validity != "valid":
+            raise ValueError("replication binding belongs to a failed raw record")
         raw_manifest_path = Path(run.manifest_path)
         if not raw_manifest_path.is_absolute():
             raw_manifest_path = experiment_dir / raw_manifest_path
@@ -369,6 +371,159 @@ def _resource_metric(name: str, value: float) -> MetricValue:
     )
 
 
+def _load_sealed_formal_config(
+    experiment_dir: Path, *, group: Mapping[str, object]
+) -> FormalExperimentConfig:
+    config_path = experiment_dir / "config" / "formal.yaml"
+    _assert_summary_path(config_path, label="staged formal config")
+    if not config_path.is_file() or _is_link_or_reparse(config_path):
+        raise ValueError("staged formal config is missing or unsafe")
+    config_bytes = config_path.read_bytes()
+    config_hash = group.get("config_sha256")
+    if not _is_sha256(config_hash) or sha256_bytes(config_bytes) != config_hash:
+        raise ValueError("staged formal config provenance mismatch")
+    try:
+        config = FormalExperimentConfig.model_validate(yaml.safe_load(config_bytes))
+    except (TypeError, ValueError, yaml.YAMLError) as error:
+        raise ValueError("staged formal config is invalid") from error
+    if config.experiment_group_id() != group.get("group_id"):
+        raise ValueError("staged formal config group identity mismatch")
+    return config
+
+
+def _verify_sealed_group(
+    experiment_dir: Path, *, group: Mapping[str, object]
+) -> FormalExperimentConfig:
+    """Recompute every result-affecting group field from the sealed config."""
+    if group.get("schema_version") != "formal-experiment-group-v1":
+        raise ValueError("experiment group schema is invalid")
+    config = _load_sealed_formal_config(experiment_dir, group=group)
+    expected_protocols = list(_PROTOCOLS)
+    if group.get("protocols") != expected_protocols:
+        raise ValueError("experiment group protocol seal does not match config")
+    expected_tasks = {
+        "ranker_component": list(config.main_test_task_ids),
+        "planner_policy": list(config.main_test_task_ids),
+        "end_to_end": list(config.main_test_task_ids),
+        "reference": list(config.p0_task_ids),
+    }
+    if group.get("protocol_task_ids") != expected_tasks:
+        raise ValueError("experiment group task coverage seal does not match config")
+    if group.get("oracle_task_ids") != list(config.oracle_task_ids):
+        raise ValueError("experiment group ORACLE task seal does not match config")
+    if group.get("cost_subset_task_ids") != list(config.cost_subset_task_ids):
+        raise ValueError("experiment group cost subset seal does not match config")
+    expected_variants = {
+        "ranker_component": ["R0", "R1", "R2"],
+        "planner_policy": ["A", "B", "C", "D"],
+        "end_to_end": ["A", "B", "C", "D"],
+        "reference": ["P0"],
+    }
+    if group.get("expected_variants") != expected_variants:
+        raise ValueError("experiment group variant seal does not match config")
+    if group.get("budgets") != list(config.budget_sensitivity_presets):
+        raise ValueError("experiment group budget seal does not match config")
+    expected_required_budgets = {
+        protocol: [config.budget_preset] for protocol in _PROTOCOLS
+    }
+    if group.get("required_budgets") != expected_required_budgets:
+        raise ValueError("experiment group required budget seal does not match config")
+    if (
+        group.get("group_id") != config.experiment_group_id()
+        or group.get("dataset_version") != config.dataset_version
+        or group.get("private_manifest_sha256") != config.private_manifest_sha256
+        or group.get("evaluator_version") != config.evaluator_version
+        or group.get("budget_preset") != config.budget_preset
+        or group.get("candidate_pool_seed") != config.replication.candidate_pool_seed
+        or group.get("pricing_snapshot_id") != config.pricing_snapshot.snapshot_id
+    ):
+        raise ValueError("experiment group identity seal does not match config")
+    replication = group.get("replication")
+    if not isinstance(replication, dict):
+        raise TypeError("experiment group replication seal is invalid")
+    typed_replication = cast(dict[str, object], replication)
+    if set(typed_replication) != {"mode", "seed_supported", "seed_values", "repeat_ids"}:
+        raise ValueError("experiment group replication seal is invalid")
+    seed_supported = typed_replication.get("seed_supported")
+    if type(seed_supported) is not bool:
+        raise ValueError("experiment group replication support seal is invalid")
+    expected_replication = {
+        "mode": "seeds" if seed_supported else "independent_repeats",
+        "seed_supported": seed_supported,
+        "seed_values": list(config.replication.seed_values) if seed_supported else [],
+        "repeat_ids": (
+            []
+            if seed_supported
+            else list(range(1, config.replication.unseeded_repeat_count + 1))
+        ),
+    }
+    if typed_replication != expected_replication:
+        raise ValueError("experiment group replication seal does not match config")
+    categories = _string_object_map(group.get("task_categories"), field="task_categories")
+    if set(categories) != set(config.main_test_task_ids):
+        raise ValueError("experiment group task category coverage does not match config")
+    for value in categories.values():
+        if not isinstance(value, str):
+            raise TypeError("task category must be a string")
+        try:
+            TaskCategory(value)
+        except ValueError as error:
+            raise ValueError("experiment group task category seal is invalid") from error
+
+    # The group metadata is not an authority for task semantics.  Re-read the
+    # staged public RuntimeTask objects and bind the category seal to the
+    # exact immutable task payload that the agent was authorized to consume.
+    # This also prevents a caller from making an otherwise valid category
+    # string appear to match by changing only group.json.
+    agent_input_root = experiment_dir / "agent-inputs"
+    _assert_summary_path(agent_input_root, label="staged runtime task root")
+    if not agent_input_root.is_dir() or _is_link_or_reparse(agent_input_root):
+        raise ValueError("staged runtime task root is missing or unsafe")
+    staged_paths = sorted(agent_input_root.iterdir())
+    if not staged_paths:
+        raise ValueError("staged runtime task category seal is missing")
+    staged_categories: dict[str, str] = {}
+    staged_variants: dict[tuple[str, str], str] = {}
+    for path in staged_paths:
+        _assert_summary_path(path, label="staged runtime task")
+        if _is_link_or_reparse(path) or not path.is_file() or path.suffix != ".json":
+            raise ValueError("staged runtime task artifact is unsafe")
+        try:
+            task = RuntimeTask.model_validate_json(path.read_bytes(), strict=True)
+        except (OSError, TypeError, ValueError) as error:
+            raise ValueError("staged runtime task artifact is invalid") from error
+        if task.task_id not in config.main_test_task_ids:
+            raise ValueError("staged runtime task is outside sealed task coverage")
+        staged_budget = task.request.budget_preset
+        if staged_budget not in config.budget_sensitivity_presets:
+            raise ValueError("staged runtime task budget is not sealed")
+        base_task = task.model_copy(
+            update={
+                "request": task.request.model_copy(
+                    update={"budget_preset": config.budget_preset}
+                )
+            }
+        )
+        expected_hash = config.internal_runtime_task_hashes.get(task.task_id)
+        if expected_hash is None or canonical_sha256(base_task.model_dump(mode="json")) != expected_hash:
+            raise ValueError("staged runtime task provenance mismatch")
+        staged_hash = canonical_sha256(task.model_dump(mode="json"))
+        variant_key = (task.task_id, staged_budget)
+        prior_hash = staged_variants.get(variant_key)
+        if prior_hash is not None and prior_hash != staged_hash:
+            raise ValueError("conflicting staged runtime task identity")
+        staged_variants[variant_key] = staged_hash
+        prior_category = staged_categories.get(task.task_id)
+        if prior_category is not None and prior_category != task.category.value:
+            raise ValueError("conflicting staged runtime task category")
+        staged_categories[task.task_id] = task.category.value
+    if set(staged_categories) != set(config.main_test_task_ids):
+        raise ValueError("staged runtime task category coverage does not match config")
+    if any(categories[task_id] != staged_categories[task_id] for task_id in staged_categories):
+        raise ValueError("experiment group task category seal does not match staged tasks")
+    return config
+
+
 def _setup_cost_section(
     experiment_dir: Path, *, runs: Sequence[ExperimentTaskRun]
 ) -> dict[str, object]:
@@ -417,21 +572,7 @@ def _setup_cost_section(
         ): task_id
         for task_id in ranker_task_ids
     }
-    config_path = experiment_dir / "config" / "formal.yaml"
-    _assert_summary_path(config_path, label="staged formal config")
-    if not config_path.is_file() or _is_link_or_reparse(config_path):
-        raise ValueError("staged formal config is missing or unsafe")
-    config_bytes = config_path.read_bytes()
-    if not _is_sha256(group.get("config_sha256")) or sha256_bytes(config_bytes) != group["config_sha256"]:
-        raise ValueError("staged formal config provenance mismatch")
-    # The sealed config is written as YAML/JSON with the model's JSON mode
-    # representation (dates, decimals and tuples are therefore represented by
-    # their YAML scalar/sequence forms).  Reconstruct it through the canonical
-    # config loader so those representation-level conversions are performed by
-    # Pydantic before provenance is checked below.
-    config = FormalExperimentConfig.model_validate(yaml.safe_load(config_bytes))
-    if config.experiment_group_id() != group_id:
-        raise ValueError("staged formal config group identity mismatch")
+    config = _verify_sealed_group(experiment_dir, group=group)
     agent_input_root = experiment_dir / "agent-inputs"
     _assert_summary_path(agent_input_root, label="staged runtime task root")
     if not agent_input_root.is_dir() or _is_link_or_reparse(agent_input_root):
@@ -1343,6 +1484,7 @@ def summarize_experiment(
         or not isinstance(dataset_version, str)
     ):
         raise TypeError("experiment group evaluator identity is incomplete")
+    _verify_sealed_group(root, group=raw_group)
     oracle_task_ids = _string_list(raw_group.get("oracle_task_ids"), field="oracle_task_ids")
     if len(set(oracle_task_ids)) != len(oracle_task_ids):
         raise ValueError("oracle task coverage is not unique")
