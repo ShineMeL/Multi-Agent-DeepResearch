@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import stat
 import subprocess
 from pathlib import Path
 from typing import Annotated, Literal
@@ -51,6 +52,26 @@ def _require_clean_worktree(repo_root: Path) -> None:
         raise ValueError("worktree must be clean before freezing formal config")
 
 
+def _require_regular_file(path: Path, *, label: str) -> Path:
+    absolute = path.absolute()
+    current = absolute
+    while current != Path(current.anchor):
+        try:
+            details = current.lstat()
+        except FileNotFoundError:
+            details = None
+        if details is not None:
+            reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            if stat.S_ISLNK(details.st_mode) or bool(
+                getattr(details, "st_file_attributes", 0) & reparse_flag
+            ):
+                raise ValueError(f"{label} contains a symlink or reparse point")
+        current = current.parent
+    if not absolute.is_file():
+        raise ValueError(f"{label} must be a regular file")
+    return absolute
+
+
 def _oracle_bindings(config: FormalExperimentConfig, repo_root: Path):
     from benchmarks.datasets.models import AnnotatedQuestion, PrivateDatasetManifest
     from benchmarks.datasets.validator import sha256_bytes
@@ -59,8 +80,9 @@ def _oracle_bindings(config: FormalExperimentConfig, repo_root: Path):
 
     private_root = repo_root / "benchmarks" / "private" / config.dataset_id
     manifest_path = private_root / "private_manifest.json"
-    if not manifest_path.is_file():
-        raise ValueError("sealed private manifest is required for ORACLE")
+    manifest_path = _require_regular_file(
+        manifest_path, label="sealed private manifest"
+    )
     private_bytes = manifest_path.read_bytes()
     if sha256_bytes(private_bytes) != config.private_manifest_sha256:
         raise ValueError("sealed private manifest hash mismatch")
@@ -73,7 +95,7 @@ def _oracle_bindings(config: FormalExperimentConfig, repo_root: Path):
         if relative_path.is_absolute() or ".." in relative_path.parts:
             raise ValueError("sealed private runtime path is unsafe")
         path = private_root / relative
-        if not path.is_file():
+        if not path.is_file() or path.is_symlink():
             raise ValueError("sealed private runtime input is unavailable")
         for line in path.read_bytes().splitlines():
             question = AnnotatedQuestion.model_validate_json(line, strict=True)
@@ -114,7 +136,7 @@ def _runner(
     *,
     with_oracle: bool = False,
 ) -> ExperimentRunner:
-    kwargs: dict[str, object] = {"config_source": source.resolve()}
+    kwargs: dict[str, object] = {"config_source": source.absolute()}
     if with_oracle:
         provider, records = _oracle_bindings(config, Path.cwd().resolve())
         kwargs["oracle_provider"] = provider
@@ -135,6 +157,9 @@ def freeze(
     try:
         repo_root = Path.cwd().resolve()
         _require_clean_worktree(repo_root)
+        private_manifest = _require_regular_file(
+            private_manifest, label="sealed private manifest"
+        )
         template = load_template(source)
         expected_locks = {
             "model lock": repo_root / template.model_lock_path,
@@ -147,9 +172,11 @@ def freeze(
             "serving environment lock": serving_environment_lock,
         }
         for label, supplied in supplied_locks.items():
-            if supplied.resolve(strict=True) != expected_locks[label].resolve(strict=True):
+            supplied_path = _require_regular_file(supplied, label=label)
+            expected_path = _require_regular_file(expected_locks[label], label=label)
+            if supplied_path != expected_path:
                 raise ValueError(f"{label} does not match the sealed template reference")
-        private_root = private_manifest.resolve().parent
+        private_root = private_manifest.parent
         config = freeze_config(template, repo_root=repo_root, private_root=private_root)
         # freeze_config itself writes atomically and refuses replacement when
         # an output is provided; keep the CLI output separate for clear error

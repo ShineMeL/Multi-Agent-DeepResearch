@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, Self, cast, override
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_serializer, model_validator
 
-from benchmarks.datasets.models import RuntimeTask
+from benchmarks.datasets.models import RuntimeTask, TaskCategory
 from benchmarks.datasets.validator import canonical_json_bytes, sha256_bytes
 from benchmarks.evaluators.metrics import MetricValue
 from deepresearch.domain import ResourceUsage, RunBudget, RunStatus
@@ -223,6 +223,18 @@ class ExperimentTaskRun(SealedModel):
     pricing_snapshot_ids: Annotated[tuple[str, ...], Field(min_length=1, max_length=1)]
     pricing_status: Literal["estimated"]
     cost_label: Literal["estimated_from_normalized_schedule"]
+    category: TaskCategory | None = None
+    metrics: dict[str, MetricValue] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_metrics(self) -> Self:
+        if any(name != metric.name for name, metric in self.metrics.items()):
+            raise ValueError("metric name must match its dictionary key")
+        return self
+
+    @field_serializer("metrics")
+    def serialize_metrics(self, value: dict[str, MetricValue]) -> dict[str, object]:
+        return {key: value[key].model_dump(mode="json") for key in sorted(value)}
 
     @model_validator(mode="after")
     def validate_protocol(self) -> Self:
@@ -294,6 +306,7 @@ def task_run_from_manifest(
     seed: int | None = None,
     repeat_id: int | None = None,
     candidate_pool_hash: str | None = None,
+    metrics: Mapping[str, MetricValue] | None = None,
 ) -> ExperimentTaskRun:
     """Bind a verified Core manifest to its authorized staged request and budget."""
     from experiments.config import authorized_staged_task
@@ -343,6 +356,8 @@ def task_run_from_manifest(
         pricing_snapshot_ids=tuple(item.snapshot_id for item in manifest.pricing_snapshots),
         pricing_status="estimated",
         cost_label="estimated_from_normalized_schedule",
+        category=task.category,
+        metrics=dict(metrics or {}),
     )
 
 

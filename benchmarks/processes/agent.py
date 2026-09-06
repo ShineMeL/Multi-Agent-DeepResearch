@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -45,6 +46,7 @@ class AgentRequestBase(BaseModel):
     run_dir: str
     config_path: str
     config_sha256: str
+    seed_supported: bool
     seed: int | None = None
     repeat_id: Annotated[int | None, Field(ge=1)] = None
     resume_checkpoint_path: str | None = None
@@ -86,6 +88,12 @@ class AgentRequestBase(BaseModel):
             raise ValueError("seed and repeat_id are mutually exclusive")
         if self.seed is None and self.repeat_id is None:
             raise ValueError("exactly one seed or repeat_id is required")
+        if type(self.seed_supported) is not bool:
+            raise ValueError("seed_supported must be a boolean")
+        if self.seed_supported and self.seed is None:
+            raise ValueError("seed-supported request requires a seed")
+        if not self.seed_supported and self.repeat_id is None:
+            raise ValueError("unseeded request requires a repeat_id")
         return self
 
 
@@ -201,6 +209,15 @@ class AgentRunReceipt(BaseModel):
             raise ValueError("receipt hashes must be non-zero lowercase SHA-256")
         return value
 
+    @field_validator("artifact_ids")
+    @classmethod
+    def validate_artifact_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError("receipt artifact IDs must be unique")
+        if any(_require_hash(item) is None for item in value):
+            raise ValueError("receipt artifact IDs must be content-addressed hashes")
+        return value
+
 
 def _canonical_json(value: object) -> bytes:
     return (
@@ -210,14 +227,40 @@ def _canonical_json(value: object) -> bytes:
     )
 
 
+def _is_link_or_reparse(path: Path) -> bool:
+    try:
+        details = path.lstat()
+    except FileNotFoundError:
+        return False
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return stat.S_ISLNK(details.st_mode) or bool(
+        getattr(details, "st_file_attributes", 0) & reparse_flag
+    )
+
+
+def _assert_snapshot_file(path: Path, *, label: str, regular_file: bool = True) -> None:
+    absolute = path.absolute()
+    current = absolute
+    while current != Path(current.anchor):
+        if _is_link_or_reparse(current):
+            raise ValueError(f"snapshot {label} contains a symlink or reparse point")
+        current = current.parent
+    if _is_link_or_reparse(current):
+        raise ValueError(f"snapshot {label} contains a symlink or reparse point")
+    if regular_file and (not absolute.exists() or not absolute.is_file()):
+        raise ValueError(f"snapshot {label} is missing")
+
+
 def _verify_snapshot(snapshot_dir: Path, *, task: RuntimeTask | None = None) -> None:
+    _assert_snapshot_file(snapshot_dir, label="root", regular_file=False)
     manifest_path = snapshot_dir / "manifest.sha256"
-    if not manifest_path.is_file():
-        raise ValueError("snapshot manifest is missing")
+    _assert_snapshot_file(manifest_path, label="manifest")
     manifest = json.loads(manifest_path.read_bytes())
     if not isinstance(manifest, dict):
         raise TypeError("snapshot manifest is invalid")
     raw_manifest = cast("dict[object, object]", manifest)
+    if set(raw_manifest) != {"file_sha256"}:
+        raise ValueError("snapshot manifest schema is invalid")
     file_hashes = raw_manifest.get("file_sha256")
     if not isinstance(file_hashes, dict) or not file_hashes:
         raise ValueError("snapshot manifest has no file hashes")
@@ -236,10 +279,10 @@ def _verify_snapshot(snapshot_dir: Path, *, task: RuntimeTask | None = None) -> 
         ):
             raise ValueError("snapshot manifest contains an invalid hash")
         path = snapshot_dir / filename
-        if not path.is_file():
-            raise ValueError(f"snapshot file is missing: {filename}")
+        _assert_snapshot_file(path, label=filename)
         if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
             raise ValueError(f"snapshot hash mismatch: {filename}")
+    _assert_snapshot_file(snapshot_dir / "snapshot.json", label="snapshot.json")
     snapshot_payload = json.loads((snapshot_dir / "snapshot.json").read_bytes())
     if not isinstance(snapshot_payload, dict):
         raise TypeError("snapshot metadata is invalid")
@@ -324,6 +367,13 @@ def load_authorized_agent_inputs(
 
     if not isinstance(guard, AgentRuntimeGuard):
         raise TypeError("guard must be an AgentRuntimeGuard")
+    if Path(request.run_dir).absolute() != guard.run_root:
+        raise GoldAccessViolation("request run_dir must equal the guarded run root")
+    if request.seed_supported:
+        if request.seed is None or request.repeat_id is not None:
+            raise GoldAccessViolation("seed-supported request has invalid replication identity")
+    elif request.seed is not None or request.repeat_id is None:
+        raise GoldAccessViolation("unseeded request has invalid replication identity")
     task_path = guard.resolve_runtime_task(Path(request.runtime_task_path))
     snapshot_dir = guard.resolve_snapshot(Path(request.snapshot_dir))
     config_path = guard.resolve_staged_config(

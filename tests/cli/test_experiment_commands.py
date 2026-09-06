@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from typer.testing import CliRunner
 
 from apps.cli.main import app
@@ -35,6 +36,17 @@ def test_runner_stages_the_user_config_source(tmp_path: Path) -> None:
     config = SimpleNamespace()
     runner = _runner(config, source)  # type: ignore[arg-type]
     assert runner.config_source == source.resolve()
+
+
+def test_private_manifest_must_be_a_real_file_not_a_symlink(tmp_path: Path) -> None:
+    from apps.cli.experiment import _require_regular_file
+
+    target = tmp_path / "private_manifest.json"
+    target.write_text("{}", encoding="utf-8")
+    link = tmp_path / "manifest-link.json"
+    link.symlink_to(target)
+    with pytest.raises(ValueError, match="symlink|reparse|regular file"):
+        _require_regular_file(link, label="sealed private manifest")
 
 
 def test_config_freeze_consumes_all_lock_options(tmp_path: Path, monkeypatch) -> None:

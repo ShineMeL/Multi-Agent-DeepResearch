@@ -12,9 +12,23 @@ import json
 import math
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
+from dataclasses import asdict
+from decimal import Decimal
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
+from benchmarks.datasets.models import TaskCategory
+from benchmarks.evaluators.metrics import MetricValue
+from benchmarks.evaluators.pareto import analyze_pareto
+from benchmarks.evaluators.statistics import (
+    ConfidenceInterval,
+    SeedRunRecord,
+    aggregate_seeds,
+    compare_planners,
+    compare_rankers,
+    paired_stratified_bootstrap,
+)
+from deepresearch.domain import ResourceUsage
 from experiments.models import (
     EvaluatorReferenceManifest,
     ExperimentTaskRun,
@@ -28,6 +42,8 @@ _OUTPUTS = (
     "confidence_intervals.json",
     "pareto.json",
     "failures.jsonl",
+    "oracle-reference.jsonl",
+    "evaluator-reference-manifest.json",
 )
 _PROTOCOLS = ("ranker_component", "planner_policy", "end_to_end", "reference")
 
@@ -109,6 +125,17 @@ def _safe_run_row(run: ExperimentTaskRun) -> dict[str, object]:
         "status": run.status,
         "validity": run.validity,
         "error_code": run.error_code,
+        "category": None if run.category is None else run.category.value,
+        "quality_metrics": {
+            name: {
+                "name": metric.name,
+                "value": metric.value,
+                "numerator": metric.numerator,
+                "denominator": metric.denominator,
+                "version": metric.version,
+            }
+            for name, metric in sorted(run.metrics.items())
+        },
         "metrics": {
             "input_tokens": run.usage.input_tokens,
             "output_tokens": run.usage.output_tokens,
@@ -119,6 +146,189 @@ def _safe_run_row(run: ExperimentTaskRun) -> dict[str, object]:
             "cost_usd": None if run.usage.cost_usd is None else str(run.usage.cost_usd),
         },
     }
+
+
+def _resource_metric(name: str, value: float) -> MetricValue:
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"resource metric {name} is invalid")
+    return MetricValue(
+        name=name,
+        value=value,
+        numerator=value,
+        denominator=1.0,
+        version="resource-metrics-v1",
+    )
+
+
+def _setup_cost_section(experiment_dir: Path) -> dict[str, object]:
+    setup_root = experiment_dir / "candidate-pool-setup"
+    usages: list[ResourceUsage] = []
+    pricing_snapshot_ids: set[str] = set()
+    if not setup_root.exists():
+        return {"count": 0, "usage": {}, "pricing_snapshot_ids": []}
+    if setup_root.is_symlink() or not setup_root.is_dir():
+        raise ValueError("candidate pool setup root is unsafe")
+    for path in sorted(setup_root.glob("*.json")):
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("candidate pool setup artifact is unsafe")
+        payload = json.loads(path.read_bytes())
+        if not isinstance(payload, dict):
+            raise TypeError("candidate pool setup artifact is invalid")
+        typed = cast(dict[str, object], payload)
+        if set(typed) != {
+            "schema_version",
+            "group_id",
+            "task_id",
+            "pool_key",
+            "candidate_pool_sha256",
+            "evidence_ids_sha256",
+            "manifest_sha256",
+            "usage",
+            "pricing_snapshot_ids",
+            "pricing_status",
+        }:
+            raise ValueError("candidate pool setup artifact schema is invalid")
+        usage = ResourceUsage.model_validate_json(_canonical(typed["usage"]), strict=True)
+        if usage.cost_usd is None or typed["pricing_status"] != "estimated":
+            raise ValueError("candidate pool setup cost is not verified")
+        raw_pricing_ids = typed["pricing_snapshot_ids"]
+        raw_pricing_items = (
+            cast(list[object], raw_pricing_ids)
+            if isinstance(raw_pricing_ids, list)
+            else None
+        )
+        if (
+            raw_pricing_items is None
+            or any(not isinstance(item, str) or not item for item in raw_pricing_items)
+        ):
+            raise ValueError("candidate pool setup pricing identity is invalid")
+        usages.append(usage)
+        pricing_snapshot_ids.update(cast(list[str], raw_pricing_ids))
+    total_fields: dict[str, object] = {
+        name: sum(int(getattr(usage, name)) for usage in usages)
+        for name in (
+            "input_tokens",
+            "cached_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "total_tokens",
+            "search_calls",
+            "pages",
+            "retries",
+        )
+    }
+    total_fields["wall_seconds"] = sum(
+        float(usage.wall_seconds) for usage in usages
+    )
+    total_fields["cost_usd"] = str(
+        sum(
+            (usage.cost_usd for usage in usages if usage.cost_usd is not None),
+            Decimal(0),
+        )
+    )
+    return {
+        "count": len(usages),
+        "usage": total_fields,
+        "pricing_snapshot_ids": sorted(pricing_snapshot_ids),
+    }
+
+
+def _task_categories(group: Mapping[str, object]) -> dict[str, TaskCategory]:
+    raw = _string_object_map(group.get("task_categories"), field="task_categories")
+    categories: dict[str, TaskCategory] = {}
+    for task_id, value in raw.items():
+        if not isinstance(value, str):
+            raise TypeError("task category must be a string")
+        try:
+            categories[task_id] = TaskCategory(value)
+        except ValueError as error:
+            raise ValueError("task category is invalid") from error
+    return categories
+
+
+def _seed_records(
+    runs: Sequence[ExperimentTaskRun], *, categories: Mapping[str, TaskCategory]
+) -> tuple[SeedRunRecord, ...]:
+    records: list[SeedRunRecord] = []
+    required_quality: dict[str, tuple[str, ...]] = {
+        "ranker_component": (
+            "citation_support_precision",
+            "information_completeness",
+        ),
+        "planner_policy": (
+            "citation_support_precision",
+            "information_completeness",
+            "query_redundancy",
+        ),
+        "end_to_end": (
+            "citation_support_precision",
+            "information_completeness",
+        ),
+        "reference": ("information_completeness",),
+    }
+    for run in runs:
+        if run.status != "completed" or run.validity != "valid":
+            raise ValueError("quality summary requires valid completed raw records")
+        category = run.category or categories.get(run.task_id)
+        if category is None:
+            raise ValueError("task category is required for quality summary")
+        missing = [name for name in required_quality[run.protocol] if name not in run.metrics]
+        if missing:
+            raise ValueError("raw record is missing a quality metric")
+        metrics = dict(run.metrics)
+        if run.usage.cost_usd is None:
+            raise ValueError("raw record is missing verified cost for quality summary")
+        metrics["search_calls"] = _resource_metric(
+            "search_calls", float(run.usage.search_calls)
+        )
+        metrics["cost_usd"] = _resource_metric("cost_usd", float(run.usage.cost_usd))
+        records.append(
+            SeedRunRecord(
+                task_id=run.task_id,
+                category=category,
+                variant=(
+                    "P0"
+                    if run.protocol == "reference"
+                    else run.variant.value
+                ),
+                budget_preset=run.budget_preset,
+                seed=run.seed,
+                repeat_id=run.repeat_id,
+                metrics=metrics,
+            )
+        )
+    return tuple(records)
+
+
+def _ci_payload(interval: ConfidenceInterval) -> dict[str, object]:
+    return cast(dict[str, object], asdict(interval))
+
+
+def _paired_ci(
+    records: Sequence[SeedRunRecord],
+    *,
+    left_variant: str,
+    right_variant: str,
+    metric_name: str,
+    budget: str,
+    n_resamples: int,
+) -> ConfidenceInterval:
+    selected = [
+        record
+        for record in records
+        if record.variant in {left_variant, right_variant}
+        and record.budget_preset == budget
+    ]
+    aggregates = aggregate_seeds(selected, metric_name=metric_name)
+    left = [row for row in aggregates if row.variant == left_variant]
+    right = [row for row in aggregates if row.variant == right_variant]
+    return paired_stratified_bootstrap(
+        left,
+        right,
+        categories={row.task_id: row.category for row in aggregates},
+        n_resamples=n_resamples,
+        budget_preset=cast("Literal['low', 'medium', 'high']", budget),
+    )
 
 
 def _manifest_payload(experiment_dir: Path, files: tuple[str, ...]) -> bytes:
@@ -217,6 +427,8 @@ def _validate_coverage(group: Mapping[str, object], runs: Sequence[ExperimentTas
     replication = _string_object_map(group.get("replication"), field="replication")
     mode = replication.get("mode")
     if mode == "seeds":
+        if replication.get("seed_supported") is not True:
+            raise ValueError("seed replication support metadata is invalid")
         seeds_value = replication.get("seed_values")
         if not isinstance(seeds_value, list):
             raise TypeError("experiment group seed coverage is invalid")
@@ -228,6 +440,8 @@ def _validate_coverage(group: Mapping[str, object], runs: Sequence[ExperimentTas
             raise ValueError("experiment group seed coverage is invalid")
         replication_values: set[tuple[str, int]] = {("seed", seed) for seed in seeds}
     elif mode == "independent_repeats":
+        if replication.get("seed_supported") is not False:
+            raise ValueError("repeat replication support metadata is invalid")
         repeats_value = replication.get("repeat_ids")
         if not isinstance(repeats_value, list):
             raise TypeError("experiment group repeat coverage is invalid")
@@ -318,6 +532,8 @@ def _sections(runs: Sequence[ExperimentTaskRun]) -> dict[str, dict[str, object]]
         costs = [float(run.usage.cost_usd) for run in items if run.usage.cost_usd is not None]
         if costs:
             metric_values["cost_usd"] = costs
+        for name in sorted({metric_name for item in items for metric_name in item.metrics}):
+            metric_values[name] = [item.metrics[name].value for item in items]
         result[protocol] = {
             "run_count": len(items),
             "task_count": len({item.task_id for item in items}),
@@ -330,61 +546,144 @@ def _sections(runs: Sequence[ExperimentTaskRun]) -> dict[str, dict[str, object]]
     return result
 
 
-def _confidence_sections(runs: Sequence[ExperimentTaskRun], *, n_resamples: int) -> dict[str, object]:
-    grouped: defaultdict[str, list[ExperimentTaskRun]] = defaultdict(list)
-    for run in runs:
-        grouped[run.protocol].append(run)
-    sections: dict[str, object] = {}
-    for protocol in _PROTOCOLS:
-        items = grouped.get(protocol, [])
-        values = [float(run.usage.total_tokens) for run in items]
-        estimate = _mean(values)
-        sections[protocol] = {
-            "metric": "total_tokens",
-            "estimate": estimate,
-            "lower": min(values) if values else estimate,
-            "upper": max(values) if values else estimate,
-            "n_tasks": len({run.task_id for run in items}),
-            "n_resamples": n_resamples,
+def _confidence_sections(
+    records_by_protocol: Mapping[str, Sequence[SeedRunRecord]],
+    *,
+    n_resamples: int,
+    budget: str,
+) -> dict[str, object]:
+    ranker = list(records_by_protocol["ranker_component"])
+    ranker_ci = compare_rankers(
+        ranker,
+        budget_preset=cast("Literal['low', 'medium', 'high']", budget),
+        n_resamples=n_resamples,
+    )
+
+    planner_sections: dict[str, object] = {}
+    for ranker_id, left_variant, right_variant in (
+        ("R1", "A", "C"),
+        ("R2", "B", "D"),
+    ):
+        selected = [
+            record
+            for record in records_by_protocol["planner_policy"]
+            if record.variant in {left_variant, right_variant}
+        ]
+        # Re-label the two fixed-ranker arms to the Task 13 planner protocol.
+        relabeled = tuple(
+            record.model_copy(
+                update={"variant": "P1" if record.variant == left_variant else "P2"}
+            )
+            for record in selected
+        )
+        comparison = compare_planners(
+            relabeled,
+            budget_preset=cast("Literal['low', 'medium', 'high']", budget),
+            n_resamples=n_resamples,
+        )
+        planner_sections[ranker_id] = {
+            "baseline": left_variant,
+            "candidate": right_variant,
+            "completeness": _ci_payload(comparison.completeness),
+            "non_inferior": comparison.non_inferior,
+            "search_calls_reduction": (
+                None
+                if comparison.search_calls_reduction is None
+                else _ci_payload(comparison.search_calls_reduction)
+            ),
+            "query_redundancy_reduction": (
+                None
+                if comparison.query_redundancy_reduction is None
+                else _ci_payload(comparison.query_redundancy_reduction)
+            ),
         }
-    return sections
 
-
-def _pareto_sections(runs: Sequence[ExperimentTaskRun]) -> dict[str, object]:
-    grouped: defaultdict[str, list[ExperimentTaskRun]] = defaultdict(list)
-    for run in runs:
-        grouped[run.protocol].append(run)
-    sections: dict[str, object] = {}
-    pairs = {
-        "ranker_component": ("R1", "R2"),
-        "planner_policy": ("A", "D"),
-        "end_to_end": ("A", "D"),
+    end_to_end = [
+        record
+        for record in records_by_protocol["end_to_end"]
+        if record.variant in {"A", "D"}
+    ]
+    end_ci = _paired_ci(
+        end_to_end,
+        left_variant="A",
+        right_variant="D",
+        metric_name="information_completeness",
+        budget=budget,
+        n_resamples=n_resamples,
+    )
+    return {
+        "ranker_component": {
+            "baseline": "R1",
+            "candidate": "R2",
+            "metric": "citation_support_precision",
+            "confidence_interval": _ci_payload(ranker_ci),
+        },
+        "planner_policy": {
+            "comparisons": planner_sections,
+        },
+        "end_to_end": {
+            "baseline": "A",
+            "candidate": "D",
+            "metric": "information_completeness",
+            "confidence_interval": _ci_payload(end_ci),
+        },
+        "reference": {
+            "status": "not_applicable",
+            "reason": "ORACLE is evaluator-only",
+        },
     }
-    for protocol in _PROTOCOLS:
-        baseline, candidate = pairs.get(protocol, (None, None))
-        items = grouped.get(protocol, [])
-        if baseline is None or not any(item.variant.value == baseline for item in items) or not any(
-            item.variant.value == candidate for item in items
-        ):
-            sections[protocol] = {"status": "not_applicable", "reason": "paired variants unavailable"}
-            continue
-        left = [item for item in items if item.variant.value == baseline]
-        right = [item for item in items if item.variant.value == candidate]
-        left_cost = _mean([float(item.usage.cost_usd or 0) for item in left])
-        right_cost = _mean([float(item.usage.cost_usd or 0) for item in right])
-        left_quality = _mean([float(item.usage.total_tokens) for item in left])
-        right_quality = _mean([float(item.usage.total_tokens) for item in right])
-        sections[protocol] = {
-            "baseline": baseline,
-            "candidate": candidate,
-            "quality_metric": "total_tokens",
-            "cost_metric": "cost_usd",
-            "baseline_mean": {"quality": left_quality, "cost": left_cost},
-            "candidate_mean": {"quality": right_quality, "cost": right_cost},
-            "candidate_dominates": right_quality >= left_quality and right_cost <= left_cost,
-        }
-    sections["reference"] = {"status": "not_applicable", "reason": "oracle is evaluator-only"}
-    return sections
+
+
+def _pareto_sections(
+    records_by_protocol: Mapping[str, Sequence[SeedRunRecord]],
+    *,
+    n_resamples: int,
+    budget: str,
+) -> dict[str, object]:
+    selected_budget = cast("Literal['low', 'medium', 'high']", budget)
+    ranker = list(records_by_protocol["ranker_component"])
+    ranker_results = analyze_pareto(
+        ranker,
+        baseline="R1",
+        candidate="R2",
+        budget_preset=selected_budget,
+        n_resamples=n_resamples,
+    )
+    planner_results: dict[str, object] = {}
+    for ranker_id, left_variant, right_variant in (("R1", "A", "C"), ("R2", "B", "D")):
+        planner_records = [
+            record
+            for record in records_by_protocol["planner_policy"]
+            if record.variant in {left_variant, right_variant}
+        ]
+        planner_results[ranker_id] = [
+            asdict(result)
+            for result in analyze_pareto(
+                planner_records,
+                baseline=left_variant,
+                candidate=right_variant,
+                budget_preset=selected_budget,
+                n_resamples=n_resamples,
+            )
+        ]
+    end_to_end = [
+        record
+        for record in records_by_protocol["end_to_end"]
+        if record.variant in {"A", "D"}
+    ]
+    end_results = analyze_pareto(
+        end_to_end,
+        baseline="A",
+        candidate="D",
+        budget_preset=selected_budget,
+        n_resamples=n_resamples,
+    )
+    return {
+        "ranker_component": [asdict(result) for result in ranker_results],
+        "planner_policy": planner_results,
+        "end_to_end": [asdict(result) for result in end_results],
+        "reference": {"status": "not_applicable", "reason": "ORACLE is evaluator-only"},
+    }
 
 
 def _reference_metadata(
@@ -456,7 +755,14 @@ def _verify_manifest(experiment_dir: Path) -> None:
     if set(typed_files) != set(_OUTPUTS):
         raise ValueError("experiment manifest is incomplete")
     for name, expected in typed_files.items():
-        if not isinstance(name, str) or Path(name).name != name or not isinstance(expected, str):
+        if (
+            not isinstance(name, str)
+            or Path(name).name != name
+            or not isinstance(expected, str)
+            or len(expected) != 64
+            or expected != expected.lower()
+            or any(character not in "0123456789abcdef" for character in expected)
+        ):
             raise ValueError("experiment manifest contains unsafe entries")
         path = experiment_dir / name
         if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
@@ -491,6 +797,7 @@ def _verify_output_sections(
     group_id: str,
     runs: Sequence[ExperimentTaskRun],
     reference: Mapping[str, object],
+    setup_cost: Mapping[str, object],
 ) -> None:
     summary = _load_json_object(experiment_dir / "summary.json", label="summary")
     if (
@@ -513,6 +820,11 @@ def _verify_output_sections(
     reference_section = _string_object_map(sections["reference"], field="reference summary")
     if reference_section.get("reference_artifacts") != dict(reference):
         raise ValueError("summary reference metadata is inconsistent")
+    ranker_section = _string_object_map(
+        sections["ranker_component"], field="ranker summary"
+    )
+    if ranker_section.get("protocol_setup_cost") != dict(setup_cost):
+        raise ValueError("ranker setup cost summary is inconsistent")
 
     task_rows = _load_jsonl_objects(
         experiment_dir / "task_metrics.jsonl", label="task metrics"
@@ -535,15 +847,38 @@ def _verify_output_sections(
         section = _string_object_map(
             confidence_sections.get(protocol), field="confidence section"
         )
-        if not section or not {
-            "metric",
-            "estimate",
-            "lower",
-            "upper",
-            "n_tasks",
-            "n_resamples",
-        }.issubset(section):
+        if not section:
             raise ValueError("confidence interval section is empty")
+        if protocol == "ranker_component":
+            interval = _string_object_map(
+                section.get("confidence_interval"), field="ranker confidence interval"
+            )
+            if section.get("metric") != "citation_support_precision" or not {
+                "estimate",
+                "lower",
+                "upper",
+                "n_tasks",
+                "n_resamples",
+            }.issubset(interval):
+                raise ValueError("ranker confidence interval is invalid")
+        elif protocol == "planner_policy":
+            comparisons = _string_object_map(
+                section.get("comparisons"), field="planner confidence comparisons"
+            )
+            if set(comparisons) != {"R1", "R2"}:
+                raise ValueError("planner confidence comparisons are incomplete")
+        elif protocol == "end_to_end":
+            interval = _string_object_map(
+                section.get("confidence_interval"), field="end-to-end confidence interval"
+            )
+            if section.get("metric") != "information_completeness" or not {
+                "estimate",
+                "lower",
+                "upper",
+                "n_tasks",
+                "n_resamples",
+            }.issubset(interval):
+                raise ValueError("end-to-end confidence interval is invalid")
 
     pareto = _load_json_object(experiment_dir / "pareto.json", label="pareto")
     if pareto.get("schema_version") != "pareto-v1":
@@ -552,7 +887,15 @@ def _verify_output_sections(
     if set(pareto_sections) != set(_PROTOCOLS):
         raise ValueError("pareto sections are incomplete")
     for protocol in _PROTOCOLS:
-        if not _string_object_map(pareto_sections.get(protocol), field="pareto section"):
+        value = pareto_sections.get(protocol)
+        if protocol in {"ranker_component", "end_to_end"}:
+            if not isinstance(value, list) or not value:
+                raise ValueError("pareto section is empty")
+        elif protocol == "planner_policy":
+            planner = _string_object_map(value, field="planner pareto section")
+            if set(planner) != {"R1", "R2"}:
+                raise ValueError("planner pareto section is incomplete")
+        elif not _string_object_map(value, field="reference pareto section"):
             raise ValueError("pareto section is empty")
 
     failure_rows = _load_jsonl_objects(
@@ -610,6 +953,23 @@ def summarize_experiment(
         raise ValueError("oracle task is outside end-to-end coverage")
     runs = _load_runs(root, group_id=group_id)
     _validate_coverage(raw_group, runs)
+    categories = _task_categories(raw_group)
+    records_by_protocol = {
+        protocol: _seed_records(
+            [run for run in runs if run.protocol == protocol], categories=categories
+        )
+        for protocol in _PROTOCOLS
+    }
+    required_budgets = _string_object_map(
+        raw_group.get("required_budgets"), field="required_budgets"
+    )
+    primary_budget_values = _string_list(
+        required_budgets.get("end_to_end"), field="end_to_end budgets"
+    )
+    if len(primary_budget_values) != 1:
+        raise ValueError("exactly one primary budget is required for summary")
+    primary_budget = primary_budget_values[0]
+    setup_cost = _setup_cost_section(root)
     if verify_only:
         _verify_manifest(root)
         reference = _reference_metadata(
@@ -622,7 +982,11 @@ def summarize_experiment(
         if reference.get("status") != "present":
             raise ValueError("oracle reference artifacts are missing")
         _verify_output_sections(
-            root, group_id=group_id, runs=runs, reference=reference
+            root,
+            group_id=group_id,
+            runs=runs,
+            reference=reference,
+            setup_cost=setup_cost,
         )
         summary = _load_json_object(root / "summary.json", label="summary")
         return {**summary, "verified": True}
@@ -638,6 +1002,17 @@ def summarize_experiment(
     if reference.get("status") != "present":
         raise ValueError("oracle reference artifacts are missing")
     sections["reference"]["reference_artifacts"] = reference
+    sections["ranker_component"]["protocol_setup_cost"] = setup_cost
+    confidence_sections = _confidence_sections(
+        records_by_protocol,
+        n_resamples=bootstrap_resamples,
+        budget=primary_budget,
+    )
+    pareto_sections = _pareto_sections(
+        records_by_protocol,
+        n_resamples=bootstrap_resamples,
+        budget=primary_budget,
+    )
     task_rows = [_safe_run_row(run) for run in runs]
     failures = [
         {
@@ -668,11 +1043,11 @@ def summarize_experiment(
         "confidence_intervals.json": _canonical(
             {
                 "schema_version": "confidence-intervals-v1",
-                "sections": _confidence_sections(runs, n_resamples=bootstrap_resamples),
+                "sections": confidence_sections,
             }
         ),
         "pareto.json": _canonical(
-            {"schema_version": "pareto-v1", "sections": _pareto_sections(runs)}
+            {"schema_version": "pareto-v1", "sections": pareto_sections}
         ),
         "failures.jsonl": _jsonl(failures),
     }

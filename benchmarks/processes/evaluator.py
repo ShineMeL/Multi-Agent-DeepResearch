@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import uuid
@@ -26,11 +27,35 @@ class StagedRuntimeTask(SealedModel):
     base_runtime_task_sha256: Sha256
 
 
+def _is_link_or_reparse(path: Path) -> bool:
+    try:
+        details = path.lstat()
+    except FileNotFoundError:
+        return False
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return stat.S_ISLNK(details.st_mode) or bool(
+        getattr(details, "st_file_attributes", 0) & reparse_flag
+    )
+
+
+def _assert_lexically_safe(path: Path, *, label: str) -> Path:
+    absolute = Path(path).absolute()
+    current = absolute
+    while current != Path(current.anchor):
+        if _is_link_or_reparse(current):
+            raise GoldAccessViolation(f"{label} contains a symlink or reparse point")
+        current = current.parent
+    if _is_link_or_reparse(current):
+        raise GoldAccessViolation(f"{label} contains a symlink or reparse point")
+    return absolute
+
+
 def _publish_no_replace_bytes(path: Path, payload: bytes) -> Path:
     """Publish bytes without replacing an existing artifact."""
     path = Path(path)
     if path.is_symlink():
         raise GoldAccessViolation("artifact destination cannot be a symlink")
+    _assert_lexically_safe(path.parent, label="artifact destination")
     if path.exists():
         if path.is_file() and path.read_bytes() == payload:
             return path
@@ -77,8 +102,12 @@ def materialize_agent_runtime_task(
     if Path(request_id).name != request_id or request_id in {".", ".."}:
         raise GoldAccessViolation("request_id must not contain path separators")
 
-    private_root = Path(forbidden_private_root).resolve()
-    input_root = Path(agent_input_root).resolve()
+    private_root = _assert_lexically_safe(
+        Path(forbidden_private_root), label="private root"
+    )
+    input_root = _assert_lexically_safe(Path(agent_input_root), label="agent input root")
+    private_root = private_root.resolve()
+    input_root = input_root.resolve()
     if input_root == private_root or private_root in input_root.parents:
         raise GoldAccessViolation("agent input root must be outside private benchmark path")
     input_root.mkdir(parents=True, exist_ok=True)
@@ -103,13 +132,14 @@ def stage_sealed_config(
     group_run_root: Path,
 ) -> Path:
     """Copy a verified repository seal into the ignored group input root."""
-    source = Path(source_path).resolve(strict=True)
+    source = _assert_lexically_safe(Path(source_path), label="sealed config source")
     if not source.is_file() or source.is_symlink():
         raise GoldAccessViolation("sealed config source is not a regular file")
     payload = source.read_bytes()
     if sha256_bytes(payload) != expected_sha256:
         raise GoldAccessViolation("sealed config source hash mismatch")
-    destination = Path(group_run_root).resolve() / "config" / "formal.yaml"
+    root = _assert_lexically_safe(Path(group_run_root), label="group run root")
+    destination = root / "config" / "formal.yaml"
     return _publish_no_replace_bytes(destination, payload).resolve()
 
 

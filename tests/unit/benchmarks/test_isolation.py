@@ -157,6 +157,35 @@ def test_agent_runtime_guard_rejects_lexical_traversal_and_root_symlink(
         AgentRuntimeGuard(runtime_root=linked_runtime, snapshot_root=snapshots, run_root=run)
 
 
+def test_snapshot_manifest_rejects_file_symlink(tmp_path: Path) -> None:
+    from benchmarks.processes.agent import _verify_snapshot
+
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    documents = tmp_path / "documents.jsonl"
+    documents.write_bytes(b"public\n")
+    (snapshot / "documents.jsonl").symlink_to(documents)
+    (snapshot / "index.json").write_bytes(b"{}\n")
+    snapshot_payload = {
+        "task_id": "test-t1",
+        "snapshot_id": "snapshot-t1",
+        "corpus_version": "corpus-v1",
+        "index_version": "index-v1",
+        "documents_sha256": hashlib.sha256(documents.read_bytes()).hexdigest(),
+        "index_sha256": hashlib.sha256((snapshot / "index.json").read_bytes()).hexdigest(),
+    }
+    (snapshot / "snapshot.json").write_text(json.dumps(snapshot_payload), encoding="utf-8")
+    manifest = {
+        "file_sha256": {
+            name: hashlib.sha256((snapshot / name).read_bytes()).hexdigest()
+            for name in ("documents.jsonl", "index.json", "snapshot.json")
+        }
+    }
+    (snapshot / "manifest.sha256").write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises((GoldAccessViolation, ValueError), match="symlink|link|snapshot"):
+        _verify_snapshot(snapshot)
+
+
 def test_agent_checkpoint_identity_must_exist_in_verified_sqlite_source(
     tmp_path: Path,
 ) -> None:
