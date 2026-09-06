@@ -12,6 +12,7 @@ import typer
 import yaml
 from click import ClickException
 
+from benchmarks.datasets.models import RuntimeTask, TaskCategory
 from experiments.config import (
     FormalExperimentConfig,
     freeze_config,
@@ -130,15 +131,88 @@ def _oracle_bindings(config: FormalExperimentConfig, repo_root: Path):
     return provider, records
 
 
+def _load_sealed_tasks(
+    config: FormalExperimentConfig, repo_root: Path
+) -> dict[str, RuntimeTask]:
+    """Load only the sealed public RuntimeTask projections for agent runs.
+
+    The private manifest is an authorization boundary, not a task source that
+    the CLI may choose from. Every task is selected by the frozen config,
+    validated against the manifest's fixed runtime roots, and hash-bound to
+    ``internal_runtime_task_hashes`` before it reaches the evaluator runner.
+    """
+    from benchmarks.datasets.models import PrivateDatasetManifest
+    from benchmarks.datasets.validator import sha256_bytes
+    from experiments.config import canonical_sha256, validate_base_task
+
+    private_root = repo_root / "benchmarks" / "private" / config.dataset_id
+    manifest_path = _require_regular_file(
+        private_root / "private_manifest.json", label="sealed private manifest"
+    )
+    manifest_bytes = manifest_path.read_bytes()
+    if sha256_bytes(manifest_bytes) != config.private_manifest_sha256:
+        raise ValueError("sealed private manifest hash mismatch")
+    manifest = PrivateDatasetManifest.model_validate_json(manifest_bytes, strict=True)
+    if (manifest.dataset_id, manifest.version) != (
+        config.dataset_id,
+        config.dataset_version,
+    ):
+        raise ValueError("sealed private dataset identity mismatch")
+    expected_runtime_files = tuple(
+        f"runtime/test/{category.value}.jsonl" for category in TaskCategory
+    )
+    if (
+        tuple(manifest.main_test_task_ids) != tuple(config.main_test_task_ids)
+        or tuple(manifest.private_test_runtime_files) != expected_runtime_files
+    ):
+        raise ValueError("sealed private task coverage disagrees with config")
+
+    expected = set(config.main_test_task_ids)
+    tasks: dict[str, RuntimeTask] = {}
+    for relative in manifest.private_test_runtime_files:
+        relative_path = Path(relative)
+        if (
+            relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or "\\" in relative
+            or relative_path.as_posix() != relative
+        ):
+            raise ValueError("sealed private runtime path is unsafe")
+        runtime_path = _require_regular_file(
+            private_root / relative, label="sealed private runtime input"
+        )
+        for line in runtime_path.read_bytes().splitlines():
+            task = RuntimeTask.model_validate_json(line, strict=True)
+            if task.task_id not in expected:
+                continue
+            if task.task_id in tasks:
+                raise ValueError("sealed RuntimeTask coverage contains a duplicate")
+            validate_base_task(task, config)
+            expected_hash = config.internal_runtime_task_hashes.get(task.task_id)
+            if expected_hash != canonical_sha256(task.model_dump(mode="json")):
+                raise ValueError("sealed RuntimeTask hash mismatch")
+            tasks[task.task_id] = task
+    if set(tasks) != expected:
+        raise ValueError("sealed RuntimeTask inputs are incomplete")
+    return tasks
+
+
 def _runner(
     config: FormalExperimentConfig,
     source: Path,
     *,
     with_oracle: bool = False,
 ) -> ExperimentRunner:
-    kwargs: dict[str, object] = {"config_source": source.absolute()}
+    repo_root = Path.cwd().resolve()
+    tasks = _load_sealed_tasks(config, repo_root)
+    kwargs: dict[str, object] = {
+        "config_source": source.absolute(),
+        "repo_root": repo_root,
+        "private_root": repo_root / "benchmarks" / "private" / config.dataset_id,
+        "task_loader": tasks,
+    }
     if with_oracle:
-        provider, records = _oracle_bindings(config, Path.cwd().resolve())
+        provider, records = _oracle_bindings(config, repo_root)
         kwargs["oracle_provider"] = provider
         kwargs["oracle_records_loader"] = records
     return ExperimentRunner(**kwargs)  # type: ignore[arg-type]

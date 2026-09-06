@@ -123,7 +123,10 @@ def _is_link_or_reparse(path: Path) -> bool:
 
 
 def _assert_lexically_safe(path: Path, *, label: str) -> Path:
-    absolute = Path(path).absolute()
+    raw = Path(path)
+    if ".." in raw.parts:
+        raise RuntimeError(f"{label} contains lexical parent traversal")
+    absolute = raw.absolute()
     current = absolute
     while current != Path(current.anchor):
         if _is_link_or_reparse(current):
@@ -735,6 +738,124 @@ class ExperimentRunner:
         binding_path = binding_root / f"{request_sha256}.json"
         _write_immutable(binding_path, _canonical(payload))
 
+    def _validate_existing_unseeded_binding(
+        self,
+        *,
+        group_root: Path,
+        config: FormalExperimentConfig,
+        task: RuntimeTask,
+        protocol: Protocol,
+        variant: ExperimentVariant | RankerComponentVariant,
+        budget: BudgetPreset,
+        repeat_id: int,
+        key: str,
+        existing: ExperimentTaskRun,
+    ) -> None:
+        if self.seed_supported:
+            return
+        binding_root = group_root / "artifacts" / "replication-bindings"
+        _assert_lexically_safe(binding_root, label="replication binding directory")
+        if not binding_root.is_dir() or _is_link_or_reparse(binding_root):
+            raise RuntimeError("completed unseeded record requires a replication binding sidecar")
+        request_path = group_root / "requests" / f"{key}.json"
+        _assert_lexically_safe(request_path, label="replication request provenance")
+        if not request_path.is_file() or _is_link_or_reparse(request_path):
+            raise RuntimeError("completed unseeded record request provenance is missing")
+        request_sha256 = sha256_bytes(request_path.read_bytes())
+        manifest_path = Path(existing.manifest_path)
+        if not manifest_path.is_absolute():
+            manifest_path = group_root / manifest_path
+        _assert_lexically_safe(manifest_path, label="replication manifest provenance")
+        if (
+            not manifest_path.is_file()
+            or _is_link_or_reparse(manifest_path)
+            or not manifest_path.absolute().is_relative_to(group_root.absolute())
+            or manifest_path.parent != (group_root / "artifacts").absolute()
+        ):
+            raise RuntimeError("completed unseeded record manifest provenance is unsafe")
+        manifest_bytes = manifest_path.read_bytes()
+        manifest_sha256 = sha256_bytes(manifest_bytes)
+        manifest = RunManifest.model_validate_json(manifest_bytes, strict=True)
+        matches: list[dict[str, object]] = []
+        for path in sorted(binding_root.glob("*.json")):
+            if _is_link_or_reparse(path) or not path.is_file():
+                raise RuntimeError("replication binding sidecar is unsafe")
+            payload = json.loads(path.read_bytes())
+            if not isinstance(payload, dict):
+                raise TypeError("replication binding sidecar is invalid")
+            typed = cast(dict[str, object], payload)
+            if set(typed) != {
+                "schema_version",
+                "group_id",
+                "task_id",
+                "protocol",
+                "variant",
+                "budget_preset",
+                "repeat_id",
+                "request_sha256",
+                "receipt_identity",
+                "manifest_provenance",
+            }:
+                raise RuntimeError("replication binding sidecar schema is invalid")
+            provenance = typed.get("manifest_provenance")
+            if not isinstance(provenance, dict):
+                raise TypeError("replication binding sidecar provenance is invalid")
+            typed_provenance = cast(dict[object, object], provenance)
+            typed_repeat_id = (
+                cast(int, typed.get("repeat_id"))
+                if type(typed.get("repeat_id")) is int
+                else None
+            )
+            if (
+                typed.get("schema_version") != "unseeded-replication-binding-v1"
+                or path.stem != typed.get("request_sha256")
+                or not self._is_sha256(typed.get("request_sha256"))
+                or not self._is_sha256(typed.get("receipt_identity"))
+                or typed.get("group_id") != config.experiment_group_id()
+                or typed_repeat_id is None
+                or typed_repeat_id < 1
+                or typed_repeat_id > config.replication.unseeded_repeat_count
+                or set(typed_provenance) != {"manifest_sha256", "run_id", "thread_id"}
+                or not self._is_sha256(typed_provenance.get("manifest_sha256"))
+                or not isinstance(typed_provenance.get("run_id"), str)
+                or not typed_provenance.get("run_id")
+                or not isinstance(typed_provenance.get("thread_id"), str)
+                or not typed_provenance.get("thread_id")
+            ):
+                raise RuntimeError("replication binding sidecar identity is invalid")
+            if (
+                typed.get("task_id") == task.task_id
+                and typed.get("protocol") == protocol
+                and typed.get("variant") == variant.value
+                and typed.get("budget_preset") == budget
+                and typed_repeat_id == repeat_id
+                and (
+                    typed_provenance.get("manifest_sha256") != manifest_sha256
+                    or typed_provenance.get("run_id") != manifest.run_id
+                    or typed_provenance.get("thread_id") != manifest.thread_id
+                )
+            ):
+                raise RuntimeError("replication binding sidecar provenance is invalid")
+            if (
+                typed.get("task_id") == task.task_id
+                and typed.get("protocol") == protocol
+                and typed.get("variant") == variant.value
+                and typed.get("budget_preset") == budget
+                and typed_repeat_id == repeat_id
+                and typed.get("request_sha256") == request_sha256
+            ):
+                matches.append(typed)
+        if len(matches) != 1:
+            raise RuntimeError("completed unseeded record requires exactly one replication binding sidecar")
+        if (
+            manifest.seed is not None
+            or manifest.seed_supported
+            or manifest.usage != existing.usage
+            or tuple(item.snapshot_id for item in manifest.pricing_snapshots)
+            != existing.pricing_snapshot_ids
+        ):
+            raise RuntimeError("completed unseeded record manifest accounting is invalid")
+
     def _validate_agent_receipt(
         self,
         *,
@@ -1204,6 +1325,18 @@ class ExperimentRunner:
         existing = self._load_existing(raw_path)
         if existing is not None:
             if existing.status == "completed":
+                if selected_repeat is not None:
+                    self._validate_existing_unseeded_binding(
+                        group_root=group_root,
+                        config=config,
+                        task=task,
+                        protocol=protocol,
+                        variant=variant,
+                        budget=budget_preset,
+                        repeat_id=selected_repeat,
+                        key=key,
+                        existing=existing,
+                    )
                 return existing
             if not resume:
                 raise RuntimeError("failed experiment key requires explicit resume")

@@ -28,14 +28,38 @@ def test_cost_sweep_cannot_accept_cli_budget_override(tmp_path: Path) -> None:
     assert result.exit_code != 0
 
 
-def test_runner_stages_the_user_config_source(tmp_path: Path) -> None:
-    from apps.cli.experiment import _runner
+def test_runner_stages_the_user_config_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from apps.cli import experiment
 
     source = tmp_path / "formal.yaml"
     source.write_text("sealed: true\n", encoding="utf-8")
-    config = SimpleNamespace()
-    runner = _runner(config, source)  # type: ignore[arg-type]
+    config = SimpleNamespace(dataset_id="fixture")
+    monkeypatch.setattr(experiment, "_load_sealed_tasks", lambda config, repo_root: {})
+    runner = experiment._runner(config, source)  # type: ignore[arg-type]
     assert runner.config_source == source.resolve()
+
+
+def test_runner_receives_sealed_task_category_loader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from apps.cli import experiment
+
+    source = tmp_path / "formal.yaml"
+    source.write_text("sealed: true\n", encoding="utf-8")
+    config = SimpleNamespace(dataset_id="dataset-v1")
+    sealed_tasks = {"task-a": object()}
+    monkeypatch.setattr(
+        experiment,
+        "_load_sealed_tasks",
+        lambda loaded, repo_root: sealed_tasks,
+        raising=False,
+    )
+
+    runner = experiment._runner(config, source)  # type: ignore[arg-type]
+
+    assert runner._task_loader is sealed_tasks
 
 
 def test_private_manifest_must_be_a_real_file_not_a_symlink(tmp_path: Path) -> None:

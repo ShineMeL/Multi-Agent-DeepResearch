@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 from benchmarks.datasets.models import TaskCategory
+from benchmarks.datasets.validator import canonical_json_bytes
 from benchmarks.evaluators.metrics import MetricValue
 from benchmarks.evaluators.statistics import SeedRunRecord, compare_rankers
-from deepresearch.domain import ResourceUsage
+from deepresearch.domain import ResourceUsage, RunBudget
+from deepresearch.runtime.manifest import PricingSnapshot, RunManifest
 from experiments.models import (
     EvaluatorReferenceManifest,
     ExperimentTaskRun,
@@ -28,6 +32,7 @@ def _write_full_group(root: Path) -> Path:
         "budget_preset": "medium",
         "candidate_pool_seed": 7,
         "pricing_snapshot_id": "pricing-v1",
+        "code_commit": "a" * 40,
         "private_manifest_sha256": "b" * 64,
         "evaluator_version": "evaluator-v1",
         "protocols": ["ranker_component", "planner_policy", "end_to_end", "reference"],
@@ -162,6 +167,96 @@ def _write_full_group(root: Path) -> Path:
             (root / "raw" / f"{key}.json").write_bytes(
                 json.dumps(run.model_dump(mode="json"), sort_keys=True).encode("utf-8")
             )
+    candidate_key = ExperimentRunner.idempotency_key(
+        "group", "ranker_component", "POOL", "task-a", 7, None, "medium"
+    )
+    candidate_payload = {"candidate_pool_version": "formal-v1", "evidence_ids": [], "task_id": "task-a"}
+    candidate_bytes = canonical_json_bytes(candidate_payload)
+    candidate_root = root / "candidate-pools"
+    setup_root = root / "candidate-pool-setup"
+    artifact_root = root / "artifacts"
+    candidate_root.mkdir()
+    setup_root.mkdir()
+    artifact_root.mkdir()
+    candidate_path = candidate_root / f"{candidate_key}.json"
+    candidate_path.write_bytes(candidate_bytes)
+    candidate_hash = hashlib.sha256(candidate_bytes).hexdigest()
+    for raw_path in (root / "raw").glob("*.json"):
+        raw_payload = json.loads(raw_path.read_bytes())
+        if raw_payload["protocol"] == "ranker_component":
+            raw_payload["candidate_pool_hash"] = candidate_hash
+            raw_path.write_bytes(canonical_json_bytes(raw_payload))
+    pricing = PricingSnapshot(
+        snapshot_id="pricing-v1",
+        provider_id="model-provider",
+        endpoint_type="responses",
+        model_id="model-v1",
+        effective_at=datetime(2026, 9, 6, tzinfo=UTC),
+        currency="USD",
+        input_tokens_per_million_usd=Decimal(0),
+        output_tokens_per_million_usd=Decimal(0),
+        cached_tokens_per_million_usd=Decimal(0),
+        reasoning_tokens_per_million_usd=Decimal(0),
+    )
+    usage = ResourceUsage.zero(cost_known=True)
+    manifest = RunManifest.create(
+        {
+            "schema_version": "run-manifest-v1",
+            "run_id": "pool-run-1",
+            "thread_id": "pool-thread-1",
+            "code_commit": "a" * 40,
+            "dependency_lock_sha256": "b" * 64,
+            "request_sha256": "c" * 64,
+            "config_sha256": "d" * 64,
+            "workflow_id": "research-v1",
+            "graph_version": "graph-v1",
+            "planner_id": "P1",
+            "provider_profiles": (),
+            "model_ids": (),
+            "prompt_versions": {},
+            "parser_versions": {},
+            "ranker_id": "R1",
+            "ranker_weights_version": "weights-v1",
+            "budget": RunBudget.preset("medium"),
+            "usage": usage,
+            "usage_by_node": {},
+            "pricing_status": "estimated",
+            "pricing_snapshots": (pricing,),
+            "provider_calls": (),
+            "node_executions": (),
+            "parsed_artifacts": (),
+            "evidence_hashes": (),
+            "source_snapshot_ids": (),
+            "artifact_ids": (),
+            "run_event_count": 0,
+            "run_events_sha256": "e" * 64,
+            "seed": 7,
+            "seed_supported": True,
+            "cache_hit_count": 0,
+            "stop_reason": "SUFFICIENT",
+            "is_partial": False,
+            "failure_codes": (),
+            "started_at": datetime(2026, 9, 6, tzinfo=UTC),
+            "finished_at": datetime(2026, 9, 6, 0, 0, 1, tzinfo=UTC),
+        }
+    )
+    manifest_path = artifact_root / f"{candidate_key}.json"
+    manifest_bytes = manifest.model_dump_json().encode("utf-8")
+    manifest_path.write_bytes(manifest_bytes)
+    setup = {
+        "schema_version": "candidate-pool-setup-v1",
+        "group_id": "group",
+        "task_id": "task-a",
+        "pool_key": candidate_key,
+        "candidate_pool_sha256": candidate_hash,
+        "evidence_ids_sha256": hashlib.sha256(canonical_json_bytes([])).hexdigest(),
+        "manifest_path": str(manifest_path),
+        "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "usage": usage.model_dump(mode="json"),
+        "pricing_snapshot_ids": ["pricing-v1"],
+        "pricing_status": "estimated",
+    }
+    (setup_root / f"{candidate_key}.json").write_bytes(canonical_json_bytes(setup))
     created_at = datetime(2026, 9, 6, tzinfo=UTC)
     oracle_result = OracleReferenceResult(
         task_id="task-a",
@@ -277,10 +372,60 @@ def test_summary_rejects_oracle_dataset_version_tamper(tmp_path: Path) -> None:
 def test_summary_rejects_extra_candidate_setup_artifact(tmp_path: Path) -> None:
     root = _write_full_group(tmp_path / "group")
     setup_root = root / "candidate-pool-setup"
-    setup_root.mkdir()
     (setup_root / "extra.json").write_text("{}", encoding="utf-8")
 
     with pytest.raises(ValueError, match="candidate pool setup"):
+        summarize_experiment(root, bootstrap_resamples=4)
+
+
+def test_summary_rejects_completed_ranker_without_verified_pool_setup(
+    tmp_path: Path,
+) -> None:
+    root = _write_full_group(tmp_path / "group")
+    for path in (root / "candidate-pool-setup").glob("*.json"):
+        path.unlink()
+    for path in (root / "candidate-pools").glob("*.json"):
+        path.unlink()
+    (root / "candidate-pool-setup").rmdir()
+    (root / "candidate-pools").rmdir()
+
+    with pytest.raises(ValueError, match="candidate pool|setup"):
+        summarize_experiment(root, bootstrap_resamples=4)
+
+
+def test_summary_rejects_unseeded_completed_records_without_replication_binding(
+    tmp_path: Path,
+) -> None:
+    root = _write_full_group(tmp_path / "group")
+    group_path = root / "group.json"
+    group = json.loads(group_path.read_bytes())
+    group["replication"] = {
+        "mode": "independent_repeats",
+        "seed_supported": False,
+        "seed_values": [],
+        "repeat_ids": [1],
+    }
+    group_path.write_text(json.dumps(group), encoding="utf-8")
+    for path in tuple((root / "raw").glob("*.json")):
+        payload = json.loads(path.read_bytes())
+        payload["seed"] = None
+        payload["repeat_id"] = 1
+        renamed = root / "raw" / (
+            ExperimentRunner.idempotency_key(
+                group["group_id"],
+                payload["protocol"],
+                payload["variant"],
+                payload["task_id"],
+                None,
+                1,
+                payload["budget_preset"],
+            )
+            + ".json"
+        )
+        path.unlink()
+        renamed.write_bytes(json.dumps(payload, sort_keys=True).encode("utf-8"))
+
+    with pytest.raises(ValueError, match="replication binding|sidecar"):
         summarize_experiment(root, bootstrap_resamples=4)
 
 

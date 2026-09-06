@@ -276,6 +276,18 @@ def test_runner_rejects_private_or_snapshot_root_symlink(tmp_path: Path) -> None
         )
 
 
+def test_runner_rejects_lexical_parent_traversal_before_root_resolution(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(RuntimeError, match="parent traversal|lexical"):
+        ExperimentRunner(
+            launch_agent=SpyLauncher(),
+            experiment_root=tmp_path,
+            private_root=tmp_path / "private" / ".." / "outside",
+            preflight=False,
+        )
+
+
 @pytest.mark.asyncio
 async def test_request_staging_failure_is_recorded_without_evaluator(
     tmp_path: Path,
@@ -633,6 +645,62 @@ async def test_unseeded_runner_uses_sealed_repeat_ids_and_request_identity(tmp_p
     assert launcher.requests[0].seed_supported is False
     assert launcher.requests[0].seed is None
     assert launcher.requests[0].repeat_id == 1
+
+
+@pytest.mark.asyncio
+async def test_unseeded_completed_fast_path_requires_replication_binding(
+    tmp_path: Path,
+) -> None:
+    config, task = _config_and_task()
+    runner = ExperimentRunner(
+        launch_agent=SpyLauncher(),
+        task_loader={task.task_id: task},
+        experiment_root=tmp_path,
+        private_root=tmp_path / "private",
+        seed_supported=False,
+        preflight=False,
+    )
+    group_root = runner._group_root(config)
+    key = runner._idempotency_key(
+        config.experiment_group_id(),
+        "end_to_end",
+        "D",
+        task.task_id,
+        None,
+        1,
+        config.budget_preset,
+    )
+    existing = ExperimentTaskRun(
+        task_id=task.task_id,
+        protocol="end_to_end",
+        variant=ExperimentVariant.D,
+        planner_id="P2",
+        ranker_id="R2",
+        budget_preset=config.budget_preset,
+        repeat_id=1,
+        status="completed",
+        manifest_path=str(group_root / "artifacts" / "missing.json"),
+        artifact_ids=(),
+        usage=ResourceUsage.zero(cost_known=True),
+        pricing_snapshot_ids=(config.pricing_snapshot.snapshot_id,),
+        pricing_status="estimated",
+        cost_label="estimated_from_normalized_schedule",
+        category=task.category,
+        metrics={},
+    )
+    (group_root / "raw" / f"{key}.json").write_bytes(
+        canonical_json_bytes(existing.model_dump(mode="json"))
+    )
+
+    with pytest.raises(RuntimeError, match="replication binding|sidecar"):
+        await runner.run_one(
+            config=config,
+            protocol="end_to_end",
+            task_id=task.task_id,
+            variant=ExperimentVariant.D,
+            budget_preset=config.budget_preset,
+            repeat_id=1,
+        )
 
 
 def test_unseeded_receipt_binding_rejects_cross_repeat_reuse(tmp_path: Path) -> None:

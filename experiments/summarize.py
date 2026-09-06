@@ -29,7 +29,7 @@ from benchmarks.evaluators.statistics import (
     compare_rankers,
     paired_stratified_bootstrap,
 )
-from deepresearch.domain import ResourceUsage
+from deepresearch.domain import ResourceUsage, RunBudget
 from deepresearch.runtime.manifest import RunManifest
 from experiments.models import (
     EvaluatorReferenceManifest,
@@ -44,6 +44,7 @@ _OUTPUTS = (
     "confidence_intervals.json",
     "pareto.json",
     "failures.jsonl",
+    "replication-bindings.jsonl",
     "oracle-reference.jsonl",
     "evaluator-reference-manifest.json",
 )
@@ -138,6 +139,169 @@ def _load_runs(experiment_dir: Path, *, group_id: str) -> tuple[ExperimentTaskRu
     return tuple(runs)
 
 
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and value == value.lower()
+        and value != "0" * 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _load_replication_bindings(
+    experiment_dir: Path,
+    *,
+    group: Mapping[str, object],
+    runs: Sequence[ExperimentTaskRun],
+) -> list[dict[str, object]]:
+    """Validate evaluator-owned repeat sidecars before aggregating raw runs."""
+    replication = _string_object_map(group.get("replication"), field="replication")
+    seed_supported = replication.get("seed_supported")
+    binding_root = experiment_dir / "artifacts" / "replication-bindings"
+    _assert_summary_path(binding_root, label="replication binding root")
+    if seed_supported is True:
+        if binding_root.exists():
+            if not binding_root.is_dir() or _is_link_or_reparse(binding_root):
+                raise ValueError("replication binding root is unsafe")
+            if any(binding_root.iterdir()):
+                raise ValueError("seeded experiment contains unseeded replication bindings")
+        return []
+    if seed_supported is not False:
+        raise ValueError("replication seed support metadata is invalid")
+    repeats = replication.get("repeat_ids")
+    if (
+        not isinstance(repeats, list)
+        or any(type(item) is not int or item < 1 for item in cast(list[object], repeats))
+        or len(set(cast(list[int], repeats))) != len(cast(list[int], repeats))
+    ):
+        raise ValueError("replication repeat coverage is invalid")
+    if not binding_root.exists() or not binding_root.is_dir() or _is_link_or_reparse(binding_root):
+        if any(run.status == "completed" and run.validity == "valid" for run in runs):
+            raise ValueError("completed unseeded records require replication bindings")
+        return []
+
+    expected_schema = {
+        "schema_version",
+        "group_id",
+        "task_id",
+        "protocol",
+        "variant",
+        "budget_preset",
+        "repeat_id",
+        "request_sha256",
+        "receipt_identity",
+        "manifest_provenance",
+    }
+    rows: list[dict[str, object]] = []
+    matched_indices: set[int] = set()
+    matched_completed: set[int] = set()
+    for path in sorted(binding_root.iterdir()):
+        _assert_summary_path(path, label="replication binding artifact")
+        if _is_link_or_reparse(path) or path.suffix != ".json" or not path.is_file():
+            raise ValueError("replication binding artifact is unsafe")
+        payload = json.loads(path.read_bytes())
+        if not isinstance(payload, dict):
+            raise TypeError("replication binding artifact is invalid")
+        typed = cast(dict[str, object], payload)
+        if set(typed) != expected_schema:
+            raise ValueError("replication binding schema is invalid")
+        if (
+            typed.get("schema_version") != "unseeded-replication-binding-v1"
+            or typed.get("group_id") != group.get("group_id")
+            or path.stem != typed.get("request_sha256")
+            or not _is_sha256(typed.get("request_sha256"))
+            or not _is_sha256(typed.get("receipt_identity"))
+            or type(typed.get("repeat_id")) is not int
+            or typed["repeat_id"] not in cast(list[int], repeats)
+        ):
+            raise ValueError("replication binding identity is invalid")
+        provenance_value = typed.get("manifest_provenance")
+        if not isinstance(provenance_value, dict):
+            raise TypeError("replication binding provenance is invalid")
+        provenance = cast(dict[str, object], provenance_value)
+        if set(provenance) != {"manifest_sha256", "run_id", "thread_id"}:
+            raise ValueError("replication binding provenance is invalid")
+        if (
+            not _is_sha256(provenance.get("manifest_sha256"))
+            or not isinstance(provenance.get("run_id"), str)
+            or not provenance["run_id"]
+            or not isinstance(provenance.get("thread_id"), str)
+            or not provenance["thread_id"]
+        ):
+            raise ValueError("replication binding provenance is invalid")
+        candidates = [
+            (index, run)
+            for index, run in enumerate(runs)
+            if run.task_id == typed.get("task_id")
+            and run.protocol == typed.get("protocol")
+            and run.variant.value == typed.get("variant")
+            and run.budget_preset == typed.get("budget_preset")
+            and run.repeat_id == typed.get("repeat_id")
+        ]
+        if not candidates:
+            raise ValueError("replication binding has no matching completed raw record")
+        matched_index, run = candidates[0]
+        raw_manifest_path = Path(run.manifest_path)
+        if not raw_manifest_path.is_absolute():
+            raw_manifest_path = experiment_dir / raw_manifest_path
+        _assert_summary_path(raw_manifest_path, label="replication manifest provenance")
+        if (
+            not raw_manifest_path.is_file()
+            or _is_link_or_reparse(raw_manifest_path)
+            or not raw_manifest_path.absolute().is_relative_to(experiment_dir.absolute())
+            or raw_manifest_path.parent != (experiment_dir / "artifacts").absolute()
+            or hashlib.sha256(raw_manifest_path.read_bytes()).hexdigest()
+            != provenance["manifest_sha256"]
+        ):
+            raise ValueError("replication binding manifest provenance mismatch")
+        manifest = RunManifest.model_validate_json(raw_manifest_path.read_bytes(), strict=True)
+        if (
+            manifest.run_id != provenance["run_id"]
+            or manifest.thread_id != provenance["thread_id"]
+            or manifest.seed is not None
+            or manifest.seed_supported
+            or manifest.usage != run.usage
+            or tuple(item.snapshot_id for item in manifest.pricing_snapshots)
+            != run.pricing_snapshot_ids
+        ):
+            raise ValueError("replication binding record identity mismatch")
+        from experiments.runner import ExperimentRunner
+
+        request_key = ExperimentRunner.idempotency_key(
+            cast(str, group["group_id"]),
+            run.protocol,
+            run.variant.value,
+            run.task_id,
+            None,
+            run.repeat_id,
+            run.budget_preset,
+        )
+        request_path = experiment_dir / "requests" / f"{request_key}.json"
+        _assert_summary_path(request_path, label="replication request provenance")
+        if (
+            not request_path.is_file()
+            or _is_link_or_reparse(request_path)
+            or hashlib.sha256(request_path.read_bytes()).hexdigest()
+            != typed["request_sha256"]
+        ):
+            raise ValueError("replication binding request provenance mismatch")
+        if matched_index in matched_indices:
+            raise ValueError("duplicate replication binding for raw record")
+        matched_indices.add(matched_index)
+        if run.status == "completed" and run.validity == "valid":
+            matched_completed.add(matched_index)
+        rows.append(typed)
+    completed_indices = {
+        index
+        for index, run in enumerate(runs)
+        if run.status == "completed" and run.validity == "valid"
+    }
+    if matched_completed != completed_indices:
+        raise ValueError("completed unseeded records have incomplete replication bindings")
+    return rows
+
+
 def _safe_run_row(run: ExperimentTaskRun) -> dict[str, object]:
     return {
         "task_id": run.task_id,
@@ -186,17 +350,17 @@ def _resource_metric(name: str, value: float) -> MetricValue:
     )
 
 
-def _setup_cost_section(experiment_dir: Path) -> dict[str, object]:
+def _setup_cost_section(
+    experiment_dir: Path, *, runs: Sequence[ExperimentTaskRun]
+) -> dict[str, object]:
     from experiments.runner import ExperimentRunner
 
     setup_root = experiment_dir / "candidate-pool-setup"
+    candidate_root = experiment_dir / "candidate-pools"
     usages: list[ResourceUsage] = []
     pricing_snapshot_ids: set[str] = set()
     _assert_summary_path(setup_root, label="candidate pool setup root")
-    if not setup_root.exists():
-        return {"count": 0, "usage": {}, "pricing_snapshot_ids": []}
-    if setup_root.is_symlink() or not setup_root.is_dir():
-        raise ValueError("candidate pool setup root is unsafe")
+    _assert_summary_path(candidate_root, label="candidate pool root")
     group_payload = json.loads((experiment_dir / "group.json").read_bytes())
     if not isinstance(group_payload, dict):
         raise TypeError("experiment group metadata is invalid")
@@ -206,11 +370,7 @@ def _setup_cost_section(experiment_dir: Path) -> dict[str, object]:
     candidate_pool_seed = group.get("candidate_pool_seed")
     pricing_snapshot_id = group.get("pricing_snapshot_id")
     task_map_value = group.get("protocol_task_ids")
-    task_map = (
-        cast(dict[str, object], task_map_value)
-        if isinstance(task_map_value, dict)
-        else None
-    )
+    task_map = cast(dict[str, object], task_map_value) if isinstance(task_map_value, dict) else None
     ranker_task_values = None if task_map is None else task_map.get("ranker_component")
     if (
         not isinstance(group_id, str)
@@ -219,9 +379,14 @@ def _setup_cost_section(experiment_dir: Path) -> dict[str, object]:
         or not isinstance(pricing_snapshot_id, str)
         or task_map is None
         or not isinstance(ranker_task_values, list)
+        or any(
+            type(task_id) is not str
+            for task_id in cast(list[object], ranker_task_values)
+        )
     ):
         raise TypeError("candidate pool setup identity is not sealed")
-    expected_pool_keys = {
+    ranker_task_ids = cast(list[str], ranker_task_values)
+    expected_pool_tasks = {
         ExperimentRunner.idempotency_key(
             group_id,
             "ranker_component",
@@ -230,108 +395,138 @@ def _setup_cost_section(experiment_dir: Path) -> dict[str, object]:
             candidate_pool_seed,
             None,
             budget_preset,
-        )
-        for task_id in cast(list[object], ranker_task_values)
-        if isinstance(task_id, str)
+        ): task_id
+        for task_id in ranker_task_ids
     }
-    for path in sorted(setup_root.glob("*.json")):
-        if path.is_symlink() or not path.is_file():
-            raise ValueError("candidate pool setup artifact is unsafe")
-        if path.stem not in expected_pool_keys:
-            raise ValueError("candidate pool setup filename is not sealed")
+    completed_ranker = [
+        run
+        for run in runs
+        if run.protocol == "ranker_component"
+        and run.status == "completed"
+        and run.validity == "valid"
+    ]
+    if not setup_root.exists() or not candidate_root.exists():
+        if completed_ranker:
+            raise ValueError("completed ranker records require candidate pool setup")
+        return {"count": 0, "usage": {}, "pricing_snapshot_ids": []}
+    if (
+        _is_link_or_reparse(setup_root)
+        or not setup_root.is_dir()
+        or _is_link_or_reparse(candidate_root)
+        or not candidate_root.is_dir()
+    ):
+        raise ValueError("candidate pool setup root is unsafe")
+    setup_paths = sorted(setup_root.iterdir())
+    candidate_paths = sorted(candidate_root.iterdir())
+    if any(
+        _is_link_or_reparse(path) or not path.is_file() or path.suffix != ".json"
+        for path in (*setup_paths, *candidate_paths)
+    ):
+        raise ValueError("candidate pool artifact is unsafe")
+    if {path.stem for path in setup_paths} != set(expected_pool_tasks):
+        raise ValueError("candidate pool setup coverage is incomplete or contains extras")
+    if {path.stem for path in candidate_paths} != set(expected_pool_tasks):
+        raise ValueError("candidate pool coverage is incomplete or contains extras")
+
+    candidate_hashes: dict[str, str] = {}
+    setup_schema = {
+        "schema_version",
+        "group_id",
+        "task_id",
+        "pool_key",
+        "candidate_pool_sha256",
+        "evidence_ids_sha256",
+        "manifest_path",
+        "manifest_sha256",
+        "usage",
+        "pricing_snapshot_ids",
+        "pricing_status",
+    }
+    for path in setup_paths:
+        expected_task_id = expected_pool_tasks[path.stem]
         payload = json.loads(path.read_bytes())
         if not isinstance(payload, dict):
             raise TypeError("candidate pool setup artifact is invalid")
         typed = cast(dict[str, object], payload)
-        if set(typed) != {
-            "schema_version",
-            "group_id",
-            "task_id",
-            "pool_key",
-            "candidate_pool_sha256",
-            "evidence_ids_sha256",
-            "manifest_path",
-            "manifest_sha256",
-            "usage",
-            "pricing_snapshot_ids",
-            "pricing_status",
-        }:
+        if set(typed) != setup_schema:
             raise ValueError("candidate pool setup artifact schema is invalid")
-        usage = ResourceUsage.model_validate_json(_canonical(typed["usage"]), strict=True)
-        if usage.cost_usd is None or typed["pricing_status"] != "estimated":
-            raise ValueError("candidate pool setup cost is not verified")
         if (
-            typed["group_id"] != group_id
+            typed["schema_version"] != "candidate-pool-setup-v1"
+            or typed["group_id"] != group_id
+            or typed["task_id"] != expected_task_id
             or typed["pool_key"] != path.stem
-            or typed["pool_key"] not in expected_pool_keys
-            or not isinstance(typed["task_id"], str)
             or not isinstance(typed["manifest_path"], str)
+            or not _is_sha256(typed["candidate_pool_sha256"])
+            or not _is_sha256(typed["evidence_ids_sha256"])
+            or not _is_sha256(typed["manifest_sha256"])
+            or typed["pricing_status"] != "estimated"
         ):
             raise ValueError("candidate pool setup identity is invalid")
-        candidate_path = experiment_dir / "candidate-pools" / f"{path.stem}.json"
-        _assert_summary_path(candidate_path, label="candidate pool artifact")
-        if candidate_path.is_symlink() or not candidate_path.is_file():
-            raise ValueError("candidate pool artifact is missing or unsafe")
+        usage = ResourceUsage.model_validate_json(_canonical(typed["usage"]), strict=True)
+        if usage.cost_usd is None:
+            raise ValueError("candidate pool setup cost is not verified")
+        pricing_ids = typed["pricing_snapshot_ids"]
+        if pricing_ids != [pricing_snapshot_id]:
+            raise ValueError("candidate pool setup pricing identity is invalid")
+        candidate_path = candidate_root / f"{path.stem}.json"
         candidate_bytes = candidate_path.read_bytes()
-        if typed["candidate_pool_sha256"] != hashlib.sha256(candidate_bytes).hexdigest():
+        candidate_hash = hashlib.sha256(candidate_bytes).hexdigest()
+        if typed["candidate_pool_sha256"] != candidate_hash:
             raise ValueError("candidate pool setup hash mismatch")
         candidate_payload = json.loads(candidate_bytes)
         if not isinstance(candidate_payload, dict):
             raise TypeError("candidate pool artifact is invalid")
         candidate = cast(dict[str, object], candidate_payload)
-        if candidate.get("task_id") != typed["task_id"]:
+        if candidate.get("task_id") != expected_task_id:
             raise ValueError("candidate pool task identity mismatch")
         evidence_ids_value = candidate.get("evidence_ids")
-        evidence_ids = (
-            cast(list[object], evidence_ids_value)
-            if isinstance(evidence_ids_value, list)
-            else None
-        )
-        if evidence_ids is None:
-            raise ValueError("candidate pool evidence hash mismatch")
+        if not isinstance(evidence_ids_value, list):
+            raise TypeError("candidate pool evidence hash mismatch")
+        evidence_ids = cast(list[object], evidence_ids_value)
         if any(not isinstance(item, str) or not item for item in evidence_ids):
             raise ValueError("candidate pool evidence hash mismatch")
         typed_evidence_ids = cast(list[str], evidence_ids)
         if typed_evidence_ids != sorted(set(typed_evidence_ids)):
             raise ValueError("candidate pool evidence hash mismatch")
-        if typed["evidence_ids_sha256"] != hashlib.sha256(
-            _canonical(typed_evidence_ids)
-        ).hexdigest():
+        if typed["evidence_ids_sha256"] != hashlib.sha256(_canonical(typed_evidence_ids)).hexdigest():
             raise ValueError("candidate pool evidence hash mismatch")
         manifest_path = Path(typed["manifest_path"])
         _assert_summary_path(manifest_path, label="candidate pool setup manifest")
         if (
             not manifest_path.is_absolute()
             or ".." in manifest_path.parts
-            or manifest_path.is_symlink()
+            or _is_link_or_reparse(manifest_path)
             or not manifest_path.is_file()
-            or manifest_path.parent != (experiment_dir / "artifacts").resolve()
+            or manifest_path.parent != (experiment_dir / "artifacts").absolute()
         ):
             raise ValueError("candidate pool setup manifest path is unsafe")
         manifest_bytes = manifest_path.read_bytes()
         if typed["manifest_sha256"] != hashlib.sha256(manifest_bytes).hexdigest():
             raise ValueError("candidate pool setup manifest hash mismatch")
         manifest = RunManifest.model_validate_json(manifest_bytes, strict=True)
+        expected_budget = RunBudget.preset(cast(Literal["low", "medium", "high"], budget_preset))
         if (
             manifest.usage != usage
-            or tuple(item.snapshot_id for item in manifest.pricing_snapshots)
-            != (pricing_snapshot_id,)
-            or typed["pricing_snapshot_ids"] != [pricing_snapshot_id]
+            or manifest.pricing_status != "estimated"
+            or tuple(item.snapshot_id for item in manifest.pricing_snapshots) != (pricing_snapshot_id,)
+            or manifest.workflow_id != "research-v1"
+            or manifest.planner_id != "P1"
+            or manifest.ranker_id != "R1"
+            or manifest.seed != candidate_pool_seed
+            or manifest.seed_supported is not True
+            or manifest.code_commit != group.get("code_commit")
+            or manifest.budget.model_dump(mode="json", exclude={"used_by_node"})
+            != expected_budget.model_dump(mode="json", exclude={"used_by_node"})
+            or not _is_sha256(manifest.request_sha256)
+            or not _is_sha256(manifest.config_sha256)
         ):
-            raise ValueError("candidate pool setup accounting mismatch")
-        raw_pricing_ids = typed["pricing_snapshot_ids"]
-        raw_pricing_items = (
-            cast(list[object], raw_pricing_ids)
-            if isinstance(raw_pricing_ids, list)
-            else None
-        )
-        if (
-            raw_pricing_items is None
-            or any(not isinstance(item, str) or not item for item in raw_pricing_items)
-        ):
-            raise ValueError("candidate pool setup pricing identity is invalid")
+            raise ValueError("candidate pool setup manifest identity mismatch")
+        candidate_hashes[expected_task_id] = candidate_hash
         usages.append(usage)
-        pricing_snapshot_ids.update(cast(list[str], raw_pricing_ids))
+        pricing_snapshot_ids.update(cast(list[str], pricing_ids))
+    for run in completed_ranker:
+        if run.candidate_pool_hash is None or candidate_hashes.get(run.task_id) != run.candidate_pool_hash:
+            raise ValueError("completed ranker record candidate pool is not verified")
     total_fields: dict[str, object] = {
         name: sum(int(getattr(usage, name)) for usage in usages)
         for name in (
@@ -935,6 +1130,7 @@ def _verify_output_sections(
     runs: Sequence[ExperimentTaskRun],
     reference: Mapping[str, object],
     setup_cost: Mapping[str, object],
+    replication_bindings: Sequence[Mapping[str, object]],
 ) -> None:
     summary = _load_json_object(experiment_dir / "summary.json", label="summary")
     if (
@@ -969,6 +1165,12 @@ def _verify_output_sections(
     expected_rows = [_safe_run_row(run) for run in runs]
     if task_rows != expected_rows:
         raise ValueError("task metrics do not match raw records")
+
+    binding_rows = _load_jsonl_objects(
+        experiment_dir / "replication-bindings.jsonl", label="replication bindings"
+    )
+    if binding_rows != [dict(row) for row in replication_bindings]:
+        raise ValueError("replication binding output does not match raw records")
 
     confidence = _load_json_object(
         experiment_dir / "confidence_intervals.json", label="confidence intervals"
@@ -1111,7 +1313,10 @@ def summarize_experiment(
     if len(primary_budget_values) != 1:
         raise ValueError("exactly one primary budget is required for summary")
     primary_budget = primary_budget_values[0]
-    setup_cost = _setup_cost_section(root)
+    replication_bindings = _load_replication_bindings(
+        root, group=raw_group, runs=runs
+    )
+    setup_cost = _setup_cost_section(root, runs=runs)
     if verify_only:
         _verify_manifest(root)
         reference = _reference_metadata(
@@ -1130,6 +1335,7 @@ def summarize_experiment(
             runs=runs,
             reference=reference,
             setup_cost=setup_cost,
+            replication_bindings=replication_bindings,
         )
         summary = _load_json_object(root / "summary.json", label="summary")
         return {**summary, "verified": True}
@@ -1194,6 +1400,7 @@ def summarize_experiment(
             {"schema_version": "pareto-v1", "sections": pareto_sections}
         ),
         "failures.jsonl": _jsonl(failures),
+        "replication-bindings.jsonl": _jsonl(replication_bindings),
     }
     for name, payload in outputs.items():
         _write_reusable(root / name, payload)
