@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from benchmarks.datasets.models import AnnotatedQuestion, PrivateDatasetManifest, TaskCategory
 from benchmarks.datasets.validator import DatasetValidator, app
+from tests.unit.benchmarks.test_builder import (
+    _write_snapshot,  # pyright: ignore[reportPrivateUsage]
+)
 
 TEMPLATE = (
     Path(__file__).parents[3]
@@ -170,3 +174,40 @@ def test_validate_dataset_cli_accepts_manifest_option(tmp_path: Path) -> None:
 
     assert result.exit_code == 2
     assert json.loads(result.output)["record_count"] == 0
+
+
+@pytest.mark.parametrize(
+    ("relation", "cutoff", "valid"),
+    [
+        ("support", date(2026, 8, 28), False),
+        ("support", date(2026, 8, 29), True),
+        ("context", date(2026, 8, 28), True),
+        ("contradict", date(2026, 8, 28), True),
+    ],
+)
+def test_freshness_cutoff_rejects_only_post_cutoff_direct_support(
+    tmp_path: Path, relation: str, cutoff: date, valid: bool
+) -> None:
+    payload = _question().model_dump(mode="json")
+    payload["category"] = "freshness"
+    payload["evaluation_cutoff"] = cutoff.isoformat()
+    for group in payload["gold_claim_links"]:
+        for link in group["evidence_links"]:
+            link["relation"] = relation
+    question = _write_snapshot(
+        AnnotatedQuestion.model_validate_json(json.dumps(payload), strict=True), tmp_path
+    )
+
+    report = DatasetValidator(snapshot_root=tmp_path).validate_records(
+        (question,),
+        batch_id="freshness",
+        expected_category=TaskCategory.FRESHNESS,
+        expected_count=1,
+    )
+
+    assert report.valid is valid
+    if not valid:
+        assert any(
+            "direct-support evidence" in error and "evaluation_cutoff" in error
+            for error in report.errors
+        )

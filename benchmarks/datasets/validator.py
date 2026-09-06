@@ -7,6 +7,7 @@ import re
 import unicodedata
 from collections import Counter
 from collections.abc import Sequence
+from datetime import UTC
 from pathlib import Path
 from typing import Annotated, Literal, cast
 
@@ -233,6 +234,12 @@ class DatasetValidator:
             errors.append(f"task {question.task_id}: candidate source is absent from snapshot")
         if not set(question.gold_source_family_ids) <= source_families:
             errors.append(f"task {question.task_id}: gold source family is absent from snapshot")
+        direct_support_ids = {
+            link.evidence_id
+            for group in question.gold_claim_links
+            for link in group.evidence_links
+            if link.relation == "support"
+        }
         for span in question.gold_evidence_spans:
             try:
                 record = snapshot.record(span.evidence_id)
@@ -245,6 +252,15 @@ class DatasetValidator:
                 or record.excerpt_hash != span.excerpt_hash
             ):
                 errors.append(f"task {question.task_id}: gold evidence disagrees with snapshot")
+            if (
+                span.evidence_id in direct_support_ids
+                and record.published_at is not None
+                and record.published_at.astimezone(UTC).date() > question.evaluation_cutoff
+            ):
+                errors.append(
+                    f"task {question.task_id}: direct-support evidence {span.evidence_id} "
+                    "was published after evaluation_cutoff"
+                )
         return _stable_messages(errors)
 
     def validate_records(
