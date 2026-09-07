@@ -1,3 +1,6 @@
-# Budget fixture report
+# Budget Exhausted fixture report
 
-The report is partial because the hard budget was exhausted.
+budget exhausted fixture answer
+
+Evidence:
+- evidence-budget: budget_exhausted evidence evidence-budget | offline evidence evidence-budget

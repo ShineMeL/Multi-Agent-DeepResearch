@@ -11,10 +11,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import shutil
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -879,19 +878,26 @@ def _sum_fixture_usage(*usages: ResourceUsage) -> ResourceUsage:
     )
 
 
-def _fixture_report(fixture_name: str) -> bytes:
-    reports = {
-        "sufficient": "# Sufficient fixture report\n\nThe frozen evidence is sufficient.\n",
-        "conflict": "# Conflict fixture report\n\nThe directed conflict remains partial after targeted research.\n",
-        "plateau": "# Plateau fixture report\n\nTwo marginal gains remain below the strict threshold.\n",
-        "budget_exhausted": "# Budget fixture report\n\nThe report is partial because the hard budget was exhausted.\n",
-        "blocked": "# Blocked fixture report\n\nNo report is published when every alternative source strategy fails.\n",
-    }
-    try:
-        newline = "\r\n" if os.linesep == "\r\n" else "\n"
-        return reports[fixture_name].replace("\n", newline).encode("utf-8")
-    except KeyError:
-        raise AssertionError(f"unknown offline fixture {fixture_name}") from None
+def _search_hit_payload(hit: SearchHit) -> dict[str, JsonValue]:
+    return cast("dict[str, JsonValue]", hit.model_dump(mode="json"))
+
+
+def _render_fixture_report(
+    fixture_name: str,
+    *,
+    model_output: str | None,
+    hits: Sequence[SearchHit],
+) -> bytes:
+    title = fixture_name.replace("_", " ").title()
+    answer = model_output or "No model report was published."
+    evidence_lines = [
+        f"- {hit.provider_metadata.get('evidence_id', 'unknown')}: "
+        f"{hit.title} | {hit.snippet}"
+        for hit in hits
+    ]
+    evidence = "\n".join(evidence_lines) or "- none"
+    report = f"# {title} fixture report\n\n{answer}\n\nEvidence:\n{evidence}\n"
+    return report.encode("utf-8")
 
 
 async def _record_offline_fixture_bundle(
@@ -963,11 +969,13 @@ async def _record_offline_fixture_bundle(
 async def _execute_offline_fixture(
     fixture_name: str,
     tmp_path: Path,
+    *,
+    fixture_root: Path | None = None,
 ) -> _OfflineFixtureRun:
     if fixture_name not in _OFFLINE_FIXTURE_NAMES:
         raise AssertionError(f"unknown offline fixture {fixture_name}")
-    fixture_root = EXPERIMENT_FIXTURES / fixture_name
-    scenario = json.loads((fixture_root / "scenario.json").read_bytes())
+    root = EXPERIMENT_FIXTURES / fixture_name if fixture_root is None else fixture_root
+    scenario = json.loads((root / "scenario.json").read_bytes())
     if scenario["name"] != fixture_name or scenario["mode"] != "strict_replay":
         raise AssertionError("fixture scenario identity is invalid")
     if scenario.get("fixture_version") != "strict-replay-fixture-v1":
@@ -985,15 +993,14 @@ async def _execute_offline_fixture(
         "BLOCKED",
     ]:
         raise AssertionError("blocked fixture alternatives are not exhausted")
-    model_records = _fixture_jsonl(fixture_root / "model.jsonl")
-    search_records = _fixture_jsonl(fixture_root / "search.jsonl")
-    parsed_records = _fixture_jsonl(fixture_root / "parsed.jsonl")
-    event_records = _fixture_jsonl(fixture_root / "graph_events.jsonl")
+    model_records = _fixture_jsonl(root / "model.jsonl")
+    search_records = _fixture_jsonl(root / "search.jsonl")
+    parsed_records = _fixture_jsonl(root / "parsed.jsonl")
+    event_records = _fixture_jsonl(root / "graph_events.jsonl")
     if len(model_records) != 1 or len(search_records) != 1 or len(parsed_records) != 1:
         raise AssertionError("offline fixture must contain one model/search/parsed record")
     model_record = model_records[0]
     search_record = search_records[0]
-    parsed_record = parsed_records[0]
     query = search_record.get("query")
     model_id = model_record.get("model_id")
     prompt_version = model_record.get("prompt_version")
@@ -1057,7 +1064,18 @@ async def _execute_offline_fixture(
     decision = evaluate_stop(state, state.budget_snapshot, blocked_needs=blocked_needs)
     if decision is None:
         raise AssertionError(f"fixture {fixture_name} did not reach a terminal stop")
-    report_bytes = _fixture_report(fixture_name)
+    model_output = None if model_result is None else model_result.output
+    hit_payloads = [_search_hit_payload(hit) for hit in hits]
+    replay_evidence_ids = [
+        evidence_id
+        for hit in hits
+        if isinstance(evidence_id := hit.provider_metadata.get("evidence_id"), str)
+    ]
+    report_bytes = _render_fixture_report(
+        fixture_name,
+        model_output=model_output,
+        hits=hits,
+    )
     report_artifact_id = (
         None
         if fixture_name == "blocked"
@@ -1075,12 +1093,15 @@ async def _execute_offline_fixture(
     event_trace = event_records
     evaluation = {
         "event_trace": event_trace,
-        "model_record": model_record,
-        "parsed": parsed_record,
+        "model_output": model_output,
         "query_trace": list(query_trace),
         "report_sha256": hashlib.sha256(report_bytes).hexdigest(),
-        "search_record": search_record,
-        "search_result_count": len(hits),
+        "search_hits": hit_payloads,
+        "search_trace": {
+            "evidence_ids": replay_evidence_ids,
+            "query": query,
+            "result_count": len(hit_payloads),
+        },
         "status": status,
         "stop_code": decision.code.value,
         "usage": {
@@ -1094,11 +1115,13 @@ async def _execute_offline_fixture(
         "evaluation_sha256": hashlib.sha256(evaluation_bytes).hexdigest(),
         "event_trace": event_trace,
         "is_partial": is_partial,
+        "model_output": model_output,
         "query_trace": list(query_trace),
         "replay_parent": bundle.snapshot.run_id,
         "report_sha256": (
             None if report_artifact_id is None else hashlib.sha256(report_bytes).hexdigest()
         ),
+        "search_evidence_ids": replay_evidence_ids,
         "stop_code": decision.code.value,
         "usage": _usage_payload(total_usage),
     }
@@ -1159,6 +1182,58 @@ async def test_offline_stop_fixtures_execute_replay_and_match_expected(
             "public_steps"
         ]
     assert result.live_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tamper_kind", ("model", "search"))
+async def test_legal_fixture_content_tamper_changes_replay_artifacts(
+    tamper_kind: str, tmp_path: Path
+) -> None:
+    """Replay artifacts must depend on returned model output and search hits."""
+
+    fixture_name = "sufficient"
+    baseline_root = tmp_path / "baseline"
+    baseline_root.mkdir()
+    baseline = await _execute_offline_fixture(fixture_name, baseline_root)
+    tampered_root = tmp_path / "tampered-fixtures"
+    tampered_fixture = tampered_root / fixture_name
+    shutil.copytree(EXPERIMENT_FIXTURES / fixture_name, tampered_fixture)
+    if tamper_kind == "model":
+        model_path = tampered_fixture / "model.jsonl"
+        model_record = json.loads(model_path.read_text(encoding="utf-8").splitlines()[0])
+        model_record["response"] = "a different valid fixture answer"
+        model_path.write_text(
+            json.dumps(model_record, ensure_ascii=False, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+    else:
+        search_path = tampered_fixture / "search.jsonl"
+        search_record = json.loads(
+            search_path.read_text(encoding="utf-8").splitlines()[0]
+        )
+        search_record["records"] = ["evidence-alt-1", "evidence-alt-2"]
+        search_path.write_text(
+            json.dumps(search_record, ensure_ascii=False, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+
+    tampered_root_path = tmp_path / "tampered-run"
+    tampered_root_path.mkdir()
+    tampered = await _execute_offline_fixture(
+        fixture_name,
+        tampered_root_path,
+        fixture_root=tampered_fixture,
+    )
+
+    assert tampered.report_bytes != baseline.report_bytes
+    assert tampered.evaluation_bytes != baseline.evaluation_bytes
+    assert tampered.manifest_bytes != baseline.manifest_bytes
+    fixture_root = EXPERIMENT_FIXTURES / fixture_name
+    assert tampered.report_bytes != (fixture_root / "expected_report.md").read_bytes()
+    assert tampered.evaluation_bytes != (
+        fixture_root / "expected_evaluation.json"
+    ).read_bytes()
+    assert tampered.manifest_bytes != (fixture_root / "expected_manifest.json").read_bytes()
 
 
 def test_unknown_replay_query_is_strict_and_never_a_live_fallback() -> None:

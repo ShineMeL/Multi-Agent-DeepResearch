@@ -1,3 +1,6 @@
 # Plateau fixture report
 
-Two marginal gains remain below the strict threshold.
+plateau fixture answer
+
+Evidence:
+- evidence-plateau: plateau evidence evidence-plateau | offline evidence evidence-plateau
