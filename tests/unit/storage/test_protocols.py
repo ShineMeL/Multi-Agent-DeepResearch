@@ -2,7 +2,8 @@ import asyncio
 import inspect
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import Literal, override
+from types import TracebackType
+from typing import Literal, cast
 
 import pytest
 
@@ -91,6 +92,9 @@ async def test_fake_store_rejects_invalid_nonterminal_and_terminal_transitions()
         await store.transition("r1", "running", "running")
     with pytest.raises(ValueError):
         await store.transition("r1", "running", "completed")
+    await store.create_run(make_record("r-terminal", status="completed"))
+    with pytest.raises(ValueError):
+        await store.transition("r-terminal", "completed", "running")
     await store.create_run(make_record("r2", status="queued"))
     with pytest.raises(ValueError):
         await store.finalize_run("r2", "queued", _finalization(), _draft())
@@ -123,35 +127,55 @@ async def test_clear_admission_ignores_none_and_nonmatching_ids_then_is_idempote
     assert created.version + 2 == cleared.version
 
 
-class _RacingIdempotencyStore(FakeRunStore):
+class _NoOpAsyncLock:
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> Literal[False]:
+        return False
+
+
+class _UnlockedRacingIdempotencyStore(FakeRunStore):
     def __init__(self) -> None:
         super().__init__()
-        self._lookups = 0
+        self._creates_waiting = 0
         self._gate = asyncio.Event()
 
-    @override
-    async def get_by_idempotency(
-        self, scope_sha256: str, idempotency_key: str
-    ) -> RunRecord | None:
-        found = await super().get_by_idempotency(scope_sha256, idempotency_key)
-        self._lookups += 1
-        if self._lookups == 2:
+    def _idempotency_lock_for(self, key: tuple[str, str]) -> asyncio.Lock:
+        return cast(asyncio.Lock, _NoOpAsyncLock())
+
+    async def _create_run(self, record: RunRecord) -> RunRecord:
+        self._creates_waiting += 1
+        if self._creates_waiting == 2:
             self._gate.set()
         await self._gate.wait()
-        return found
+        return await super()._create_run(record)
 
 
 @pytest.mark.asyncio
 async def test_create_run_rejects_concurrent_duplicate_scoped_idempotency_key() -> None:
-    store = _RacingIdempotencyStore()
     first = make_record("r1", status="queued")
     second = make_record("r2", status="queued")
     first = replace(first, idempotency_key="request-1")
     second = replace(second, idempotency_key="request-1")
 
+    store = FakeRunStore()
     outcomes = await asyncio.gather(
         store.create_run(first), store.create_run(second), return_exceptions=True
     )
 
     assert sum(isinstance(outcome, IdempotencyCollision) for outcome in outcomes) == 1
     assert sum(not isinstance(outcome, BaseException) for outcome in outcomes) == 1
+
+    unlocked_store = _UnlockedRacingIdempotencyStore()
+    unlocked_outcomes = await asyncio.gather(
+        unlocked_store.create_run(first),
+        unlocked_store.create_run(second),
+        return_exceptions=True,
+    )
+    assert sum(not isinstance(outcome, BaseException) for outcome in unlocked_outcomes) == 2
