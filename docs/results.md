@@ -22,7 +22,7 @@ This page is generated from public aggregate values; it is not a claim of a comp
 ## Ranker primary result
 
 - Comparison: R2 vs R1.
-- Estimate: 0; 95% CI: [0, 0].
+- Estimate: not reported; 95% CI: [not reported, not reported].
 
 ## Planner policy
 
@@ -58,6 +58,7 @@ External 10/20/10 benchmark results: not sealed/present.
 ## Limitations and disclosure
 
 - Missing human/external artifacts are preserved as missing; they are not imputed.
+- File-based human/external aggregates require a sidecar hash manifest before publication.
 - Re-runs must use the same sealed configuration, model/environment locks, and replication policy.
 - Figures in this checkout are deterministic layout placeholders until formal public aggregates are sealed.
 - This publication boundary does not read sealed prompts, private gold, raw provider responses, or credentials.

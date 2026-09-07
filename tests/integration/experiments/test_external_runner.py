@@ -604,3 +604,7 @@ async def test_external_runner_validates_receipts_calls_evaluator_and_replicates
     metrics = repo / "experiments" / result.portfolio_group_id / "external" / "metrics.json"
     metrics_payload = metrics.read_text(encoding="utf-8")
     assert "private_scoring_reference" not in metrics_payload
+    external_manifest = metrics.with_name("manifest.sha256")
+    manifest_payload = json.loads(external_manifest.read_text(encoding="utf-8"))
+    assert manifest_payload["schema_version"] == "external-result-manifest-v1"
+    assert manifest_payload["files"]["metrics.json"] == sha256_bytes(metrics.read_bytes())

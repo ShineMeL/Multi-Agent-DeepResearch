@@ -20,6 +20,7 @@ unsealed unless a hash-verified public summary is supplied.
 - [Results](#results)
 - [Reproduction](#reproduction)
 - [Trade-offs and limitations](#trade-offs-and-limitations)
+- [Demo and deployment plan](#demo-and-deployment-plan)
 
 ## Replay quickstart
 
@@ -162,6 +163,12 @@ also mean missing human/external artifacts cannot be filled in by the renderer.
 USD values are labelled estimated when derived from the approved pricing
 schedule. The renderer never reads private gold, sealed prompts, raw provider
 responses, or credentials.
+
+## Demo and deployment plan
+
+The user-facing Streamlit/Gradio service is specified separately in the
+[service demo and deployment plan](docs/superpowers/plans/2026-08-29-service-demo-deployment.md).
+No hosted service or live provider endpoint is claimed by this checkout.
 
 ## Roadmap and design documents
 

@@ -267,3 +267,100 @@ def test_renderer_writes_deterministic_accessible_public_artifacts(tmp_path: Pat
             assert 'role="img"' in text
             assert "<title" in text and "<desc" in text
             assert "no formal result is sealed" in text
+
+
+def test_renderer_rejects_unsealed_external_metrics(tmp_path: Path) -> None:
+    external_dir = tmp_path / "external"
+    external_dir.mkdir()
+    (external_dir / "metrics.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "external-metrics-v1",
+                "formal_config_sha256": "a" * 64,
+                "external_lock_sha256": "b" * 64,
+                "benchmark_counts": {
+                    "livedrbench": 10,
+                    "frames": 20,
+                    "deepresearchbench": 10,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ResultValidationError, match="manifest"):
+        render_results(_renderer_summary(), external_experiment_dir=external_dir)
+
+
+def test_renderer_accepts_hash_verified_external_metrics_only(tmp_path: Path) -> None:
+    external_dir = tmp_path / "external"
+    external_dir.mkdir()
+    metrics_path = external_dir / "metrics.json"
+    metrics_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "external-metrics-v1",
+                "portfolio_group_id": "portfolio-fixture",
+                "formal_config_sha256": "a" * 64,
+                "external_lock_sha256": "b" * 64,
+                "benchmark_counts": {
+                    "livedrbench": 10,
+                    "frames": 20,
+                    "deepresearchbench": 10,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (external_dir / "manifest.sha256").write_text(
+        json.dumps(
+            {
+                "schema_version": "external-result-manifest-v1",
+                "files": {"metrics.json": hashlib.sha256(metrics_path.read_bytes()).hexdigest()},
+                "portfolio_group_id": "portfolio-fixture",
+                "formal_config_sha256": "a" * 64,
+                "external_lock_sha256": "b" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    page = render_results(_renderer_summary(), external_experiment_dir=external_dir)
+
+    assert "External 10/20/10 benchmark results" in page
+    assert "`frames`: 20 tasks" in page
+
+
+def test_renderer_requires_sealed_human_aggregate_file(tmp_path: Path) -> None:
+    human_path = tmp_path / "human.json"
+    human_path.write_text(json.dumps({"rating_count": 1}), encoding="utf-8")
+
+    with pytest.raises(ResultValidationError, match="manifest"):
+        render_results(_renderer_summary(), human_summary=human_path)
+
+
+def test_renderer_rejects_noncanonical_external_summary_mapping() -> None:
+    with pytest.raises(ResultValidationError, match="10/20/10"):
+        render_results(
+            _renderer_summary(),
+            external_summary={
+                "schema_version": "external-metrics-v1",
+                "formal_config_sha256": "a" * 64,
+                "external_lock_sha256": "b" * 64,
+                "benchmark_counts": {"frames": 1},
+            },
+        )
+
+
+def test_renderer_redacts_nested_sensitive_values_and_section_names() -> None:
+    payload = _renderer_summary(
+        metadata={"model_id": {"source": "private provider response"}},
+        confidence_intervals={"private_prompt_section": {"ci": [0.1, 0.2]}},
+        pareto={"raw_provider_section": {"dominance_proportion": 0.5}},
+    )
+
+    page = render_results(payload)
+
+    assert "private provider response" not in page
+    assert "private_prompt_section" not in page
+    assert "raw_provider_section" not in page

@@ -45,6 +45,18 @@ _PUBLIC_ARTIFACTS: Final[frozenset[str]] = frozenset(
         "evaluator-reference-manifest.json",
     }
 )
+_AGGREGATE_MANIFEST_SCHEMAS: Final[frozenset[str]] = frozenset(
+    {
+        "benchmark-aggregate-manifest-v1",
+        "external-result-manifest-v1",
+        "experiment-artifact-manifest-v1",
+    }
+)
+_EXTERNAL_BENCHMARK_COUNTS: Final[dict[str, int]] = {
+    "livedrbench": 10,
+    "frames": 20,
+    "deepresearchbench": 10,
+}
 _FORBIDDEN_TOKENS: Final[tuple[str, ...]] = (
     "private",
     "gold",
@@ -105,6 +117,42 @@ def _read_json(source: Source, *, label: str) -> PublicMap:
     except (OSError, TypeError, ValueError) as error:
         raise ResultValidationError(f"{label} is invalid") from error
     return _mapping(payload, label=label)
+
+
+def _read_sealed_aggregate(source: Source, *, label: str) -> PublicMap:
+    """Read an optional aggregate, requiring a sidecar hash manifest on disk.
+
+    In-memory mappings are deliberately supported for callers that have
+    already verified an aggregate in another process.  A path is different:
+    it is an untrusted publication input and must be accompanied by a
+    manifest that hashes the exact file before any value is rendered.
+    """
+
+    if isinstance(source, Mapping):
+        return _mapping(source, label=label)
+    path = _safe_path(Path(source), label=label)
+    if not path.is_file():
+        raise ResultValidationError(f"{label} is missing")
+    manifest_path = _safe_path(path.parent / "manifest.sha256", label=f"{label} manifest")
+    if not manifest_path.is_file():
+        raise ResultValidationError(f"{label} manifest is missing")
+    manifest = _read_json(manifest_path, label=f"{label} manifest")
+    if manifest.get("schema_version") not in _AGGREGATE_MANIFEST_SCHEMAS:
+        raise ResultValidationError(f"{label} manifest schema is invalid")
+    files = manifest.get("files")
+    if not isinstance(files, Mapping):
+        raise ResultValidationError(f"{label} manifest files are invalid")
+    raw_files = cast(Mapping[object, object], files)
+    expected = raw_files.get(path.name)
+    if not _valid_hash(expected):
+        raise ResultValidationError(f"{label} manifest does not hash the aggregate")
+    try:
+        payload = path.read_bytes()
+    except OSError as error:
+        raise ResultValidationError(f"{label} is unavailable") from error
+    if _sha256(payload) != expected:
+        raise ResultValidationError(f"{label} hash mismatch")
+    return _read_json(path, label=label)
 
 
 def _sha256(data: bytes) -> str:
@@ -228,12 +276,26 @@ def _fmt(value: object, *, digits: int = 3) -> str:
 
 
 def _safe_text(value: object, *, max_length: int = 160) -> str:
-    if not isinstance(value, str):
-        return str(value)
-    text = " ".join(value.split())
+    if isinstance(value, str):
+        text = " ".join(value.split())
+    elif isinstance(value, Mapping):
+        try:
+            text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            text = "[unserializable mapping]"
+    elif isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        try:
+            sequence = cast(Sequence[object], value)
+            text = json.dumps(list(sequence), ensure_ascii=False, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            text = "[unserializable sequence]"
+    else:
+        text = str(value)
+    text = " ".join(text.split())
     if any(token in text.casefold() for token in _FORBIDDEN_TOKENS):
         return "[redacted]"
-    return text[:max_length]
+    # Keep values inside the renderer's Markdown code spans and tables.
+    return text.replace("`", "'").replace("|", r"\|")[:max_length]
 
 
 def _first(mapping: Mapping[str, object], names: Sequence[str]) -> object | None:
@@ -449,7 +511,8 @@ def _confidence_lines(payload: Mapping[str, object]) -> list[str]:
             if ci is not None:
                 estimate, lower, upper = _ci(ci)
                 lines.append(
-                    f"- `{protocol}`: estimate {_fmt(estimate)}, 95% CI [{_fmt(lower)}, {_fmt(upper)}]"
+                    f"- `{_safe_text(protocol)}`: estimate {_fmt(estimate)}, "
+                    f"95% CI [{_fmt(lower)}, {_fmt(upper)}]"
                 )
     return lines
 
@@ -487,7 +550,9 @@ def _pareto_lines(payload: Mapping[str, object]) -> list[str]:
             if dominance is None:
                 dominance = item.get("dominance_proportion")
             if dominance is not None:
-                lines.append(f"- `{protocol}` bootstrap dominance: {_fmt(dominance)}")
+                lines.append(
+                    f"- `{_safe_text(protocol)}` bootstrap dominance: {_fmt(dominance)}"
+                )
     return lines
 
 
@@ -614,7 +679,7 @@ def _render_markdown(
     )
     planner_metrics = _metrics(planner)
     for name, value in planner_metrics.items():
-        lines.append(f"- `{name}` mean: {_fmt(value)}.")
+        lines.append(f"- `{_safe_text(name)}` mean: {_fmt(value)}.")
     comparisons = planner.get("comparisons")
     if isinstance(comparisons, Mapping):
         raw_comparisons = cast(Mapping[object, object], comparisons)
@@ -670,7 +735,7 @@ def _render_markdown(
     for protocol in _PROTOCOLS:
         values = _metrics(sections[protocol])
         for name, value in values.items():
-            lines.append(f"- `{protocol}.{name}` mean: {_fmt(value)}")
+            lines.append(f"- `{_safe_text(protocol)}.{_safe_text(name)}` mean: {_fmt(value)}")
     end_to_end_ci = _find_ci(sections["end_to_end"], payload)
     if end_to_end_ci[1] is not None and end_to_end_ci[2] is not None:
         lines.append(
@@ -723,6 +788,7 @@ def _render_markdown(
             "## Limitations and disclosure",
             "",
             "- Missing human/external artifacts are preserved as missing; they are not imputed.",
+            "- File-based human/external aggregates require a sidecar hash manifest before publication.",
             "- Re-runs must use the same sealed configuration, model/environment locks, and replication policy.",
             "- Figures in this checkout are deterministic layout placeholders until formal public aggregates are sealed.",
             "- This publication boundary does not read sealed prompts, private gold, raw provider responses, or credentials.",
@@ -769,6 +835,11 @@ missing, and this repository does not manufacture human, external, or CI data.
 
 ## Commands
 
+The sealed `formal.yaml` and `formal-portfolio.yaml` paths below are generated
+artifacts, not templates.  They are intentionally absent from this checkout
+until the pinned model/environment locks and licensed external sources are
+available; running the commands without those seals must fail closed.
+
 ```powershell
 uv run deepresearch experiment config id --config benchmarks/configs/formal.yaml
 uv run deepresearch experiment run --config benchmarks/configs/formal.yaml --variants A,B,C,D
@@ -777,8 +848,9 @@ uv run python -m benchmarks.scripts.render_results --experiment-dir experiments/
 ```
 
 For the optional Portfolio extension, pass a separately sealed external
-directory with `--external-experiment-dir`.  Primary confidence intervals are
-never pooled with external metrics.
+directory with `--external-experiment-dir`.  The directory must contain a
+hash-verified `manifest.sha256` for `metrics.json`; primary confidence
+intervals are never pooled with external metrics.
 
 ## Isolation and provenance
 
@@ -796,6 +868,37 @@ the task level before paired comparisons.  Formal paired intervals use the
 sealed budget and replication policy with 10,000 stratified bootstrap draws;
 the planner non-inferiority margin is the pre-registered completeness margin.
 
+The primary paired effect is computed after within-task seed aggregation:
+`effect(task) = candidate(task) - baseline(task)`.  The reported estimate is
+the mean task effect; each bootstrap replicate resamples tasks within category
+and recomputes that mean.  A two-sided 95% interval is the 2.5th and 97.5th
+percentiles of 10,000 deterministic replicates.  Planner non-inferiority is
+accepted only when the lower bound is at least the sealed completeness margin.
+Pareto dominance is the fraction of bootstrap replicates in which one variant
+is no worse on quality while costing no more and using no more search calls.
+
+The six human dimensions use 1–5 ordinal ratings.  Missing ratings remain
+missing; no score is imputed.  Agreement is ordinal Krippendorff's alpha on
+pairable task/rater units, and automatic-vs-human association is Spearman's
+rank correlation on complete pairs only.
+
+## Execution profile and budgets
+
+The formal template records the intended endpoint and lock identities:
+Qwen/Qwen3-8B at the pinned revision, local vLLM 0.28.0, bfloat16, one tensor
+parallel worker, and a 32,768-token context.  The actual model, hardware,
+CUDA/runtime, and environment hashes are reported only after the corresponding
+lock files are captured; this checkout does not claim that profile is sealed.
+
+| Preset | Max search calls | Max pages | Max tokens | Wall time | Estimated USD cap |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| low | 4 | 8 | 20,000 | 180 s | 0.25 |
+| medium | 8 | 12 | 40,000 | 300 s | 0.50 |
+| high | 12 | 20 | 70,000 | 480 s | 1.00 |
+
+Costs are labelled estimated when derived from the approved pricing snapshot;
+they are not treated as observed provider billing.
+
 ## Budget and subset policy
 
 The formal configuration fixes the primary budget, sensitivity presets, task
@@ -807,7 +910,8 @@ labelled estimated when it comes from the normalized pricing schedule.
 
 The checked-in SVGs are deterministic, accessible placeholders until a public
 formal summary is available.  Human ratings and external 10/20/10 results are
-optional aggregate inputs; no score is imputed when those inputs are absent.
+optional aggregate inputs.  File-based human/external aggregates require a
+sidecar hash manifest; no score is imputed when those inputs are absent.
 """
 
 
@@ -828,41 +932,68 @@ def _load_external_directory(root: Path) -> PublicMap:
     if not metrics_path.is_file():
         raise ResultValidationError("external metrics are missing")
     outer_manifest = root / "manifest.sha256"
-    if outer_manifest.is_file():
-        manifest = _read_json(outer_manifest, label="external artifact manifest")
-        files = manifest.get("files")
-        if not isinstance(files, Mapping):
-            raise ResultValidationError("external artifact manifest is invalid")
-        raw_files = cast(Mapping[object, object], files)
-        expected = raw_files.get("metrics.json")
-        if not _valid_hash(expected):
-            raise ResultValidationError("external metrics hash is invalid")
-        try:
-            metrics_bytes = metrics_path.read_bytes()
-        except OSError as error:
-            raise ResultValidationError("external metrics are unavailable") from error
-        if _sha256(metrics_bytes) != expected:
-            raise ResultValidationError("external metrics hash mismatch")
+    if not outer_manifest.is_file():
+        raise ResultValidationError("external artifact manifest is missing")
+    manifest = _read_json(outer_manifest, label="external artifact manifest")
+    if manifest.get("schema_version") != "external-result-manifest-v1":
+        raise ResultValidationError("external artifact manifest schema is invalid")
+    files = manifest.get("files")
+    if not isinstance(files, Mapping):
+        raise ResultValidationError("external artifact manifest is invalid")
+    raw_files = cast(Mapping[object, object], files)
+    expected = raw_files.get("metrics.json")
+    if not _valid_hash(expected):
+        raise ResultValidationError("external metrics hash is invalid")
     try:
-        payload = json.loads(metrics_path.read_bytes())
+        metrics_bytes = metrics_path.read_bytes()
+    except OSError as error:
+        raise ResultValidationError("external metrics are unavailable") from error
+    if _sha256(metrics_bytes) != expected:
+        raise ResultValidationError("external metrics hash mismatch")
+    try:
+        payload = json.loads(metrics_bytes)
     except (OSError, TypeError, ValueError) as error:
         raise ResultValidationError("external metrics are invalid") from error
     result = _mapping(payload, label="external metrics")
-    if result.get("schema_version") not in (None, "external-metrics-v1"):
+    _validate_external_payload(result, seal=manifest)
+    return result
+
+
+def _validate_external_payload(
+    result: Mapping[str, object], *, seal: Mapping[str, object] | None
+) -> None:
+    if result.get("schema_version") != "external-metrics-v1":
         raise ResultValidationError("external metrics schema is invalid")
     for key in ("formal_config_sha256", "external_lock_sha256"):
-        if key in result and not _valid_hash(result[key]):
+        if not _valid_hash(result.get(key)):
             raise ResultValidationError(f"external {key} is invalid")
+        if seal is not None:
+            if not _valid_hash(seal.get(key)):
+                raise ResultValidationError(f"external {key} is invalid")
+            if result[key] != seal[key]:
+                raise ResultValidationError(f"external {key} does not match its seal")
+    if seal is not None and seal.get("portfolio_group_id") not in (
+        None,
+        result.get("portfolio_group_id"),
+    ):
+        raise ResultValidationError("external portfolio group does not match its seal")
     counts = result.get("benchmark_counts")
-    if counts is not None:
-        if not isinstance(counts, Mapping):
+    if not isinstance(counts, Mapping):
+        raise ResultValidationError("external benchmark counts are invalid")
+    raw_counts = cast(Mapping[object, object], counts)
+    normalised_counts: dict[str, int] = {}
+    for name, count in raw_counts.items():
+        numeric_count = _as_float(count)
+        if (
+            not isinstance(name, str)
+            or numeric_count is None
+            or numeric_count < 0
+            or not numeric_count.is_integer()
+        ):
             raise ResultValidationError("external benchmark counts are invalid")
-        raw_counts = cast(Mapping[object, object], counts)
-        for name, count in raw_counts.items():
-            numeric_count = _as_float(count)
-            if not isinstance(name, str) or numeric_count is None or numeric_count < 0:
-                raise ResultValidationError("external benchmark counts are invalid")
-    return result
+        normalised_counts[name] = int(numeric_count)
+    if normalised_counts != _EXTERNAL_BENCHMARK_COUNTS:
+        raise ResultValidationError("external benchmark counts are not canonical 10/20/10")
 
 
 def _artifact_overlay(artifacts: Mapping[str, bytes]) -> PublicMap:
@@ -914,10 +1045,18 @@ def render_results(
         manifest_payload = _read_json(manifest_path, label="public manifest")
         artifacts = _verify_manifest(root, manifest_payload)
         verified = True
-        if summary is None:
-            summary_payload = _read_json(root / "summary.json", label="public summary")
-        else:
-            summary_payload = _read_json(summary, label="public summary")
+        canonical_summary = _safe_path(root / "summary.json", label="public summary")
+        if summary is not None:
+            if isinstance(summary, Mapping):
+                raise ResultValidationError(
+                    "public summary must be the manifest-listed summary.json"
+                )
+            supplied_summary = _safe_path(Path(summary), label="public summary")
+            if supplied_summary != canonical_summary:
+                raise ResultValidationError(
+                    "public summary must be the manifest-listed summary.json"
+                )
+        summary_payload = _read_json(canonical_summary, label="public summary")
         summary_payload.update(_artifact_overlay(artifacts))
     if root is not None:
         root = _safe_path(root, label="experiment directory")
@@ -956,10 +1095,11 @@ def render_results(
 
     human: PublicMap | None = None
     if human_summary is not None:
-        human = _read_json(human_summary, label="human aggregate summary")
+        human = _read_sealed_aggregate(human_summary, label="human aggregate summary")
     external: PublicMap | None = None
     if external_summary is not None:
-        external = _read_json(external_summary, label="external aggregate summary")
+        external = _read_sealed_aggregate(external_summary, label="external aggregate summary")
+        _validate_external_payload(external, seal=None)
     elif external_experiment_dir is not None:
         external = _load_external_directory(Path(external_experiment_dir))
 

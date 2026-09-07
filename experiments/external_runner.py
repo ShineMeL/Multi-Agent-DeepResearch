@@ -1089,6 +1089,20 @@ class ExternalExperimentRunner:
         metrics_bytes = canonical_json_bytes(metrics_payload)
         metrics_path = group_root / "external" / "metrics.json"
         self._write_no_replace(metrics_path, metrics_bytes)
+        # Publish a small public seal for the aggregate.  The renderer must
+        # verify this sidecar before exposing any external result; raw runs,
+        # snapshots and evaluator plans remain outside that boundary.
+        external_manifest = {
+            "schema_version": "external-result-manifest-v1",
+            "files": {"metrics.json": sha256_bytes(metrics_bytes)},
+            "portfolio_group_id": config.experiment_group_id(),
+            "formal_config_sha256": sha256_bytes(config_payload),
+            "external_lock_sha256": config.external_lock_sha256,
+        }
+        self._write_no_replace(
+            group_root / "external" / "manifest.sha256",
+            canonical_json_bytes(external_manifest),
+        )
         return ExternalExperimentResult(
             portfolio_group_id=config.experiment_group_id(),
             formal_config_sha256=sha256_bytes(config_payload),
