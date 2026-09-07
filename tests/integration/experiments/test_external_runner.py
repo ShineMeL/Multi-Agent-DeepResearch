@@ -35,6 +35,48 @@ class SpyLauncher:
         self.requests.append(request)
 
 
+def _formal_config_with_external(
+    external_config_path: Path,
+    external_lock_path: Path,
+    hashes: dict[str, str],
+) -> FormalExperimentConfig:
+    payload = yaml.safe_load(Path("benchmarks/configs/formal.template.yaml").read_text())
+    payload.update(
+        {
+            name: "a" * 64
+            for name in (
+                "private_manifest_sha256",
+                "model_snapshot_sha256",
+                "judge_model_snapshot_sha256",
+                "r1_model_snapshot_sha256",
+                "serving_environment_sha256",
+                "code_tree_sha256",
+            )
+        }
+    )
+    payload.update(
+        {
+            name: ["test-a"]
+            for name in (
+                "main_test_task_ids",
+                "stability_task_ids",
+                "cost_subset_task_ids",
+                "p0_task_ids",
+                "oracle_task_ids",
+            )
+        }
+    )
+    payload.update(
+        {
+            "internal_runtime_task_hashes": {"test-a": "b" * 64},
+            "external_config_sha256": sha256_bytes(external_config_path.read_bytes()),
+            "external_lock_sha256": sha256_bytes(external_lock_path.read_bytes()),
+            "external_runtime_task_hashes": dict(sorted(hashes.items())),
+        }
+    )
+    return FormalExperimentConfig.model_validate(payload)
+
+
 @pytest.mark.asyncio
 async def test_missing_external_authorization_fails_before_agent_launch(tmp_path: Path):
     payload = yaml.safe_load(Path("benchmarks/configs/formal.template.yaml").read_text())
@@ -75,6 +117,209 @@ async def test_missing_external_authorization_fails_before_agent_launch(tmp_path
             benchmarks=("frames",),
         )
     assert launcher.requests == []
+
+
+@pytest.mark.asyncio
+async def test_external_preflight_rejects_partial_portfolio_map(
+    external_fixture, monkeypatch: pytest.MonkeyPatch
+):
+    repo, external, external_config_path, external_lock_path, raw_root, snapshot_root = external_fixture
+    adapter = FramesAdapter(
+        lock_file=external_lock_path,
+        raw_root=raw_root,
+        snapshot_root=snapshot_root,
+        external_config=external,
+    )
+    partial_hashes = {
+        selection.runtime_task.task_id: canonical_sha256(
+            selection.runtime_task.model_dump(mode="json")
+        )
+        for selection in adapter.select(
+            provider_profile_id="formal-local-vllm", budget_preset="medium"
+        )
+    }
+    payload = yaml.safe_load(Path("benchmarks/configs/formal.template.yaml").read_text())
+    payload.update(
+        {
+            name: "a" * 64
+            for name in (
+                "private_manifest_sha256",
+                "model_snapshot_sha256",
+                "judge_model_snapshot_sha256",
+                "r1_model_snapshot_sha256",
+                "serving_environment_sha256",
+                "code_tree_sha256",
+            )
+        }
+    )
+    payload.update(
+        {
+            name: ["test-a"]
+            for name in (
+                "main_test_task_ids",
+                "stability_task_ids",
+                "cost_subset_task_ids",
+                "p0_task_ids",
+                "oracle_task_ids",
+            )
+        }
+    )
+    payload.update(
+        {
+            "internal_runtime_task_hashes": {"test-a": "b" * 64},
+            "external_config_sha256": sha256_bytes(external_config_path.read_bytes()),
+            "external_lock_sha256": sha256_bytes(external_lock_path.read_bytes()),
+            "external_runtime_task_hashes": dict(sorted(partial_hashes.items())),
+        }
+    )
+    config = FormalExperimentConfig.model_validate(payload)
+    # Isolate the portfolio-map assertion from the unavailable internal seal
+    # files in this synthetic repository. A real preflight still runs the
+    # complete validator before launching any agent.
+    monkeypatch.setattr("experiments.external_runner.preflight_config", lambda *args, **kwargs: None)
+    monkeypatch.setattr("experiments.external_runner.code_tree_sha256", lambda _: config.code_tree_sha256)
+    monkeypatch.setattr(ExternalExperimentRunner, "_code_commit", lambda self: "a" * 40)
+    launcher = SpyLauncher()
+    runner = ExternalExperimentRunner(
+        launch_agent=launcher,
+        repo_root=repo,
+        experiment_root=repo / "experiments",
+        preflight=True,
+    )
+    with pytest.raises(ValueError, match="40|canonical|Portfolio"):
+        await runner.run(
+            config=config,
+            external_config_path=external_config_path,
+            external_lock_path=external_lock_path,
+            benchmarks=("frames",),
+        )
+    assert launcher.requests == []
+
+
+@pytest.mark.asyncio
+async def test_external_runner_rechecks_raw_after_selection_before_launch(
+    external_fixture, monkeypatch: pytest.MonkeyPatch
+):
+    repo, external, external_config_path, external_lock_path, raw_root, snapshot_root = external_fixture
+    adapter = FramesAdapter(
+        lock_file=external_lock_path,
+        raw_root=raw_root,
+        snapshot_root=snapshot_root,
+        external_config=external,
+    )
+    hashes = {
+        selection.runtime_task.task_id: canonical_sha256(
+            selection.runtime_task.model_dump(mode="json")
+        )
+        for selection in adapter.select(
+            provider_profile_id="formal-local-vllm", budget_preset="medium"
+        )
+    }
+    payload = yaml.safe_load(Path("benchmarks/configs/formal.template.yaml").read_text())
+    payload.update(
+        {
+            name: "a" * 64
+            for name in (
+                "private_manifest_sha256",
+                "model_snapshot_sha256",
+                "judge_model_snapshot_sha256",
+                "r1_model_snapshot_sha256",
+                "serving_environment_sha256",
+                "code_tree_sha256",
+            )
+        }
+    )
+    payload.update(
+        {
+            name: ["test-a"]
+            for name in (
+                "main_test_task_ids",
+                "stability_task_ids",
+                "cost_subset_task_ids",
+                "p0_task_ids",
+                "oracle_task_ids",
+            )
+        }
+    )
+    payload.update(
+        {
+            "internal_runtime_task_hashes": {"test-a": "b" * 64},
+            "external_config_sha256": sha256_bytes(external_config_path.read_bytes()),
+            "external_lock_sha256": sha256_bytes(external_lock_path.read_bytes()),
+            "external_runtime_task_hashes": dict(sorted(hashes.items())),
+        }
+    )
+    config = FormalExperimentConfig.model_validate(payload)
+    original_select = FramesAdapter.select
+
+    def select_then_mutate(self: FramesAdapter, **kwargs: object):
+        result = original_select(self, **kwargs)  # type: ignore[arg-type]
+        raw_path = self.raw_root / self._entry.raw_relative_path  # pyright: ignore[reportPrivateUsage]
+        raw_path.write_bytes(b"[]\n")
+        return result
+
+    monkeypatch.setattr(FramesAdapter, "select", select_then_mutate)
+    launcher = SpyLauncher()
+    runner = ExternalExperimentRunner(
+        launch_agent=launcher,
+        repo_root=repo,
+        experiment_root=repo / "experiments",
+        preflight=False,
+    )
+    with pytest.raises(Exception, match="hash mismatch|changed") as error:
+        await runner.run(
+            config=config,
+            external_config_path=external_config_path,
+            external_lock_path=external_lock_path,
+            benchmarks=("frames",),
+        )
+    assert getattr(error.value, "code", None) == "INVALID_SNAPSHOT"
+    assert launcher.requests == []
+
+
+@pytest.mark.asyncio
+async def test_external_runner_records_all_unseeded_repeats(external_fixture):
+    repo, external, external_config_path, external_lock_path, raw_root, snapshot_root = external_fixture
+    adapter = FramesAdapter(
+        lock_file=external_lock_path,
+        raw_root=raw_root,
+        snapshot_root=snapshot_root,
+        external_config=external,
+    )
+    hashes = {
+        selection.runtime_task.task_id: canonical_sha256(
+            selection.runtime_task.model_dump(mode="json")
+        )
+        for selection in adapter.select(
+            provider_profile_id="formal-local-vllm", budget_preset="medium"
+        )
+    }
+    config = _formal_config_with_external(
+        external_config_path, external_lock_path, hashes
+    )
+    launcher = SpyLauncher()
+    runner = ExternalExperimentRunner(
+        launch_agent=launcher,
+        repo_root=repo,
+        experiment_root=repo / "experiments",
+        preflight=False,
+        seed_supported=False,
+    )
+    result = await runner.run(
+        config=config,
+        external_config_path=external_config_path,
+        external_lock_path=external_lock_path,
+        benchmarks=("frames",),
+    )
+    expected_repeats = range(1, config.replication.unseeded_repeat_count + 1)
+    assert len(result.runs) == 20 * config.replication.unseeded_repeat_count
+    assert {run.repeat_id for run in result.runs} == set(expected_repeats)
+    assert all(run.seed is None and run.status == "failed" for run in result.runs)
+    assert len(launcher.requests) == len(result.runs)
+    assert {
+        request.repeat_id for request in launcher.requests  # type: ignore[union-attr]
+    } == set(expected_repeats)
+    assert all(request.seed is None for request in launcher.requests)  # type: ignore[union-attr]
 
 
 @pytest.mark.asyncio

@@ -910,7 +910,17 @@ def _as_frozen_records(
     return tuple(sorted(records, key=lambda record: (record.evidence_id, record.source_id)))
 
 
+def _canonical_records_payload(records: Sequence[FrozenEvidenceRecord]) -> bytes:
+    """Serialize the exact JSONL bytes consumed by Task 3's builder."""
+
+    return b"".join(
+        canonical_json_bytes(record.model_dump(mode="json")) for record in records
+    )
+
+
 class ExternalTaskAdapter(Protocol):
+    def revalidate_source(self) -> None: ...
+
     def frozen_records_for(self, external_id: str) -> tuple[FrozenEvidenceRecord, ...]: ...
 
     def snapshot_lock_for(self, task_id: str) -> ExternalSnapshotLock: ...
@@ -948,7 +958,16 @@ class BaseExternalAdapter:
             snapshot_root, kind="snapshot", repo_root=self.repo_root
         )
         self.external_config = external_config
-        self._lock = load_external_lock(self.lock_file)
+        # Bind the adapter to one immutable lock payload.  The runner calls
+        # ``revalidate_source`` before every materialisation/launch, so a
+        # replacement lock cannot silently leave the adapter using stale
+        # source metadata or snapshot identities.
+        lock_payload = self.lock_file.read_bytes()
+        self._lock_payload_sha256 = sha256_bytes(lock_payload)
+        try:
+            self._lock = ExternalBenchmarkLock.model_validate_json(lock_payload)
+        except (TypeError, ValueError, ValidationError, json.JSONDecodeError) as error:
+            raise ValueError("external lock is invalid") from error
         self._entry = self._lock.entry(self.benchmark)
         if self._entry.benchmark != self.benchmark:
             raise ValueError("external lock benchmark identity mismatch")
@@ -970,6 +989,45 @@ class BaseExternalAdapter:
         self._locks_by_task = {lock.task_id: lock for lock in self._entry.snapshot_locks}
         if len(self._locks_by_task) != len(self._entry.snapshot_locks):
             raise ValueError("external snapshot lock task IDs must be unique")
+
+    def revalidate_source(self) -> None:
+        """Recheck the locked bytes and lock before crossing the agent boundary.
+
+        Selection is intentionally not a durable cache.  This method is cheap
+        enough to call for every replication and closes the select-to-launch
+        TOCTOU window for both the raw payload and its aggregate lock.
+        """
+
+        lock_payload = self.lock_file.read_bytes()
+        if sha256_bytes(lock_payload) != self._lock_payload_sha256:
+            raise ProviderError(
+                code="INVALID_SNAPSHOT",
+                provider="external-corpus",
+                operation="lock",
+                public_message="external lock changed after selection",
+                retryable=False,
+            )
+        try:
+            current_lock = ExternalBenchmarkLock.model_validate_json(lock_payload)
+        except (TypeError, ValueError, ValidationError, json.JSONDecodeError) as error:
+            raise ProviderError(
+                code="INVALID_SNAPSHOT",
+                provider="external-corpus",
+                operation="lock",
+                public_message="external lock is invalid",
+                retryable=False,
+            ) from error
+        if current_lock.entry(self.benchmark) != self._entry:
+            raise ProviderError(
+                code="INVALID_SNAPSHOT",
+                provider="external-corpus",
+                operation="lock",
+                public_message="external lock identity changed after selection",
+                retryable=False,
+            )
+        # ``_load_items`` reads one raw byte string and uses that same value
+        # for hashing and parsing.  It also rejects a changed cached payload.
+        self._load_items()
 
     def _load_items(self) -> Mapping[str, Mapping[str, object]]:
         raw_path = _safe_child(self.raw_root, self._entry.raw_relative_path, label="external raw", require_file=True)
@@ -1128,6 +1186,7 @@ class ExternalSnapshotMaterializer:
         selection_manifest_path: Path,
         documents_staging_root: Path,
         snapshot_root: Path,
+        raw_root: Path | None = None,
         repo_root: Path | None = None,
         external_config: ExternalConfig | None = None,
         source_locks: Mapping[BenchmarkName, ExternalSourceLock] | None = None,
@@ -1146,6 +1205,65 @@ class ExternalSnapshotMaterializer:
             repo_root=materializer_repo_root,
             create=True,
         )
+        raw: Path | None = None
+        raw_items: dict[BenchmarkName, dict[str, Mapping[str, object]]] = {}
+        if raw_root is not None or source_locks is not None:
+            if raw_root is None or source_locks is None:
+                raise ValueError("external raw root and source locks are required together")
+            raw = fixed_external_root(raw_root, kind="raw", repo_root=materializer_repo_root)
+            # Read each locked source once.  The bytes parsed here are the
+            # same bytes whose digest is checked and whose records are later
+            # compared with staging; a second read could reintroduce a TOCTOU
+            # window between hashing and parsing.
+            for benchmark in BENCHMARK_NAMES:
+                source = source_locks.get(benchmark)
+                if source is None:
+                    raise ValueError("external source lock is missing for benchmark")
+                if source.benchmark != benchmark:
+                    raise ValueError("external source lock benchmark identity mismatch")
+                if external_config is not None:
+                    spec = external_config.spec(benchmark)
+                    if (
+                        source.corpus_version,
+                        source.index_version,
+                        source.adapter_version,
+                    ) != (
+                        spec.corpus_version,
+                        external_config.index_version,
+                        spec.adapter_version,
+                    ):
+                        raise ValueError(
+                            "external source lock/config versions disagree"
+                        )
+                source_path = _safe_child(
+                    raw,
+                    source.raw_relative_path,
+                    label="external raw",
+                    require_file=True,
+                )
+                source_payload = source_path.read_bytes()
+                if sha256_bytes(source_payload) != source.sha256:
+                    raise ProviderError(
+                        code="INVALID_SNAPSHOT",
+                        provider="external-corpus",
+                        operation="raw",
+                        public_message="external raw payload hash mismatch",
+                        retryable=False,
+                    )
+                parsed_rows = _json_objects(source_payload, source=source_path)
+                by_id: dict[str, Mapping[str, object]] = {}
+                for parsed in parsed_rows:
+                    raw_id = parsed.get(
+                        "external_id",
+                        parsed.get("id", parsed.get("task_id", parsed.get("uid"))),
+                    )
+                    if not isinstance(raw_id, str) or not raw_id.strip():
+                        raise ValueError("external raw item has no stable external_id")
+                    external_id = _canonical_name(raw_id.strip())
+                    if external_id in by_id:
+                        raise ValueError("duplicate external_id in external raw payload")
+                    by_id[external_id] = parsed
+                raw_items[benchmark] = by_id
         raw_selection_path = Path(selection_manifest_path)
         if ".." in raw_selection_path.parts:
             raise ValueError("selection manifest contains traversal")
@@ -1182,6 +1300,10 @@ class ExternalSnapshotMaterializer:
         if len(rows) != len(cast(Sequence[object], rows_value)):
             raise ValueError("external selection manifest contains an invalid row")
         rows.sort(key=lambda row: (str(row.get("benchmark", "")), str(row.get("task_id", ""))))
+        if rows and (raw is None or source_locks is None):
+            raise ValueError(
+                "external raw root and source locks are required for snapshot provenance"
+            )
         locks: list[ExternalSnapshotLock] = []
         records_by_task: dict[str, tuple[FrozenEvidenceRecord, ...]] = {}
         for row in rows:
@@ -1192,6 +1314,12 @@ class ExternalSnapshotMaterializer:
             external_id = str(row.get("external_id", ""))
             if not task_id or not external_id:
                 raise ValueError("external selection identity is incomplete")
+            try:
+                external_id = _canonical_name(external_id)
+            except ValueError as error:
+                raise ValueError("external selection external_id is invalid") from error
+            if task_id != f"ext-{benchmark}-{external_id}":
+                raise ValueError("external selection task_id is not namespaced")
             documents_relative = row.get("documents_relative_path", row.get("documents_path", f"{task_id}.jsonl"))
             if not isinstance(documents_relative, str):
                 raise TypeError("external documents path is invalid")
@@ -1221,6 +1349,35 @@ class ExternalSnapshotMaterializer:
                 or index_version != expected_source.index_version
             ):
                 raise ValueError("external selection versions disagree with source lock")
+            if raw is None or source_locks is None:
+                # The non-empty-row guard above is deliberately repeated at
+                # the use site so future callers cannot accidentally bypass
+                # provenance by adding another row path.
+                raise ValueError("external raw provenance is unavailable")
+            source = source_locks.get(benchmark)
+            if source is None:
+                raise ValueError("external source lock is missing for benchmark")
+            raw_item = raw_items[benchmark].get(external_id)
+            if raw_item is None:
+                raise ValueError(
+                    f"external raw payload has no selected task {external_id}"
+                )
+            upstream_digest = sha256_bytes(canonical_json_bytes(raw_item))
+            if row.get("upstream_record_sha256") != upstream_digest:
+                raise ValueError("external selection upstream record hash mismatch")
+            records = _as_frozen_records(
+                raw_item,
+                benchmark=benchmark,
+                external_id=external_id,
+                task_id=task_id,
+                retrieved_at=source.fetched_at,
+            )
+            records_payload = _canonical_records_payload(records)
+            records_digest = sha256_bytes(records_payload)
+            if row.get("records_sha256") != records_digest:
+                raise ValueError("external selection records hash mismatch")
+            if documents.read_bytes() != records_payload:
+                raise ValueError("external staging document hash mismatch")
             built = build_one(
                 task_id=task_id,
                 documents=documents,
@@ -1243,6 +1400,8 @@ class ExternalSnapshotMaterializer:
             )
             if built != loaded.manifest:
                 raise ValueError("external snapshot self-verification mismatch")
+            if loaded.manifest.documents_sha256 != records_digest or loaded.records != records:
+                raise ValueError("external snapshot records disagree with raw provenance")
             locks.append(snapshot_lock)
             records_by_task[task_id] = loaded.records
         locks.sort(key=lambda item: item.task_id)

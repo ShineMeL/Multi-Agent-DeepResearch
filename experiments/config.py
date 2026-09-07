@@ -489,6 +489,11 @@ def freeze_config(
                 if task.task_id in external_hashes:
                     raise ValueError("duplicate external RuntimeTask ID")
                 external_hashes[task.task_id] = canonical_sha256(task.model_dump(mode="json"))
+        expected_external_count = sum(
+            external.spec(name).expected_count for name in BENCHMARK_NAMES
+        )
+        if len(external_hashes) != expected_external_count:
+            raise ValueError("external RuntimeTask authorization must cover the full Portfolio")
         external_values = {
             "external_config_sha256": sha256_bytes(external_source.read_bytes()),
             "external_lock_sha256": sha256_bytes(external_lock_source.read_bytes()),
@@ -552,6 +557,21 @@ def preflight_config(
         mode="json", exclude=external_fields
     ):
         raise ValueError("sealed config no longer matches verified inputs")
+    # The external fields are part of the formal seal too.  Comparing only the
+    # common/internal template above would allow a caller to provide a valid
+    # internal seal with a partial map, a different lock, or an evaluator-plan
+    # hash.  ``freeze_config`` recomputes all three values from the full
+    # 10/20/10 adapter portfolio, so exact equality is required here.
+    if (
+        config.external_config_sha256,
+        config.external_lock_sha256,
+        config.external_runtime_task_hashes,
+    ) != (
+        expected.external_config_sha256,
+        expected.external_lock_sha256,
+        expected.external_runtime_task_hashes,
+    ):
+        raise ValueError("sealed external Portfolio authorization does not match verified inputs")
 
 
 def authorized_staged_task(

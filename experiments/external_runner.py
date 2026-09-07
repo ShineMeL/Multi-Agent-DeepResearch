@@ -655,6 +655,71 @@ class ExternalExperimentRunner:
         ExternalExperimentRunner._write_no_replace(path, payload)
         return path, sha256_bytes(payload)
 
+    def _validate_full_portfolio_runtime_hashes(
+        self,
+        *,
+        config: FormalExperimentConfig,
+        external: ExternalConfig,
+        lock_path: Path,
+        raw_root: Path,
+        snapshot_root: Path,
+    ) -> None:
+        """Reconstruct and compare the complete sealed 10/20/10 task map.
+
+        ``run-external --benchmarks frames`` is still a view of a formal
+        Portfolio seal, not a new frames-only seal.  Reconstructing all
+        adapters here also makes it impossible to smuggle an
+        ``ExternalEvaluationPlan`` hash (or any partial map) into the formal
+        authorization field: only the canonical seven-field RuntimeTask is
+        hashed.
+        """
+
+        adapters = {
+            benchmark: self._adapter(
+                benchmark,
+                lock_path=lock_path,
+                raw_root=raw_root,
+                snapshot_root=snapshot_root,
+                external_config=external,
+                repo_root=self.repo_root,
+            )
+            for benchmark in BENCHMARK_NAMES
+        }
+        expected: dict[str, str] = {}
+        expected_counts: dict[str, int] = {}
+        for benchmark in BENCHMARK_NAMES:
+            adapter = cast(Any, adapters[benchmark])
+            adapter.revalidate_source()
+            selections = adapter.select(
+                provider_profile_id=config.provider_profile_id,
+                budget_preset=config.budget_preset,
+            )
+            expected_count = BENCHMARK_COUNTS[benchmark]
+            if len(selections) != expected_count:
+                raise ValueError(
+                    "Portfolio external authorization must cover canonical 10/20/10 selections"
+                )
+            expected_counts[benchmark] = len(selections)
+            for selection in selections:
+                if not isinstance(selection, ExternalTaskSelection):
+                    raise TypeError("Portfolio adapter returned an invalid task selection")
+                task = selection.runtime_task
+                task_hash = canonical_sha256(task.model_dump(mode="json"))
+                if task.task_id in expected:
+                    raise ValueError("Portfolio external RuntimeTask IDs are not unique")
+                expected[task.task_id] = task_hash
+        if expected_counts != dict(BENCHMARK_COUNTS) or len(expected) != sum(
+            BENCHMARK_COUNTS.values()
+        ):
+            raise ValueError(
+                "Portfolio external authorization must cover the canonical 40-task map"
+            )
+        sealed = dict(config.external_runtime_task_hashes)
+        if sealed != dict(sorted(expected.items())):
+            raise ValueError(
+                "Portfolio external RuntimeTask authorization must exactly match canonical 10/20/10 map"
+            )
+
     @staticmethod
     def _failed_run(
         *,
@@ -782,6 +847,16 @@ class ExternalExperimentRunner:
                 verify_external_snapshot(snapshot_lock, snapshot_root=snapshot_root)
         if self.preflight:
             try:
+                # Validate the full Portfolio before honoring the requested
+                # benchmark subset.  A subset is an execution choice only;
+                # it cannot weaken the sealed 10/20/10 authorization map.
+                self._validate_full_portfolio_runtime_hashes(
+                    config=config,
+                    external=external,
+                    lock_path=lock_path,
+                    raw_root=raw_root,
+                    snapshot_root=snapshot_root,
+                )
                 private_root = self.repo_root / "benchmarks" / "private" / config.dataset_id
                 if not (private_root / "private_manifest.json").is_file():
                     private_root = self.repo_root / "benchmarks" / "private"
@@ -836,6 +911,10 @@ class ExternalExperimentRunner:
                 provider_profile_id=config.provider_profile_id,
                 budget_preset=config.budget_preset,
             )
+            # Selection is an in-memory view over ignored raw bytes.  Recheck
+            # the lock and source immediately after selection before any
+            # candidate pool or agent input is materialised.
+            cast(Any, adapter).revalidate_source()
             if len(selections) != BENCHMARK_COUNTS[benchmark]:
                 raise ValueError("INVALID_REQUEST: external selection count is not canonical")
             counts[benchmark] = len(selections)
@@ -898,6 +977,10 @@ class ExternalExperimentRunner:
                             }
                         )
                     ).hexdigest()
+                    # Revalidate for every replication as well.  A raw file
+                    # replaced between two launches must invalidate the run,
+                    # never reuse a cached selection/evaluation plan.
+                    cast(Any, adapter).revalidate_source()
                     staged = materialize_agent_runtime_task(
                         task,
                         agent_input_root=group_root / "agent-inputs",

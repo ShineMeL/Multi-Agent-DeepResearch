@@ -22,7 +22,7 @@ from benchmarks.external import (
 from benchmarks.external.base import ExternalSnapshotMaterializer, _as_frozen_records
 from benchmarks.external.livedrbench import LiveDRBenchAdapter
 from benchmarks.scripts.build_snapshot import build_one
-from benchmarks.scripts.fetch_external import restore
+from benchmarks.scripts.fetch_external import _parse_counts, restore
 from deepresearch.providers.errors import ProviderError
 
 
@@ -228,6 +228,43 @@ def test_external_adapter_rechecks_cached_raw_bytes_after_mutation(external_fixt
     (raw_root / "frames.json").write_bytes(b"[]\n")
     with pytest.raises(ProviderError, match="hash mismatch"):
         adapter.select(provider_profile_id="formal-local-vllm", budget_preset="medium")
+
+
+def test_restore_rejects_raw_payload_tampering(external_fixture):
+    repo, config, _, lock_path, raw_root, snapshot_root = external_fixture
+    raw_path = raw_root / "frames.json"
+    raw_path.write_bytes(raw_path.read_bytes() + b"\n")
+    with pytest.raises(ValueError, match="raw payload hash mismatch"):
+        restore(
+            config=config,
+            raw_root=raw_root,
+            documents_staging_root=repo / "benchmarks/private/external/staging",
+            snapshot_root=snapshot_root,
+            lock_path=lock_path,
+            repo_root=repo,
+        )
+
+
+def test_restore_rejects_staging_document_tampering(external_fixture):
+    repo, config, _, lock_path, raw_root, snapshot_root = external_fixture
+    lock = ExternalBenchmarkLock.model_validate_json(lock_path.read_bytes())
+    task_id = lock.frames.snapshot_locks[0].task_id
+    documents = repo / "benchmarks/private/external/staging" / f"{task_id}.jsonl"
+    documents.write_bytes(documents.read_bytes() + b"tampered")
+    with pytest.raises(ValueError, match="staging document hash mismatch"):
+        restore(
+            config=config,
+            raw_root=raw_root,
+            documents_staging_root=repo / "benchmarks/private/external/staging",
+            snapshot_root=snapshot_root,
+            lock_path=lock_path,
+            repo_root=repo,
+        )
+
+
+def test_cli_expected_counts_rejects_noncanonical_portfolio():
+    with pytest.raises(ValueError, match="canonical 10/20/10"):
+        _parse_counts("frames=1")
 
 
 def test_external_raw_and_snapshot_roots_reject_wrong_suffix(tmp_path: Path):

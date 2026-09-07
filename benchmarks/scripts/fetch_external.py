@@ -31,6 +31,7 @@ from benchmarks.external.base import (
     ExternalSourceLock,
     _as_frozen_records,  # pyright: ignore[reportPrivateUsage]
     _canonical_name,  # pyright: ignore[reportPrivateUsage]
+    _canonical_records_payload,  # pyright: ignore[reportPrivateUsage]
     _json_objects,  # pyright: ignore[reportPrivateUsage]
     _safe_child,  # pyright: ignore[reportPrivateUsage]
     fixed_external_root,
@@ -52,6 +53,7 @@ class ExternalSelectionRow(BaseModel):
     corpus_version: str
     index_version: str
     upstream_record_sha256: str
+    records_sha256: str
 
     @field_validator("external_id", "task_id", "documents_relative_path", "corpus_version", "index_version")
     @classmethod
@@ -60,7 +62,7 @@ class ExternalSelectionRow(BaseModel):
             raise ValueError("selection metadata must be non-empty")
         return value
 
-    @field_validator("upstream_record_sha256")
+    @field_validator("upstream_record_sha256", "records_sha256")
     @classmethod
     def digest(cls, value: str) -> str:
         if len(value) != 64 or value != value.lower() or value == "0" * 64:
@@ -360,7 +362,8 @@ def materialize_records(
                 retrieved_at=entry.fetched_at,
             )
             document_path = _safe_child(staging, f"{task_id}.jsonl", label="external staging document")
-            payload = b"".join(canonical_json_bytes(record.model_dump(mode="json")) for record in records)
+            payload = _canonical_records_payload(records)
+            records_digest = sha256_bytes(payload)
             write_external_json(document_path, payload)
             rows.append(
                 ExternalSelectionRow(
@@ -371,6 +374,7 @@ def materialize_records(
                     corpus_version=entry.corpus_version,
                     index_version=entry.index_version,
                     upstream_record_sha256=sha256_bytes(canonical_json_bytes(item)),
+                    records_sha256=records_digest,
                 )
             )
     manifest = ExternalSelectionManifest(selections=tuple(sorted(rows, key=lambda row: (row.benchmark, row.task_id))))
@@ -421,6 +425,15 @@ def build_snapshots(
     source_locks: dict[BenchmarkName, ExternalSourceLock] = {
         name: download_lock.entry(name) for name in BENCHMARK_NAMES
     }
+    for benchmark in BENCHMARK_NAMES:
+        source = source_locks[benchmark]
+        spec = config.spec(benchmark)
+        if (
+            source.benchmark != benchmark
+            or (source.corpus_version, source.index_version, source.adapter_version)
+            != (spec.corpus_version, config.index_version, spec.adapter_version)
+        ):
+            raise ValueError("external config and download lock versions disagree")
     for row in selection.selections:
         source = source_locks[row.benchmark]
         spec = config.spec(row.benchmark)
@@ -432,10 +445,14 @@ def build_snapshots(
             row.index_version,
         ) != (spec.corpus_version, config.index_version):
             raise ValueError("external selection/config/source versions disagree")
+    raw = fixed_external_root(
+        repository / config.raw_root, kind="raw", repo_root=repository
+    )
     built = ExternalSnapshotMaterializer().build(
         selection_manifest_path=selection_file,
         documents_staging_root=staging,
         snapshot_root=snapshots,
+        raw_root=raw,
         repo_root=repository,
         external_config=config,
         source_locks=source_locks,
@@ -563,9 +580,31 @@ def restore(
                 retrieved_at=entry.fetched_at,
             )
             documents_path = _safe_child(staging, f"{task_id}.jsonl", label="external staging document")
-            payload = b"".join(
-                canonical_json_bytes(record.model_dump(mode="json")) for record in records
+            payload = _canonical_records_payload(records)
+            records_digest = sha256_bytes(payload)
+            snapshot_path = _safe_child(
+                snapshots,
+                snapshot_lock.snapshot_relative_path,
+                label="external snapshot",
             )
+            if snapshot_path.exists() and snapshot_path.is_dir():
+                try:
+                    existing_snapshot = verify_external_snapshot(
+                        snapshot_lock, snapshot_root=snapshots
+                    )
+                except ProviderError:
+                    # The later restore pass reports an incomplete child and
+                    # never replaces it.  A valid child, however, must be
+                    # byte-for-byte derived from the currently locked raw
+                    # item before it can be reused.
+                    existing_snapshot = None
+                if existing_snapshot is not None and (
+                    existing_snapshot.manifest.documents_sha256 != records_digest
+                    or existing_snapshot.records != records
+                ):
+                    raise ValueError(
+                        "existing external snapshot is inconsistent with raw provenance"
+                    )
             if documents_path.exists():
                 if documents_path.read_bytes() != payload:
                     raise ValueError("external staging document hash mismatch")
@@ -580,6 +619,7 @@ def restore(
                     corpus_version=entry.corpus_version,
                     index_version=entry.index_version,
                     upstream_record_sha256=sha256_bytes(canonical_json_bytes(item)),
+                    records_sha256=records_digest,
                 )
             )
     selection_path = staging / "restore-selection.json"
@@ -614,6 +654,7 @@ def restore(
             selection_manifest_path=missing_path,
             documents_staging_root=staging,
             snapshot_root=snapshots,
+            raw_root=raw,
             repo_root=repository,
             external_config=config,
             source_locks={name: lock.entry(name) for name in BENCHMARK_NAMES},
