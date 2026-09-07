@@ -226,6 +226,8 @@ def freeze(
     r1_model_lock: Annotated[Path, typer.Option("--r1-model-lock")],
     serving_environment_lock: Annotated[Path, typer.Option("--serving-environment-lock")],
     output: Annotated[Path, typer.Option("--output")],
+    external_config: Annotated[Path | None, typer.Option("--external-config")] = None,
+    external_lock: Annotated[Path | None, typer.Option("--external-lock")] = None,
 ) -> None:
     """Freeze a formal config from the fixed evaluator roots."""
     try:
@@ -251,7 +253,19 @@ def freeze(
             if supplied_path != expected_path:
                 raise ValueError(f"{label} does not match the sealed template reference")
         private_root = private_manifest.parent
-        config = freeze_config(template, repo_root=repo_root, private_root=private_root)
+        external_pair = (external_config is not None, external_lock is not None)
+        if any(external_pair) and not all(external_pair):
+            raise ValueError("external config and lock must be supplied together")
+        if external_config is not None:
+            external_config = _require_regular_file(external_config, label="external config")
+            external_lock = _require_regular_file(external_lock, label="external lock")
+        config = freeze_config(
+            template,
+            repo_root=repo_root,
+            private_root=private_root,
+            external_config_path=external_config,
+            external_lock_path=external_lock,
+        )
         # freeze_config itself writes atomically and refuses replacement when
         # an output is provided; keep the CLI output separate for clear error
         # handling and exact canonical bytes.
@@ -351,6 +365,35 @@ def run_reference(
     _run(
         _runner(loaded, config, with_oracle=True).run_reference(
             config=loaded, task_ids=loaded.p0_task_ids
+        )
+    )
+
+
+@experiment_app.command("run-external")
+def run_external(
+    config: Annotated[Path, typer.Option("--config")],
+    external_config: Annotated[Path, typer.Option("--external-config")],
+    external_lock: Annotated[Path, typer.Option("--external-lock")],
+    benchmarks: Annotated[str, typer.Option("--benchmarks")],
+) -> None:
+    """Run the evaluator-only Portfolio external benchmark extension."""
+
+    loaded = _load_formal(config)
+    requested = tuple(item.strip() for item in benchmarks.split(",") if item.strip())
+    allowed = {"livedrbench", "frames", "deepresearchbench"}
+    if not requested or len(set(requested)) != len(requested) or not set(requested) <= allowed:
+        _fail("--benchmarks must contain unique external benchmark names")
+    from experiments.external_runner import ExternalExperimentRunner
+
+    _run(
+        ExternalExperimentRunner(
+            repo_root=Path.cwd().resolve(),
+            config_source=config.absolute(),
+        ).run(
+            config=loaded,
+            external_config_path=external_config,
+            external_lock_path=external_lock,
+            benchmarks=requested,  # type: ignore[arg-type]
         )
     )
 

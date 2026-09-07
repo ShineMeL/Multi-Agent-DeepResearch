@@ -168,7 +168,11 @@ class FormalExperimentConfig(FormalExperimentTemplate):
         if set(self.external_runtime_task_hashes) & main:
             raise ValueError("task may occur in exactly one authorization map")
         if any(
-            re.fullmatch(r"ext-[a-z0-9]+-[a-zA-Z0-9][a-zA-Z0-9_-]*", task) is None
+            re.fullmatch(
+                r"ext-(?:livedrbench|frames|deepresearchbench)-[a-zA-Z0-9][a-zA-Z0-9_.-]*",
+                task,
+            )
+            is None
             for task in self.external_runtime_task_hashes
         ):
             raise ValueError(
@@ -238,6 +242,10 @@ def code_tree_sha256(repo_root: Path) -> str:
         include |= relative.startswith("benchmarks/") and (
             path.suffix == ".py" or relative.startswith("benchmarks/configs/")
         )
+        # A Portfolio seal is bound to the exact external source/snapshot
+        # lock.  The lock is evaluator metadata (not raw payload), so include
+        # it in the result-affecting tree hash.
+        include |= relative == "benchmarks/external/external.lock.json"
         if relative.startswith(
             ("benchmarks/private/", "benchmarks/snapshots/", "benchmarks/results/")
         ):
@@ -281,6 +289,15 @@ def validate_base_task(task: RuntimeTask, config: FormalExperimentTemplate) -> N
         request.budget_preset,
     ) != ("hybrid", "local", "benchmark", config.provider_profile_id, config.budget_preset):
         raise ValueError("base RuntimeTask request must match sealed primary budget/profile")
+    external_hashes = getattr(config, "external_runtime_task_hashes", {})
+    # External Portfolio snapshots intentionally have their own corpus
+    # version. Their canonical task hash is sealed in the external map and
+    # the runner has already verified the matching frozen snapshot. Internal
+    # tasks continue to require the primary corpus/index identity.
+    if task.task_id in external_hashes:
+        if not task.task_id.startswith("ext-"):
+            raise ValueError("external RuntimeTask namespace is invalid")
+        return
     if (task.corpus_version, task.index_version) != (config.corpus_version, config.index_version):
         raise ValueError("RuntimeTask corpus/index identity mismatch")
 
@@ -291,6 +308,8 @@ def freeze_config(
     repo_root: Path,
     private_root: Path,
     output_path: Path | None = None,
+    external_config_path: Path | None = None,
+    external_lock_path: Path | None = None,
 ) -> FormalExperimentConfig:
     """Evaluator-only: seal from verified fixed dataset roots, never caller-selected task files."""
     template = FormalExperimentTemplate.model_validate(template.model_dump(mode="json"))
@@ -366,6 +385,112 @@ def freeze_config(
         != (template.serving_runtime_version, template.serving_runtime_artifact_sha256)
     ):
         raise ValueError("serving environment/model/runtime identity mismatch")
+    external_values: dict[str, object] = {
+        "external_config_sha256": None,
+        "external_lock_sha256": None,
+        "external_runtime_task_hashes": {},
+    }
+    external_pair = (external_config_path is not None, external_lock_path is not None)
+    if any(external_pair) and not all(external_pair):
+        raise ValueError("external config and lock must be supplied together")
+    if all(external_pair):
+        # Keep optional Portfolio inputs out of the primary import path.  The
+        # adapters only read the fixed, hash-checked local roots and expose a
+        # canonical RuntimeTask; the evaluator plan is intentionally ignored
+        # when producing the authorization hash map.
+        from benchmarks.external import BENCHMARK_NAMES, load_external_config, load_external_lock
+        from benchmarks.external.deepresearchbench import DeepResearchBenchAdapter
+        from benchmarks.external.frames import FramesAdapter
+        from benchmarks.external.livedrbench import LiveDRBenchAdapter
+
+        try:
+            external_source_raw = Path(external_config_path)
+            external_lock_raw = Path(external_lock_path)
+            if ".." in external_source_raw.parts or ".." in external_lock_raw.parts:
+                raise ValueError("external config/lock contains traversal")
+            external_source = external_source_raw.absolute()
+            external_lock_source = external_lock_raw.absolute()
+            external_source.relative_to(Path(repo_root).absolute())
+            external_lock_source.relative_to(Path(repo_root).absolute())
+            expected_external_source = Path(repo_root).absolute() / "benchmarks" / "configs" / "external.yaml"
+            expected_external_lock = Path(repo_root).absolute() / "benchmarks" / "external" / "external.lock.json"
+            if (external_source, external_lock_source) != (
+                expected_external_source,
+                expected_external_lock,
+            ):
+                raise ValueError("external config/lock must use the fixed repository paths")
+        except ValueError as error:
+            raise ValueError("external config/lock must be inside the repository") from error
+        external = load_external_config(external_source)
+        external_lock = load_external_lock(external_lock_source)
+        if (
+            external.raw_root,
+            external.documents_staging_root,
+            external.snapshot_root,
+        ) != (
+            "benchmarks/private/external/raw",
+            "benchmarks/private/external/staging",
+            "benchmarks/snapshots/external",
+        ):
+            raise ValueError("external roots are not fixed")
+        # Parse once at the seal boundary so a malformed aggregate cannot be
+        # hidden by an adapter's benchmark-specific lookup.
+        _ = external_lock
+        adapters = {
+            "livedrbench": LiveDRBenchAdapter,
+            "frames": FramesAdapter,
+            "deepresearchbench": DeepResearchBenchAdapter,
+        }
+        external_hashes: dict[str, str] = {}
+        for benchmark in BENCHMARK_NAMES:
+            adapter = adapters[benchmark](
+                lock_file=external_lock_source,
+                raw_root=Path(repo_root) / external.raw_root,
+                snapshot_root=Path(repo_root) / external.snapshot_root,
+                external_config=external,
+            )
+            selections = adapter.select(
+                provider_profile_id=template.provider_profile_id,
+                budget_preset=template.budget_preset,
+            )
+            if len(selections) != external.spec(benchmark).expected_count:
+                raise ValueError("external selection count is not sealed")
+            for selection in selections:
+                task = selection.runtime_task
+                request = task.request
+                if (
+                    request.execution_mode,
+                    request.access_profile,
+                    request.run_purpose,
+                    request.provider_profile_id,
+                    request.budget_preset,
+                ) != (
+                    "hybrid",
+                    "local",
+                    "benchmark",
+                    template.provider_profile_id,
+                    template.budget_preset,
+                ):
+                    raise ValueError("external RuntimeTask request identity mismatch")
+                snapshot_lock = adapter.snapshot_lock_for(task.task_id)
+                if (
+                    task.snapshot_id,
+                    task.corpus_version,
+                    task.index_version,
+                ) != (
+                    snapshot_lock.snapshot_id,
+                    snapshot_lock.corpus_version,
+                    snapshot_lock.index_version,
+                ):
+                    raise ValueError("external RuntimeTask snapshot identity mismatch")
+                if task.task_id in external_hashes:
+                    raise ValueError("duplicate external RuntimeTask ID")
+                external_hashes[task.task_id] = canonical_sha256(task.model_dump(mode="json"))
+        external_values = {
+            "external_config_sha256": sha256_bytes(external_source.read_bytes()),
+            "external_lock_sha256": sha256_bytes(external_lock_source.read_bytes()),
+            "external_runtime_task_hashes": dict(sorted(external_hashes.items())),
+        }
     config = FormalExperimentConfig.model_validate(
         {
             **template.model_dump(mode="json"),
@@ -377,6 +502,7 @@ def freeze_config(
             "serving_environment_sha256": environment.environment_sha256,
             "code_tree_sha256": code_tree_sha256(repo_root),
             "internal_runtime_task_hashes": dict(sorted(tasks.items())),
+            **external_values,
         }
     )
     if output_path is not None:
@@ -385,7 +511,12 @@ def freeze_config(
 
 
 def preflight_config(
-    config: FormalExperimentConfig, *, repo_root: Path, private_root: Path
+    config: FormalExperimentConfig,
+    *,
+    repo_root: Path,
+    private_root: Path,
+    external_config_path: Path | None = None,
+    external_lock_path: Path | None = None,
 ) -> None:
     payload = config.model_dump(mode="json")
     template = FormalExperimentTemplate.model_validate(
@@ -395,7 +526,20 @@ def preflight_config(
             if key in FormalExperimentTemplate.model_fields
         }
     )
-    expected = freeze_config(template, repo_root=repo_root, private_root=private_root)
+    if config.external_config_sha256 is not None:
+        external_config_path = external_config_path or (
+            repo_root / "benchmarks" / "configs" / "external.yaml"
+        )
+        external_lock_path = external_lock_path or (
+            repo_root / "benchmarks" / "external" / "external.lock.json"
+        )
+    expected = freeze_config(
+        template,
+        repo_root=repo_root,
+        private_root=private_root,
+        external_config_path=external_config_path,
+        external_lock_path=external_lock_path,
+    )
     external_fields = {
         "external_config_sha256",
         "external_lock_sha256",
