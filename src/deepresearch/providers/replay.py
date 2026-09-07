@@ -4,7 +4,7 @@ import asyncio
 import base64
 import binascii
 import time
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from math import isfinite
 from typing import TypeVar, cast
 
@@ -45,11 +45,22 @@ T = TypeVar("T")
 class _ReplayProvider:
     live_calls = 0
 
-    def __init__(self, bundle: ReplayBundle, *, provider_kind: str) -> None:
+    def __init__(
+        self,
+        bundle: ReplayBundle,
+        *,
+        provider_kind: str,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._bundle = bundle
         self._provider_snapshot = bundle.provider_snapshot(provider_kind)
         self.provider_id = self._provider_snapshot.provider_id
+        self._clock = clock
         self.last_usage: ResourceUsage | None = None
+
+    def _begin_call(self) -> None:
+        """Drop usage from a prior call before any new failure can occur."""
+        self.last_usage = None
 
     def _key(
         self,
@@ -67,6 +78,7 @@ class _ReplayProvider:
         )
 
     def _lookup(self, key: ReplayRequestKey) -> ReplaySuccess:
+        self._begin_call()
         record = self._bundle.lookup(key)
         self.last_usage = record.usage
         if isinstance(record.outcome, ReplayFailure):
@@ -87,7 +99,7 @@ class _ReplayProvider:
         if not isfinite(deadline):
             raise ValueError("deadline must be finite")
         cancellation_token.raise_if_cancelled()
-        if time.monotonic() >= deadline:
+        if self._clock() >= deadline:
             raise ProviderError(
                 code="TIMEOUT",
                 provider=self.provider_id,
@@ -108,8 +120,13 @@ class _ReplayProvider:
 
 
 class ReplayModelProvider(_ReplayProvider):
-    def __init__(self, bundle: ReplayBundle) -> None:
-        super().__init__(bundle, provider_kind="model")
+    def __init__(
+        self,
+        bundle: ReplayBundle,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        super().__init__(bundle, provider_kind="model", clock=clock)
         if not self._provider_snapshot.model_revision:
             raise ProviderError(
                 code="INVALID_SNAPSHOT", provider=self.provider_id,
@@ -125,6 +142,7 @@ class ReplayModelProvider(_ReplayProvider):
         deadline: float,
         cancellation_token: CancellationToken,
     ) -> ModelResult[str]:
+        self._begin_call()
         self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation="model.complete")
         key = self._key(
             "model.complete",
@@ -135,8 +153,11 @@ class ReplayModelProvider(_ReplayProvider):
         await asyncio.sleep(0)
         self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation=key.operation)
         try:
-            return ModelResult[str].model_validate(outcome.response)
-        except ValidationError as error:
+            result = ModelResult[str].model_validate(outcome.response)
+            if result.model_id != request.model_id:
+                raise ValueError("recorded model identity does not match request")
+            return result
+        except (TypeError, ValueError, ValidationError) as error:
             raise self._invalid_response(self.provider_id, key.operation, error) from error
 
     async def structured(
@@ -147,6 +168,7 @@ class ReplayModelProvider(_ReplayProvider):
         deadline: float,
         cancellation_token: CancellationToken,
     ) -> StructuredModelResult[T]:
+        self._begin_call()
         self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation="model.structured")
         key = self._key(
             "model.structured",
@@ -163,7 +185,13 @@ class ReplayModelProvider(_ReplayProvider):
             response["output"] = TypeAdapter(output_schema).validate_python(
                 response.get("output")
             )
-            return StructuredModelResult[T].model_validate(response)
+            result = StructuredModelResult[T].model_validate(response)
+            if (
+                result.model_id != request.model_id
+                or result.output_schema_hash != request.output_schema_hash
+            ):
+                raise ValueError("recorded structured model identity does not match request")
+            return result
         except (TypeError, ValueError, ValidationError) as error:
             raise self._invalid_response(self.provider_id, key.operation, error) from error
 
@@ -174,7 +202,10 @@ class ReplayModelProvider(_ReplayProvider):
         deadline: float,
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[ModelStreamChunk]:
+        self._begin_call()
+
         async def replay_chunks() -> AsyncIterator[ModelStreamChunk]:
+            self._begin_call()
             self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation="model.stream")
             key = self._key(
                 "model.stream",
@@ -200,8 +231,13 @@ class ReplayModelProvider(_ReplayProvider):
 
 
 class ReplaySearchProvider(_ReplayProvider):
-    def __init__(self, bundle: ReplayBundle) -> None:
-        super().__init__(bundle, provider_kind="search")
+    def __init__(
+        self,
+        bundle: ReplayBundle,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        super().__init__(bundle, provider_kind="search", clock=clock)
 
     async def search(
         self,
@@ -212,6 +248,7 @@ class ReplaySearchProvider(_ReplayProvider):
         deadline: float,
         cancellation_token: CancellationToken,
     ) -> list[SearchHit]:
+        self._begin_call()
         self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation="search")
         key = self._key("search", search_request_payload(query, limit, filters))
         outcome = self._lookup(key)
@@ -225,8 +262,13 @@ class ReplaySearchProvider(_ReplayProvider):
 
 
 class ReplayFetcher(_ReplayProvider):
-    def __init__(self, bundle: ReplayBundle) -> None:
-        super().__init__(bundle, provider_kind="fetch")
+    def __init__(
+        self,
+        bundle: ReplayBundle,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        super().__init__(bundle, provider_kind="fetch", clock=clock)
 
     async def fetch(
         self,
@@ -235,6 +277,7 @@ class ReplayFetcher(_ReplayProvider):
         deadline: float,
         cancellation_token: CancellationToken,
     ) -> RawDocument:
+        self._begin_call()
         self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation="fetch")
         key = self._key("fetch", fetch_request_payload(url))
         outcome = self._lookup(key)
@@ -254,8 +297,13 @@ class ReplayFetcher(_ReplayProvider):
 
 
 class ReplayTextEmbedder(_ReplayProvider):
-    def __init__(self, bundle: ReplayBundle) -> None:
-        super().__init__(bundle, provider_kind="embed")
+    def __init__(
+        self,
+        bundle: ReplayBundle,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        super().__init__(bundle, provider_kind="embed", clock=clock)
         if (
             self._provider_snapshot.model_id is None
             or self._provider_snapshot.model_revision is None
@@ -279,6 +327,7 @@ class ReplayTextEmbedder(_ReplayProvider):
         deadline: float,
         cancellation_token: CancellationToken,
     ) -> tuple[tuple[float, ...], ...]:
+        self._begin_call()
         self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation="embed")
         frozen_texts = tuple(texts)
         key = self._key("embed", embed_request_payload(frozen_texts))

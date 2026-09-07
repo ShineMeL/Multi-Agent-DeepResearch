@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -8,6 +11,7 @@ import pytest
 from benchmarks.datasets.isolation import GoldAccessViolation, GoldIsolationGuard
 from benchmarks.datasets.models import AnnotatedQuestion, RuntimeTask
 from benchmarks.processes.evaluator import materialize_agent_runtime_task
+from deepresearch.runtime import CheckpointRef
 
 EXAMPLE = Path(__file__).parents[2] / ".." / "benchmarks" / "datasets" / "templates" / "question.example.json"
 
@@ -92,4 +96,135 @@ def test_materialization_rejects_private_destination(tmp_path: Path) -> None:
             agent_input_root=private_root / "agent-inputs",
             request_id="request-1",
             forbidden_private_root=private_root,
+        )
+
+
+def test_agent_runtime_guard_verifies_task15_input_roots_and_hashes(tmp_path: Path) -> None:
+    from benchmarks.datasets.isolation import AgentRuntimeGuard
+
+    runtime = tmp_path / "runtime"
+    snapshots = tmp_path / "snapshots"
+    run = tmp_path / "run"
+    requests = run / "requests"
+    config = run / "config"
+    pools = run / "candidate-pools"
+    checkpoints = run / "resume-checkpoints"
+    for directory in (runtime, snapshots, requests, config, pools, checkpoints):
+        directory.mkdir(parents=True)
+    (runtime / "task.json").write_text("{}", encoding="utf-8")
+    (requests / "request.json").write_text("{}", encoding="utf-8")
+    (config / "formal.yaml").write_text("sealed: true\n", encoding="utf-8")
+    (pools / "pool.json").write_text('{"evidence_ids": []}\n', encoding="utf-8")
+    (checkpoints / "resume.sqlite3").write_bytes(b"checkpoint")
+    guard = AgentRuntimeGuard(runtime_root=runtime, snapshot_root=snapshots, run_root=run)
+    digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    assert guard.resolve_request(requests / "request.json") == (requests / "request.json").resolve()
+    assert guard.resolve_staged_config(
+        config / "formal.yaml", expected_sha256=digest(config / "formal.yaml")
+    ) == (config / "formal.yaml").resolve()
+    assert guard.resolve_candidate_pool(
+        pools / "pool.json", expected_sha256=digest(pools / "pool.json")
+    ) == (pools / "pool.json").resolve()
+    assert guard.resolve_resume_checkpoint(
+        checkpoints / "resume.sqlite3", expected_sha256=digest(checkpoints / "resume.sqlite3")
+    ) == (checkpoints / "resume.sqlite3").resolve()
+    with pytest.raises(GoldAccessViolation):
+        guard.resolve_staged_config(config / "formal.yaml", expected_sha256="0" * 64)
+    with pytest.raises(GoldAccessViolation):
+        guard.resolve_output(config / "formal.yaml")
+
+
+def test_agent_runtime_guard_rejects_lexical_traversal_and_root_symlink(
+    tmp_path: Path,
+) -> None:
+    from benchmarks.datasets.isolation import AgentRuntimeGuard
+
+    runtime = tmp_path / "runtime"
+    snapshots = tmp_path / "snapshots"
+    run = tmp_path / "run"
+    requests = run / "requests"
+    for directory in (runtime, snapshots, requests):
+        directory.mkdir(parents=True)
+    request = requests / "request.json"
+    request.write_text("{}", encoding="utf-8")
+    guard = AgentRuntimeGuard(runtime_root=runtime, snapshot_root=snapshots, run_root=run)
+    with pytest.raises(GoldAccessViolation):
+        guard.resolve_request(requests / ".." / "requests" / "request.json")
+
+    linked_runtime = tmp_path / "runtime-link"
+    linked_runtime.symlink_to(runtime, target_is_directory=True)
+    with pytest.raises(GoldAccessViolation):
+        AgentRuntimeGuard(runtime_root=linked_runtime, snapshot_root=snapshots, run_root=run)
+
+
+def test_agent_artifact_output_rejects_artifacts_subtree_symlink(tmp_path: Path) -> None:
+    from benchmarks.processes.agent import _write_json_no_replace
+
+    run = tmp_path / "run"
+    run.mkdir()
+    target = tmp_path / "artifact-target"
+    target.mkdir()
+    (run / "artifacts").symlink_to(target, target_is_directory=True)
+
+    with pytest.raises((GoldAccessViolation, ValueError, OSError), match="symlink|reparse|artifact"):
+        _write_json_no_replace(run / "artifacts" / "result.json", {"status": "ok"})
+
+
+def test_snapshot_manifest_rejects_file_symlink(tmp_path: Path) -> None:
+    from benchmarks.processes.agent import _verify_snapshot
+
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    documents = tmp_path / "documents.jsonl"
+    documents.write_bytes(b"public\n")
+    (snapshot / "documents.jsonl").symlink_to(documents)
+    (snapshot / "index.json").write_bytes(b"{}\n")
+    snapshot_payload = {
+        "task_id": "test-t1",
+        "snapshot_id": "snapshot-t1",
+        "corpus_version": "corpus-v1",
+        "index_version": "index-v1",
+        "documents_sha256": hashlib.sha256(documents.read_bytes()).hexdigest(),
+        "index_sha256": hashlib.sha256((snapshot / "index.json").read_bytes()).hexdigest(),
+    }
+    (snapshot / "snapshot.json").write_text(json.dumps(snapshot_payload), encoding="utf-8")
+    manifest = {
+        "file_sha256": {
+            name: hashlib.sha256((snapshot / name).read_bytes()).hexdigest()
+            for name in ("documents.jsonl", "index.json", "snapshot.json")
+        }
+    }
+    (snapshot / "manifest.sha256").write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises((GoldAccessViolation, ValueError), match="symlink|link|snapshot"):
+        _verify_snapshot(snapshot)
+
+
+def test_agent_checkpoint_identity_must_exist_in_verified_sqlite_source(
+    tmp_path: Path,
+) -> None:
+    from benchmarks.processes.agent import _verify_checkpoint_identity
+
+    path = tmp_path / "resume.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE checkpoints (thread_id TEXT, checkpoint_ns TEXT, checkpoint_id TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO checkpoints VALUES (?, ?, ?)",
+            ("thread-1", "", "cp-1"),
+        )
+    ref = CheckpointRef(
+        checkpoint_id="cp-1",
+        thread_id="thread-1",
+        created_at=datetime(2026, 9, 1, tzinfo=UTC),
+    )
+    _verify_checkpoint_identity(path, ref)
+    with pytest.raises(GoldAccessViolation, match="checkpoint identity"):
+        _verify_checkpoint_identity(
+            path,
+            CheckpointRef(
+                checkpoint_id="cp-other",
+                thread_id="thread-1",
+                created_at=ref.created_at,
+            ),
         )

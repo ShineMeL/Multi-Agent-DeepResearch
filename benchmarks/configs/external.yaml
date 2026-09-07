@@ -1,0 +1,32 @@
+# Optional Portfolio Full inputs.  This is a reviewable configuration only;
+# no third-party payload is bundled in this repository.
+schema_version: external-config-v1
+raw_root: benchmarks/private/external/raw
+documents_staging_root: benchmarks/private/external/staging
+snapshot_root: benchmarks/snapshots/external
+index_version: bm25-mixed-v1
+evaluation_cutoff: 2026-08-29
+
+livedrbench:
+  corpus_version: livedrbench-v1
+  expected_count: 10
+  adapter_version: livedrbench-adapter-v1
+  supported_metric_names: [citation_precision, evidence_recall]
+  source_url: https://example.invalid/livedrbench
+  license_id: pending-verification
+
+frames:
+  corpus_version: frames-v1
+  expected_count: 20
+  adapter_version: frames-adapter-v1
+  supported_metric_names: [evidence_ndcg, evidence_recall]
+  source_url: https://example.invalid/frames
+  license_id: pending-verification
+
+deepresearchbench:
+  corpus_version: deepresearchbench-v1
+  expected_count: 10
+  adapter_version: deepresearchbench-adapter-v1
+  supported_metric_names: [citation_precision, citation_recall, report_quality]
+  source_url: https://example.invalid/deepresearchbench
+  license_id: pending-verification

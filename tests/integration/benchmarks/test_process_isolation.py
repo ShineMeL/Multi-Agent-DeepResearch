@@ -75,6 +75,71 @@ def test_agent_subprocess_refuses_gold_environment(tmp_path: Path) -> None:
     assert "GOLD_ROOT_FORBIDDEN" in result.stderr
 
 
+def test_agent_request_rejects_missing_or_empty_root_environment(tmp_path: Path) -> None:
+    root = Path(__file__).parents[2].parents[1].resolve()
+    request = tmp_path / "request.json"
+    request.write_text("{}", encoding="utf-8")
+    base = _base_env(root)
+    for name in (
+        "DEEPRESEARCH_BENCHMARK_RUNTIME_ROOT",
+        "DEEPRESEARCH_BENCHMARK_SNAPSHOT_ROOT",
+        "DEEPRESEARCH_BENCHMARK_RUN_ROOT",
+    ):
+        missing = {
+            **base,
+            **{
+                key: str(tmp_path / key.lower())
+                for key in (
+                    "DEEPRESEARCH_BENCHMARK_RUNTIME_ROOT",
+                    "DEEPRESEARCH_BENCHMARK_SNAPSHOT_ROOT",
+                    "DEEPRESEARCH_BENCHMARK_RUN_ROOT",
+                )
+                if key != name
+            },
+        }
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "benchmarks.processes.agent",
+                "--request",
+                str(request),
+                "--receipt",
+                str(tmp_path / "receipt.json"),
+            ],
+            cwd=root,
+            env=missing,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 3
+        assert "root environment" in result.stderr
+
+        empty = {
+            **missing,
+            name: "",
+        }
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "benchmarks.processes.agent",
+                "--request",
+                str(request),
+                "--receipt",
+                str(tmp_path / "receipt-empty.json"),
+            ],
+            cwd=root,
+            env=empty,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 3
+        assert "root environment" in result.stderr
+
+
 def test_evaluator_stages_sanitized_task_and_agent_never_sees_private_root(
     tmp_path: Path,
 ) -> None:

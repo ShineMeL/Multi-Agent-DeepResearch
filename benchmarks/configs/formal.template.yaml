@@ -1,0 +1,57 @@
+dataset_id: frozen_ai_cs_60
+dataset_version: 1.0.0
+evaluation_timestamp: 2026-08-29T00:00:00Z
+model_id: Qwen/Qwen3-8B
+model_revision: cbe31c4effd2c6b8e18d453f0d3230dc6a1d2f18
+model_lock_path: benchmarks/configs/qwen3-8b.lock.json
+base_url: http://127.0.0.1:8001/v1
+provider_id: local-vllm
+provider_profile_id: formal-local-vllm
+endpoint_type: openai_compatible_chat_completions
+decoding:
+  temperature: 0.0
+  top_p: 1.0
+  top_k: -1
+  max_tokens: 8192
+  repetition_penalty: 1.0
+  thinking_mode: enabled
+  tensor_parallel_size: 1
+  dtype: bfloat16
+  max_model_len: 32768
+replication:
+  seed_values: [20260829, 20260830, 20260831]
+  candidate_pool_seed: 20260829
+  unseeded_repeat_count: 3
+prompt_version: planner-writer-v1
+writer_prompt_version: writer-v1
+judge_model_id: Qwen/Qwen3-8B
+judge_model_revision: cbe31c4effd2c6b8e18d453f0d3230dc6a1d2f18
+judge_model_lock_path: benchmarks/configs/qwen3-8b.lock.json
+judge_prompt_version: evidence-judge-v1
+r1_model_id: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+r1_model_revision: e62509716f15c5fd03a6fd3156a4bc5e43f83f26
+r1_model_lock_path: models/embedding.lock.json
+ranker_weights_version: r2-v1
+serving_runtime: vllm
+serving_runtime_version: 0.28.0
+serving_runtime_platform: manylinux_2_31_x86_64
+serving_runtime_artifact_sha256: addb0ffdaafd8155d75e9b3f5ddb3da28fdee9e8a7097ede91f7db2e9e1a3889
+serving_environment_lock_path: benchmarks/configs/inference-environment.lock.json
+budget_preset: medium
+budget_sensitivity_presets: [low, medium, high]
+snapshot_collection_id: frozen-ai-cs-60-v1
+corpus_version: ai-cs-60-v1
+index_version: bm25-mixed-v1
+evaluator_version: evaluator-v1
+pricing_status: estimated
+pricing_snapshot:
+  snapshot_id: formal-local-accounting-2026-08-29
+  provider_id: local-vllm
+  endpoint_type: openai_compatible_chat_completions
+  model_id: Qwen/Qwen3-8B
+  effective_at: 2026-08-29T00:00:00Z
+  currency: USD
+  input_tokens_per_million_usd: '0.10'
+  output_tokens_per_million_usd: '0.20'
+  cached_tokens_per_million_usd: '0.02'
+  reasoning_tokens_per_million_usd: '0.20'

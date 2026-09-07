@@ -9,6 +9,7 @@ __pycache__/
 
 # Benchmark gold and generated experiment payloads stay evaluator-only.
 benchmarks/private/
+benchmarks/snapshots/external/
 benchmarks/snapshots/**/documents.jsonl
 benchmarks/snapshots/**/search.jsonl
 benchmarks/snapshots/**/index.json
