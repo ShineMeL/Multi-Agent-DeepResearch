@@ -15,6 +15,7 @@ import shutil
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -39,6 +40,7 @@ from deepresearch.runtime import (
     CancellationToken,
     ResourceEstimate,
 )
+from deepresearch.runtime.manifest import RunManifest
 
 ROOT = Path(__file__).resolve().parents[2]
 PROVIDER_FIXTURE = ROOT / "fixtures" / "replay" / "provider_contract"
@@ -69,11 +71,85 @@ def _request(*, model_id: str = "fixture-model-v1") -> ModelRequest:
 class _ReplayRun:
     report_bytes: bytes
     evaluation_bytes: bytes
-    manifest_bytes: bytes
-    replay_parent: str | None
+    manifest: RunManifest
+    manifest_path: Path
 
 
-async def _run_recorded_fixture(bundle: ReplayBundle, *, strict: bool) -> _ReplayRun:
+def _build_run_manifest(
+    bundle: ReplayBundle,
+    *,
+    report_bytes: bytes,
+    evaluation_bytes: bytes,
+    strict: bool,
+    recorded_manifest: RunManifest | None,
+) -> RunManifest:
+    report_artifact_id = f"sha256:{hashlib.sha256(report_bytes).hexdigest()}"
+    evaluation_artifact_id = f"sha256:{hashlib.sha256(evaluation_bytes).hexdigest()}"
+    if strict:
+        if recorded_manifest is None:
+            raise AssertionError("strict replay requires a recorded RunManifest")
+        if recorded_manifest.run_id != bundle.snapshot.run_id:
+            raise AssertionError("recorded manifest must identify the replay bundle")
+        return recorded_manifest.model_copy(
+            update={
+                "run_id": "strict-replay-run-v1",
+                "replay_parent": recorded_manifest.run_id,
+            }
+        )
+
+    started_at = datetime(2026, 9, 7, tzinfo=UTC)
+    zero_usage = ResourceUsage.zero(cost_known=True)
+    return RunManifest.create(
+        {
+            "schema_version": "run-manifest-v1",
+            "run_id": bundle.snapshot.run_id,
+            "thread_id": "recorded-thread-v1",
+            "code_commit": "a" * 40,
+            "dependency_lock_sha256": "b" * 64,
+            "request_sha256": "c" * 64,
+            "config_sha256": "d" * 64,
+            "workflow_id": "research-v1",
+            "graph_version": "strict-replay-graph-v1",
+            "planner_id": "P1",
+            "provider_profiles": (),
+            "model_ids": (),
+            "prompt_versions": {"planner": "prompt-v1"},
+            "parser_versions": {"json": "parser-v1"},
+            "ranker_id": "R1",
+            "ranker_weights_version": "ranker-v1",
+            "budget": RunBudget.preset("medium"),
+            "usage": zero_usage,
+            "usage_by_node": {},
+            "pricing_status": "estimated",
+            "pricing_snapshots": (),
+            "provider_calls": (),
+            "node_executions": (),
+            "parsed_artifacts": (),
+            "evidence_hashes": (),
+            "source_snapshot_ids": (),
+            "artifact_ids": (report_artifact_id, evaluation_artifact_id),
+            "run_event_count": 0,
+            "run_events_sha256": hashlib.sha256(_canonical([])).hexdigest(),
+            "seed": 7,
+            "seed_supported": True,
+            "cache_hit_count": 0,
+            "stop_reason": "SUFFICIENT",
+            "is_partial": False,
+            "failure_codes": (),
+            "replay_parent": None,
+            "started_at": started_at,
+            "finished_at": started_at + timedelta(seconds=1),
+        }
+    )
+
+
+async def _run_recorded_fixture(
+    bundle: ReplayBundle,
+    *,
+    strict: bool,
+    output_root: Path,
+    recorded_manifest: RunManifest | None = None,
+) -> _ReplayRun:
     """Execute the same offline provider calls used by record/replay modes."""
 
     token = CancellationToken()
@@ -96,17 +172,28 @@ async def _run_recorded_fixture(bundle: ReplayBundle, *, strict: bool) -> _Repla
         "model_id": model.model_id,
         "report_sha256": hashlib.sha256(_canonical(report)).hexdigest(),
     }
-    manifest = {
-        "run_id": "strict-replay-run-v1" if strict else "recorded-run-v1",
-        "replay_parent": bundle.snapshot.run_id if strict else None,
-        "report_sha256": hashlib.sha256(_canonical(report)).hexdigest(),
-        "evaluation_sha256": hashlib.sha256(_canonical(evaluation)).hexdigest(),
-    }
+    report_bytes = _canonical(report)
+    evaluation_bytes = _canonical(evaluation)
+    manifest = _build_run_manifest(
+        bundle,
+        report_bytes=report_bytes,
+        evaluation_bytes=evaluation_bytes,
+        strict=strict,
+        recorded_manifest=recorded_manifest,
+    )
+    output_root.mkdir(parents=True, exist_ok=False)
+    (output_root / "report.md").write_bytes(report_bytes)
+    (output_root / "evaluation.json").write_bytes(evaluation_bytes)
+    manifest_path = output_root / "run-manifest.json"
+    manifest_path.write_bytes(_canonical(manifest.model_dump(mode="json")))
+    persisted_manifest = RunManifest.model_validate_json(
+        manifest_path.read_bytes(), strict=True
+    )
     return _ReplayRun(
-        report_bytes=_canonical(report),
-        evaluation_bytes=_canonical(evaluation),
-        manifest_bytes=_canonical(manifest),
-        replay_parent=manifest["replay_parent"],
+        report_bytes=report_bytes,
+        evaluation_bytes=evaluation_bytes,
+        manifest=persisted_manifest,
+        manifest_path=manifest_path,
     )
 
 
@@ -118,6 +205,17 @@ def _canonical(value: object) -> bytes:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def _read_normalized_manifest(
+    path: Path,
+) -> tuple[RunManifest, dict[str, object], bytes]:
+    manifest_bytes = path.read_bytes()
+    manifest = RunManifest.model_validate_json(manifest_bytes, strict=True)
+    normalized = json.loads(_canonical(manifest.model_dump(mode="json")))
+    assert manifest_bytes == _canonical(normalized)
+    assert manifest.manifest_sha256 == manifest.canonical_sha256()
+    return manifest, normalized, manifest_bytes
 
 
 @pytest.mark.asyncio
@@ -223,19 +321,52 @@ async def test_record_then_strict_replay_is_byte_identical(tmp_path: Path) -> No
     )
     await writer.finalize()
     bundle = ReplayBundle.load(recorded_root)
-    recorded_manifest_bytes = (recorded_root / "manifest.sha256").read_bytes()
-    recorded = await _run_recorded_fixture(bundle, strict=False)
-    replayed = await _run_recorded_fixture(bundle, strict=True)
+    recorded = await _run_recorded_fixture(
+        bundle,
+        strict=False,
+        output_root=tmp_path / "recorded-run",
+    )
+    recorded_manifest, recorded_payload, recorded_manifest_bytes = (
+        _read_normalized_manifest(recorded.manifest_path)
+    )
+    assert recorded_manifest == recorded.manifest
+    assert recorded_manifest.run_id == bundle.snapshot.run_id
+    replayed = await _run_recorded_fixture(
+        bundle,
+        strict=True,
+        output_root=tmp_path / "replayed-run",
+        recorded_manifest=recorded_manifest,
+    )
+    replayed_manifest, replayed_payload, replayed_manifest_bytes = (
+        _read_normalized_manifest(replayed.manifest_path)
+    )
+    assert replayed_manifest == replayed.manifest
 
     assert replayed.report_bytes == recorded.report_bytes
     assert replayed.evaluation_bytes == recorded.evaluation_bytes
-    assert recorded.manifest_bytes != replayed.manifest_bytes
-    assert json.loads(recorded.manifest_bytes)["replay_parent"] is None
-    assert replayed.replay_parent == bundle.snapshot.run_id
-    assert json.loads(replayed.manifest_bytes)["replay_parent"] == bundle.snapshot.run_id
-    assert recorded_manifest_bytes == (recorded_root / "manifest.sha256").read_bytes()
+    assert recorded_manifest_bytes != replayed_manifest_bytes
+    assert set(recorded_payload) == set(replayed_payload)
+    differing_fields = {
+        field
+        for field in recorded_payload
+        if recorded_payload[field] != replayed_payload[field]
+    }
+    assert differing_fields == {"run_id", "replay_parent", "manifest_sha256"}
+    for field in recorded_payload:
+        if field not in differing_fields:
+            assert recorded_payload[field] == replayed_payload[field]
+
+    assert recorded.manifest.replay_parent is None
+    assert replayed.manifest.replay_parent == recorded.manifest.run_id
+    assert replayed_payload["replay_parent"] == recorded_payload["run_id"]
+    expected_artifacts = {
+        f"sha256:{hashlib.sha256(recorded.report_bytes).hexdigest()}",
+        f"sha256:{hashlib.sha256(recorded.evaluation_bytes).hexdigest()}",
+    }
+    assert set(recorded.manifest.artifact_ids) == expected_artifacts
+    assert set(replayed.manifest.artifact_ids) == expected_artifacts
     assert json.loads((recorded_root / "snapshot.json").read_bytes())["run_id"] == (
-        bundle.snapshot.run_id
+        recorded.manifest.run_id
     )
 
 
