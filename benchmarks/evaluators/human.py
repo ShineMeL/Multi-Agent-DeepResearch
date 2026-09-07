@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import random
 import re
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
@@ -304,7 +305,7 @@ def blind_pair(pair: object, *, seed: int) -> BlindPacket:
     # A local PRNG gives stable labels without using process-global state.  A
     # stable packet ID is safe to publish because it is derived only from the
     # already-redacted payload and task ID; the private mapping is not encoded.
-    swap = __import__("random").Random(seed).getrandbits(1) == 1
+    swap = random.Random(seed).getrandbits(1) == 1
     report_x, report_y = (
         (right_report, left_report) if swap else (left_report, right_report)
     )
@@ -400,7 +401,7 @@ def _expected_task_ids(expected_tasks: int | Sequence[str] | None) -> tuple[str,
 
 
 def validate_human_ratings(
-    ratings: Sequence[HumanRating] | Sequence[Mapping[str, object]],
+    ratings: Sequence[HumanRating | Mapping[str, object]],
     *,
     expected_tasks: int | Sequence[str] | None = None,
     raters_per_task: int = 3,
@@ -597,7 +598,7 @@ class HumanSummary(BaseModel):
 
 
 def summarize_human_ratings(
-    ratings: Sequence[HumanRating] | Sequence[Mapping[str, object]],
+    ratings: Sequence[HumanRating | Mapping[str, object]],
     *,
     automatic_metrics: Mapping[str, Mapping[str, float]]
     | Sequence[Mapping[str, object]]
@@ -618,15 +619,16 @@ def summarize_human_ratings(
     if automatic_metrics is not None and auto_metrics is not None:
         raise ValueError("provide only one of automatic_metrics or auto_metrics")
     metric_input = automatic_metrics if automatic_metrics is not None else auto_metrics
+    rating_rows = tuple(ratings)
     validation = validate_human_ratings(
-        ratings,
+        rating_rows,
         expected_tasks=expected_tasks,
         raters_per_task=raters_per_task,
     )
     if not validation.valid:
         detail = "; ".join(validation.errors) or "rating batch is empty"
         raise ValueError(f"human ratings require three distinct raters per task: {detail}")
-    rows = [_coerce_rating(raw) for raw in ratings]
+    rows = [_coerce_rating(raw) for raw in rating_rows]
     by_task: dict[str, list[HumanRating]] = defaultdict(list)
     for row in rows:
         by_task[row.task_id].append(row)
