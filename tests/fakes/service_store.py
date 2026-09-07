@@ -15,6 +15,15 @@ from deepresearch.storage.protocols import (
     TerminalEventDraft,
 )
 
+_LEGAL_NONTERMINAL_TRANSITIONS = frozenset(
+    {("queued", "running"), ("interrupted", "running")}
+)
+_LEGAL_TERMINAL_TRANSITIONS = {
+    "queued": frozenset({"interrupted", "cancelled"}),
+    "running": frozenset({"interrupted", "completed", "failed", "cancelled"}),
+    "interrupted": frozenset({"cancelled"}),
+}
+
 
 @dataclass
 class _DailyReservation:
@@ -31,12 +40,17 @@ class FakeRunStore:
         self._runs: dict[str, RunRecord] = {}
         self._events: dict[str, list[RunEvent]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._idempotency_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._idempotency_index: dict[tuple[str, str], str] = {}
         self._daily_reservations: dict[str, _DailyReservation] = {}
         self._daily_counter = 0
         self._daily_lock = asyncio.Lock()
 
     def _lock_for(self, run_id: str) -> asyncio.Lock:
         return self._locks.setdefault(run_id, asyncio.Lock())
+
+    def _idempotency_lock_for(self, key: tuple[str, str]) -> asyncio.Lock:
+        return self._idempotency_locks.setdefault(key, asyncio.Lock())
 
     async def get_run(self, run_id: str) -> RunRecord | None:
         return self._runs.get(run_id)
@@ -50,36 +64,26 @@ class FakeRunStore:
     async def get_by_idempotency(
         self, scope_sha256: str, idempotency_key: str
     ) -> RunRecord | None:
-        for record in self._runs.values():
-            if (
-                record.idempotency_scope_sha256 == scope_sha256
-                and record.idempotency_key == idempotency_key
-            ):
-                return record
-        return None
+        run_id = self._idempotency_index.get((scope_sha256, idempotency_key))
+        return self._runs.get(run_id) if run_id is not None else None
 
     async def create_run(self, record: RunRecord) -> RunRecord:
-        async with self._lock_for(record.run_id):
-            existing = self._runs.get(record.run_id)
-            if existing is not None:
-                if existing.idempotency_key == record.idempotency_key:
-                    return existing
-                raise IdempotencyCollision(record.run_id)
-            if record.idempotency_key is not None:
-                duplicate = await self.get_by_idempotency(
-                    record.idempotency_scope_sha256, record.idempotency_key
-                )
-                if duplicate is not None:
-                    raise IdempotencyCollision(record.idempotency_key)
-            self._runs[record.run_id] = record
-            self._events[record.run_id] = []
-            return record
+        if record.idempotency_key is None:
+            return await self._create_run(record)
+        key = (record.idempotency_scope_sha256, record.idempotency_key)
+        async with self._idempotency_lock_for(key):
+            indexed_run_id = self._idempotency_index.get(key)
+            if indexed_run_id is not None and indexed_run_id != record.run_id:
+                raise IdempotencyCollision(record.idempotency_key)
+            created = await self._create_run(record)
+            self._idempotency_index[key] = created.run_id
+            return created
 
     async def transition(
         self, run_id: str, expected: RunStatus, target: RunStatus
     ) -> RunRecord:
-        if target != "running":
-            raise ValueError("terminal transitions require finalize_run")
+        if (expected, target) not in _LEGAL_NONTERMINAL_TRANSITIONS:
+            raise ValueError("transition is not a legal nonterminal CAS pair")
         async with self._lock_for(run_id):
             record = self._require_expected(run_id, expected)
             updated = replace(record, status=target, version=record.version + 1)
@@ -93,6 +97,8 @@ class FakeRunStore:
         finalization: RunFinalization,
         terminal_event: TerminalEventDraft,
     ) -> tuple[RunRecord, RunEvent]:
+        if finalization.status not in _LEGAL_TERMINAL_TRANSITIONS.get(expected, frozenset()):
+            raise ValueError("finalization is not a legal terminal transition")
         async with self._lock_for(run_id):
             record = self._require_expected(run_id, expected)
             updated = replace(
@@ -151,7 +157,7 @@ class FakeRunStore:
     async def clear_admission(self, run_id: str, reservation_id: str | None) -> RunRecord:
         async with self._lock_for(run_id):
             record = self._runs[run_id]
-            if record.admission_reservation_id != reservation_id:
+            if reservation_id is None or record.admission_reservation_id != reservation_id:
                 return record
             updated = replace(
                 record,
@@ -246,6 +252,17 @@ class FakeRunStore:
         if record.status != expected:
             raise ValueError(f"expected {expected}, found {record.status}")
         return record
+
+    async def _create_run(self, record: RunRecord) -> RunRecord:
+        async with self._lock_for(record.run_id):
+            existing = self._runs.get(record.run_id)
+            if existing is not None:
+                if existing.idempotency_key == record.idempotency_key:
+                    return existing
+                raise IdempotencyCollision(record.run_id)
+            self._runs[record.run_id] = record
+            self._events[record.run_id] = []
+            return record
 
 
 def make_record(run_id: str, *, status: RunStatus) -> RunRecord:

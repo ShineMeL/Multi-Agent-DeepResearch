@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 
 from pydantic import JsonValue
 
@@ -27,8 +27,11 @@ class RunFinalization:
     def from_result(cls, result: RunResult) -> RunFinalization:
         if result.status not in {"interrupted", "completed", "failed", "cancelled"}:
             raise ValueError("run result is not terminal")
+        status = cast(
+            Literal["interrupted", "completed", "failed", "cancelled"], result.status
+        )
         return cls(
-            status=result.status,
+            status=status,
             stop_reason=result.stop_reason,
             is_partial=result.is_partial,
             report_artifact_id=result.report_artifact_id,
