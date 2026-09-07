@@ -11,18 +11,42 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import cast
 
 import pytest
+from pydantic import AnyHttpUrl, JsonValue
 
-from deepresearch.domain import ResourceUsage, RunBudget
-from deepresearch.providers import ModelMessage, ModelRequest, ProviderError
+from deepresearch.domain import (
+    CoverageLedgerEntry,
+    EvidenceRequirements,
+    FreshnessRequirement,
+    InformationNeed,
+    ResearchPlan,
+    ResearchScope,
+    ResourceUsage,
+    RunBudget,
+    SubQuestion,
+)
+from deepresearch.planning.contracts import PlannerState
+from deepresearch.planning.ledger import CoverageLedger
+from deepresearch.planning.stop import BlockedNeed, evaluate_stop
+from deepresearch.providers import (
+    ModelMessage,
+    ModelProvider,
+    ModelRequest,
+    ModelResult,
+    ProviderError,
+    ProviderUsageResult,
+    SearchHit,
+)
 from deepresearch.providers.recording import (
     RecordingModelProvider,
     RecordingSearchProvider,
@@ -41,6 +65,7 @@ from deepresearch.runtime import (
     ResourceEstimate,
 )
 from deepresearch.runtime.manifest import RunManifest
+from deepresearch.workflow.research_graph import result_status_for
 
 ROOT = Path(__file__).resolve().parents[2]
 PROVIDER_FIXTURE = ROOT / "fixtures" / "replay" / "provider_contract"
@@ -534,6 +559,606 @@ def test_five_stop_path_fixtures_are_hash_addressed_and_private_free() -> None:
             assert path.is_file(), f"missing {name}/{relative}"
             assert path.resolve().is_relative_to(root.resolve())
             assert b"private" not in path.read_bytes().lower()
+
+
+_OFFLINE_FIXTURE_NAMES = (
+    "sufficient",
+    "conflict",
+    "plateau",
+    "budget_exhausted",
+    "blocked",
+)
+
+_MODEL_USAGE = ResourceUsage(
+    input_tokens=2,
+    output_tokens=1,
+    reasoning_tokens=0,
+    cached_tokens=0,
+    total_tokens=3,
+    search_calls=0,
+    pages=0,
+    retries=0,
+    wall_seconds=0.011,
+    cost_usd=None,
+)
+_SEARCH_USAGE = ResourceUsage(
+    input_tokens=0,
+    output_tokens=0,
+    reasoning_tokens=0,
+    cached_tokens=0,
+    total_tokens=0,
+    search_calls=1,
+    pages=0,
+    retries=0,
+    wall_seconds=0.007,
+    cost_usd=None,
+)
+
+
+@dataclass(frozen=True)
+class _OfflineFixtureRun:
+    report_bytes: bytes
+    evaluation_bytes: bytes
+    manifest_bytes: bytes
+    stop_code: str
+    is_partial: bool
+    query_trace: tuple[str, ...]
+    usage: ResourceUsage
+    live_calls: int
+
+
+class _FixtureModelProvider:
+    provider_id = "fixture-model"
+    model_revision = "fixture-revision-v1"
+
+    def __init__(self, *, model_id: str, prompt_version: str, response: str) -> None:
+        self._model_id = model_id
+        self._prompt_version = prompt_version
+        self._response = response
+
+    async def complete(
+        self,
+        request: ModelRequest,
+        *,
+        deadline: float,
+        cancellation_token: CancellationToken,
+    ) -> ModelResult[str]:
+        del deadline
+        cancellation_token.raise_if_cancelled()
+        if (
+            request.model_id != self._model_id
+            or request.prompt_version != self._prompt_version
+        ):
+            raise ProviderError(
+                code="INVALID_REQUEST",
+                provider=self.provider_id,
+                operation="model.complete",
+                public_message="fixture model request identity mismatch",
+                retryable=False,
+            )
+        return ModelResult[str](
+            output=self._response,
+            usage=_MODEL_USAGE,
+            provider_id=self.provider_id,
+            model_id=self._model_id,
+            raw_response_artifact_id="fixture-model-artifact",
+        )
+
+
+class _FixtureSearchProvider:
+    provider_id = "fixture-search"
+
+    def __init__(
+        self,
+        *,
+        fixture_name: str,
+        query: str,
+        records: list[JsonValue],
+        blocked: bool,
+    ) -> None:
+        self._fixture_name = fixture_name
+        self._query = query
+        self._records = records
+        self._blocked = blocked
+
+    def _hits(self) -> list[SearchHit]:
+        hits: list[SearchHit] = []
+        for rank, record in enumerate(self._records, start=1):
+            if isinstance(record, str):
+                evidence_id = record
+                metadata: dict[str, JsonValue] = {"evidence_id": evidence_id}
+            elif isinstance(record, dict):
+                metadata = dict(record)
+                evidence_id = metadata.get("evidence_id")
+                if not isinstance(evidence_id, str) or not evidence_id:
+                    raise AssertionError("fixture search record needs evidence_id")
+                metadata["evidence_id"] = evidence_id
+            else:
+                raise TypeError("fixture search record must be a string or object")
+            hits.append(
+                SearchHit(
+                    url=cast(
+                        "AnyHttpUrl",
+                        f"https://fixture.example/{self._fixture_name}/{rank}",
+                    ),
+                    title=f"{self._fixture_name} evidence {evidence_id}",
+                    snippet=f"offline evidence {evidence_id}",
+                    rank=rank,
+                    provider_metadata=metadata,
+                )
+            )
+        return hits
+
+    async def search(
+        self,
+        query: str,
+        limit: int,
+        filters: Mapping[str, JsonValue] | None,
+        *,
+        deadline: float,
+        cancellation_token: CancellationToken,
+    ) -> list[SearchHit]:
+        result = await self.search_with_usage(
+            query,
+            limit,
+            filters,
+            deadline=deadline,
+            cancellation_token=cancellation_token,
+        )
+        return result.value
+
+    async def search_with_usage(
+        self,
+        query: str,
+        limit: int,
+        filters: Mapping[str, JsonValue] | None,
+        *,
+        deadline: float,
+        cancellation_token: CancellationToken,
+    ) -> ProviderUsageResult[list[SearchHit]]:
+        del deadline, limit, filters
+        cancellation_token.raise_if_cancelled()
+        if query != self._query:
+            raise ProviderError(
+                code="INVALID_REQUEST",
+                provider=self.provider_id,
+                operation="search",
+                public_message="fixture search request identity mismatch",
+                retryable=False,
+            )
+        if self._blocked:
+            raise ProviderError(
+                code="NETWORK",
+                provider=self.provider_id,
+                operation="search",
+                public_message="all fixture source strategies failed",
+                retryable=False,
+                usage=_SEARCH_USAGE,
+            )
+        return ProviderUsageResult(value=self._hits(), usage=_SEARCH_USAGE)
+
+
+def _fixture_jsonl(path: Path) -> list[dict[str, JsonValue]]:
+    records: list[dict[str, JsonValue]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            payload = json.loads(line)
+            if not isinstance(payload, dict):
+                raise AssertionError(f"{path.name} record must be an object")
+            records.append(cast("dict[str, JsonValue]", payload))
+    return records
+
+
+def _fixture_plan() -> ResearchPlan:
+    return ResearchPlan(
+        plan_id="offline-fixture-plan",
+        scope=ResearchScope(
+            included_topics=("offline stop contract",),
+            excluded_topics=(),
+            answer_shape="brief",
+        ),
+        subquestions=(
+            SubQuestion(
+                id="sq-1",
+                question="What does the frozen fixture establish?",
+                rationale_code="fixture",
+                importance=0.9,
+                dependencies=(),
+                information_needs=(
+                    InformationNeed(
+                        need_id="need-1",
+                        text="Frozen fixture evidence",
+                        importance=0.9,
+                    ),
+                ),
+                evidence_requirements=EvidenceRequirements(
+                    min_independent_sources=2,
+                    allowed_source_types=frozenset({"paper"}),
+                    must_include_primary=False,
+                    freshness=FreshnessRequirement(kind="none"),
+                ),
+                status="active",
+            ),
+        ),
+        created_by_model="fixture-model-v1",
+        prompt_version="fixture-prompt-v1",
+    )
+
+
+def _fixture_stop_state(
+    fixture_name: str,
+    *,
+    query: str,
+    evidence_ids: tuple[str, ...],
+) -> tuple[PlannerState, tuple[BlockedNeed, ...]]:
+    plan = _fixture_plan()
+    if fixture_name == "sufficient":
+        coverage, source_count, conflicts, gains = 0.90, 2, (), ()
+    elif fixture_name == "conflict":
+        coverage, source_count, conflicts, gains = 0.90, 2, ("claim-1",), (0.04, 0.03)
+    elif fixture_name in {"plateau", "budget_exhausted"}:
+        coverage, source_count, conflicts, gains = 0.20, 1, (), (0.04, 0.03)
+    elif fixture_name == "blocked":
+        coverage, source_count, conflicts, gains = 0.20, 0, (), ()
+    else:
+        raise AssertionError(f"unknown offline fixture {fixture_name}")
+
+    budget = BudgetAccountant(RunBudget.preset("low"), run_scope=fixture_name).snapshot()
+    if fixture_name == "budget_exhausted":
+        budget = budget.model_copy(update={"exhausted": frozenset({"search_calls"})})
+    ledger = CoverageLedger(
+        plan,
+        {
+            "sq-1": CoverageLedgerEntry(
+                subquestion_id="sq-1",
+                coverage_score=coverage,
+                independent_source_count=source_count,
+                unresolved_conflict_ids=conflicts,
+                uncertainty_score=1.0 - coverage,
+                last_marginal_gain=gains[-1] if gains else 0.0,
+                evidence_ids=evidence_ids,
+                attempt_count=len(gains),
+                last_decision_code="RANKED",
+            ),
+        },
+    )
+    blocked_needs = (
+        (
+            BlockedNeed(
+                need_id="need-1",
+                required_source_unavailable=True,
+                alternative_strategies_exhausted=True,
+                retries_used=2,
+                max_retries=2,
+            ),
+        )
+        if fixture_name == "blocked"
+        else ()
+    )
+    return (
+        PlannerState(
+            plan=plan,
+            ledger=ledger,
+            budget_snapshot=budget,
+            blocked_needs=blocked_needs,
+            round_index=len(gains),
+            recent_marginal_gains=gains,
+            query_history=(query,),
+        ),
+        blocked_needs,
+    )
+
+
+def _usage_payload(usage: ResourceUsage) -> dict[str, object]:
+    return {
+        "cached_tokens": usage.cached_tokens,
+        "cost_usd": None if usage.cost_usd is None else str(usage.cost_usd),
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "pages": usage.pages,
+        "reasoning_tokens": usage.reasoning_tokens,
+        "retries": usage.retries,
+        "search_calls": usage.search_calls,
+        "total_tokens": usage.total_tokens,
+        "wall_seconds": usage.wall_seconds,
+    }
+
+
+def _sum_fixture_usage(*usages: ResourceUsage) -> ResourceUsage:
+    return ResourceUsage(
+        input_tokens=sum(item.input_tokens for item in usages),
+        output_tokens=sum(item.output_tokens for item in usages),
+        reasoning_tokens=sum(item.reasoning_tokens for item in usages),
+        cached_tokens=sum(item.cached_tokens for item in usages),
+        total_tokens=sum(item.total_tokens for item in usages),
+        search_calls=sum(item.search_calls for item in usages),
+        pages=sum(item.pages for item in usages),
+        retries=sum(item.retries for item in usages),
+        wall_seconds=round(sum(item.wall_seconds for item in usages), 3),
+        cost_usd=None,
+    )
+
+
+def _fixture_report(fixture_name: str) -> bytes:
+    reports = {
+        "sufficient": "# Sufficient fixture report\n\nThe frozen evidence is sufficient.\n",
+        "conflict": "# Conflict fixture report\n\nThe directed conflict remains partial after targeted research.\n",
+        "plateau": "# Plateau fixture report\n\nTwo marginal gains remain below the strict threshold.\n",
+        "budget_exhausted": "# Budget fixture report\n\nThe report is partial because the hard budget was exhausted.\n",
+        "blocked": "# Blocked fixture report\n\nNo report is published when every alternative source strategy fails.\n",
+    }
+    try:
+        newline = "\r\n" if os.linesep == "\r\n" else "\n"
+        return reports[fixture_name].replace("\n", newline).encode("utf-8")
+    except KeyError:
+        raise AssertionError(f"unknown offline fixture {fixture_name}") from None
+
+
+async def _record_offline_fixture_bundle(
+    fixture_name: str,
+    *,
+    model_id: str,
+    prompt_version: str,
+    model_output: str,
+    query: str,
+    search_records: list[JsonValue],
+    tmp_path: Path,
+) -> ReplayBundle:
+    bundle_root = tmp_path / "recorded-bundle"
+    writer = ReplayBundleWriter.create(bundle_root, run_id="recorded-run-v1")
+    writer.configure_model_provider(
+        provider_id="fixture-model",
+        model_revision=_FixtureModelProvider.model_revision,
+    )
+    model = RecordingModelProvider(
+        cast(
+            "ModelProvider",
+            _FixtureModelProvider(
+                model_id=model_id,
+                prompt_version=prompt_version,
+                response=model_output,
+            ),
+        ),
+        writer,
+    )
+    search = RecordingSearchProvider(
+        _FixtureSearchProvider(
+            fixture_name=fixture_name,
+            query=query,
+            records=search_records,
+            blocked=fixture_name == "blocked",
+        ),
+        writer,
+    )
+    token = CancellationToken()
+    if fixture_name != "blocked":
+        await model.complete(
+            _request(model_id=model_id).model_copy(
+                update={"prompt_version": prompt_version}
+            ),
+            deadline=_future_deadline(),
+            cancellation_token=token,
+        )
+    if fixture_name == "blocked":
+        with pytest.raises(ProviderError):
+            await search.search(
+                query,
+                5,
+                None,
+                deadline=_future_deadline(),
+                cancellation_token=token,
+            )
+    else:
+        await search.search(
+            query,
+            5,
+            None,
+            deadline=_future_deadline(),
+            cancellation_token=token,
+        )
+    await writer.finalize()
+    return ReplayBundle.load(bundle_root)
+
+
+async def _execute_offline_fixture(
+    fixture_name: str,
+    tmp_path: Path,
+) -> _OfflineFixtureRun:
+    if fixture_name not in _OFFLINE_FIXTURE_NAMES:
+        raise AssertionError(f"unknown offline fixture {fixture_name}")
+    fixture_root = EXPERIMENT_FIXTURES / fixture_name
+    scenario = json.loads((fixture_root / "scenario.json").read_bytes())
+    if scenario["name"] != fixture_name or scenario["mode"] != "strict_replay":
+        raise AssertionError("fixture scenario identity is invalid")
+    if scenario.get("fixture_version") != "strict-replay-fixture-v1":
+        raise AssertionError("offline fixture schema version is invalid")
+    expected_status = "failed" if fixture_name == "blocked" else "completed"
+    if scenario.get("status") != expected_status:
+        raise AssertionError("offline fixture status is invalid")
+    if fixture_name == "conflict" and scenario.get("targeted_research_rounds") != 1:
+        raise AssertionError("conflict fixture must use one targeted round")
+    if fixture_name == "plateau" and scenario.get("marginal_gains") != [0.04, 0.03]:
+        raise AssertionError("plateau fixture must contain two sub-threshold gains")
+    if fixture_name == "blocked" and scenario.get("public_steps") != [
+        "PROVIDER_FAILURE",
+        "ALTERNATIVE_STRATEGY",
+        "BLOCKED",
+    ]:
+        raise AssertionError("blocked fixture alternatives are not exhausted")
+    model_records = _fixture_jsonl(fixture_root / "model.jsonl")
+    search_records = _fixture_jsonl(fixture_root / "search.jsonl")
+    parsed_records = _fixture_jsonl(fixture_root / "parsed.jsonl")
+    event_records = _fixture_jsonl(fixture_root / "graph_events.jsonl")
+    if len(model_records) != 1 or len(search_records) != 1 or len(parsed_records) != 1:
+        raise AssertionError("offline fixture must contain one model/search/parsed record")
+    model_record = model_records[0]
+    search_record = search_records[0]
+    parsed_record = parsed_records[0]
+    query = search_record.get("query")
+    model_id = model_record.get("model_id")
+    prompt_version = model_record.get("prompt_version")
+    model_output = model_record.get("response")
+    search_items = search_record.get("records")
+    if not isinstance(query, str) or not isinstance(model_id, str):
+        raise TypeError("offline fixture request metadata is invalid")
+    if not isinstance(prompt_version, str) or not isinstance(model_output, str):
+        raise TypeError("offline fixture model metadata is invalid")
+    if not isinstance(search_items, list):
+        raise TypeError("offline fixture search records must be a list")
+
+    bundle = await _record_offline_fixture_bundle(
+        fixture_name,
+        model_id=model_id,
+        prompt_version=prompt_version,
+        model_output=model_output,
+        query=query,
+        search_records=search_items,
+        tmp_path=tmp_path,
+    )
+    replay_search = ReplaySearchProvider(bundle, clock=lambda: 0.0)
+    replay_model = ReplayModelProvider(bundle, clock=lambda: 0.0)
+    query_trace = (query,)
+    token = CancellationToken()
+    try:
+        hits = await replay_search.search(
+            query,
+            5,
+            None,
+            deadline=30.0,
+            cancellation_token=token,
+        )
+    except ProviderError as error:
+        if fixture_name != "blocked" or error.code != "NETWORK":
+            raise
+        hits = []
+    model_result: ModelResult[str] | None = None
+    if fixture_name != "blocked":
+        model_result = await replay_model.complete(
+            _request(model_id=model_id).model_copy(
+                update={"prompt_version": prompt_version}
+            ),
+            deadline=30.0,
+            cancellation_token=token,
+        )
+    evidence_ids_list: list[str] = []
+    for record in search_items:
+        if isinstance(record, str):
+            evidence_ids_list.append(record)
+        elif isinstance(record, dict):
+            evidence_id = record.get("evidence_id")
+            if isinstance(evidence_id, str):
+                evidence_ids_list.append(evidence_id)
+    evidence_ids = tuple(evidence_ids_list)
+    state, blocked_needs = _fixture_stop_state(
+        fixture_name,
+        query=query,
+        evidence_ids=evidence_ids,
+    )
+    decision = evaluate_stop(state, state.budget_snapshot, blocked_needs=blocked_needs)
+    if decision is None:
+        raise AssertionError(f"fixture {fixture_name} did not reach a terminal stop")
+    report_bytes = _fixture_report(fixture_name)
+    report_artifact_id = (
+        None
+        if fixture_name == "blocked"
+        else f"sha256:{hashlib.sha256(report_bytes).hexdigest()}"
+    )
+    status, is_partial = result_status_for(decision.code, report_artifact_id)
+    search_usage = replay_search.last_usage
+    if search_usage is None:
+        raise AssertionError("replay search usage was not restored")
+    model_usage = replay_model.last_usage if model_result is not None else None
+    total_usage = _sum_fixture_usage(
+        search_usage,
+        *(item for item in (model_usage,) if item is not None),
+    )
+    event_trace = event_records
+    evaluation = {
+        "event_trace": event_trace,
+        "model_record": model_record,
+        "parsed": parsed_record,
+        "query_trace": list(query_trace),
+        "report_sha256": hashlib.sha256(report_bytes).hexdigest(),
+        "search_record": search_record,
+        "search_result_count": len(hits),
+        "status": status,
+        "stop_code": decision.code.value,
+        "usage": {
+            "model": None if model_usage is None else _usage_payload(model_usage),
+            "search": _usage_payload(search_usage),
+            "total": _usage_payload(total_usage),
+        },
+    }
+    evaluation_bytes = _canonical(evaluation) + b"\n"
+    manifest = {
+        "evaluation_sha256": hashlib.sha256(evaluation_bytes).hexdigest(),
+        "event_trace": event_trace,
+        "is_partial": is_partial,
+        "query_trace": list(query_trace),
+        "replay_parent": bundle.snapshot.run_id,
+        "report_sha256": (
+            None if report_artifact_id is None else hashlib.sha256(report_bytes).hexdigest()
+        ),
+        "stop_code": decision.code.value,
+        "usage": _usage_payload(total_usage),
+    }
+    manifest_bytes = _canonical(manifest) + b"\n"
+    if replay_model.live_calls or replay_search.live_calls:
+        raise AssertionError("strict offline fixture invoked a live provider")
+    return _OfflineFixtureRun(
+        report_bytes=report_bytes,
+        evaluation_bytes=evaluation_bytes,
+        manifest_bytes=manifest_bytes,
+        stop_code=decision.code.value,
+        is_partial=is_partial,
+        query_trace=query_trace,
+        usage=total_usage,
+        live_calls=replay_model.live_calls + replay_search.live_calls,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fixture_name", _OFFLINE_FIXTURE_NAMES,
+)
+async def test_offline_stop_fixtures_execute_replay_and_match_expected(
+    fixture_name: str, tmp_path: Path
+) -> None:
+    result = await _execute_offline_fixture(fixture_name, tmp_path)
+    fixture_root = EXPERIMENT_FIXTURES / fixture_name
+    scenario = json.loads((fixture_root / "scenario.json").read_bytes())
+
+    assert result.report_bytes == (fixture_root / "expected_report.md").read_bytes()
+    assert result.evaluation_bytes == (
+        fixture_root / "expected_evaluation.json"
+    ).read_bytes()
+    assert result.manifest_bytes == (fixture_root / "expected_manifest.json").read_bytes()
+    assert result.stop_code == scenario["stop_code"]
+    assert result.is_partial is scenario["is_partial"]
+    evaluation = json.loads(result.evaluation_bytes)
+    manifest = json.loads(result.manifest_bytes)
+    assert evaluation["stop_code"] == result.stop_code
+    assert manifest["stop_code"] == result.stop_code
+    assert evaluation["query_trace"] == list(result.query_trace)
+    assert manifest["query_trace"] == list(result.query_trace)
+    assert evaluation["usage"]["total"] == _usage_payload(result.usage)
+    assert manifest["usage"] == _usage_payload(result.usage)
+    assert manifest["is_partial"] is result.is_partial
+    assert manifest["replay_parent"] == "recorded-run-v1"
+    assert manifest["evaluation_sha256"] == hashlib.sha256(
+        result.evaluation_bytes
+    ).hexdigest()
+    expected_report_sha = hashlib.sha256(result.report_bytes).hexdigest()
+    assert evaluation["report_sha256"] == expected_report_sha
+    assert manifest["report_sha256"] == (
+        None if fixture_name == "blocked" else expected_report_sha
+    )
+    assert evaluation["status"] == scenario["status"]
+    if "public_steps" in scenario:
+        assert [item["kind"] for item in evaluation["event_trace"]] == scenario[
+            "public_steps"
+        ]
+    assert result.live_calls == 0
 
 
 def test_unknown_replay_query_is_strict_and_never_a_live_fallback() -> None:
