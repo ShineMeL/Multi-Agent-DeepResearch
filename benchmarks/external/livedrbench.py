@@ -8,7 +8,6 @@ dataset into a live request.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
 
 from benchmarks.datasets.models import TaskCategory
 
@@ -25,19 +24,19 @@ class LiveDRBenchAdapter(BaseExternalAdapter):
         return TaskCategory.TECHNICAL_SURVEY
 
     def _eligible(self, item: Mapping[str, object]) -> bool:
-        """Select CS prior-art/dataset-discovery records when labels exist.
+        """Accept only the published CS prior-art/discovery task families."""
 
-        Third-party exports use several names for this field.  A fixture that
-        omits the optional label is still eligible: the lock and frozen
-        snapshot, rather than an invented local label, remain authoritative.
-        Explicitly unrelated records are rejected.
-        """
-
-        value: Any = item.get("task_type", item.get("category", item.get("domain")))
+        value = item.get("task_type", item.get("category", item.get("domain")))
         if value is None:
-            return True
-        text = str(value).casefold()
-        return not any(token in text for token in ("unrelated", "non-cs", "non_cs"))
+            return False
+        text = str(value).casefold().replace("_", "-")
+        padded = f" {text} "
+        is_cs = any(token in text for token in ("computer-science", "computer science")) or " cs " in padded
+        is_supported_task = any(
+            token in text
+            for token in ("prior-art", "prior art", "dataset-discovery", "dataset discovery")
+        )
+        return is_cs and is_supported_task
 
 
 Adapter = LiveDRBenchAdapter

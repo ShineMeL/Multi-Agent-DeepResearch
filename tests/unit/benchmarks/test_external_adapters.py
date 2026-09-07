@@ -10,16 +10,20 @@ from benchmarks.datasets.models import RuntimeTask
 from benchmarks.datasets.validator import canonical_json_bytes, sha256_bytes
 from benchmarks.external import (
     BENCHMARK_COUNTS,
+    DeepResearchBenchAdapter,
     ExternalBenchmarkLock,
     ExternalSnapshotLock,
     ExternalSourceLock,
     FramesAdapter,
     fixed_external_root,
     load_external_config,
+    write_external_json,
 )
 from benchmarks.external.base import ExternalSnapshotMaterializer, _as_frozen_records
+from benchmarks.external.livedrbench import LiveDRBenchAdapter
 from benchmarks.scripts.build_snapshot import build_one
 from benchmarks.scripts.fetch_external import restore
+from deepresearch.providers.errors import ProviderError
 
 
 def _item(benchmark: str, index: int) -> dict[str, object]:
@@ -32,13 +36,21 @@ def _item(benchmark: str, index: int) -> dict[str, object]:
         }
         for part in range(2 if benchmark == "frames" else 1)
     ]
-    return {
+    item: dict[str, object] = {
         "external_id": f"{benchmark}-{index:02d}",
         "question": f"What does {benchmark} task {index} ask?",
         "documents": documents,
         "rubric": {"private": "ignored"},
         "acceptable_claims": ["ignored"],
     }
+    if benchmark == "livedrbench":
+        item["task_type"] = "computer-science prior-art"
+    elif benchmark == "frames":
+        item["evidence_mapping"] = {documents[0]["id"]: ["claim-1"]}
+    else:
+        item["task_type"] = "research-report"
+        item["citations"] = [{"id": documents[0]["id"], "url": documents[0]["url"]}]
+    return item
 
 
 @pytest.fixture
@@ -53,7 +65,7 @@ def external_fixture(tmp_path: Path):
     config = load_external_config(Path("benchmarks/configs/external.yaml"))
     entries: dict[str, ExternalSourceLock] = {}
     for benchmark in ("livedrbench", "frames", "deepresearchbench"):
-        count = BENCHMARK_COUNTS[benchmark] + 2
+        count = BENCHMARK_COUNTS[benchmark]
         items = [_item(benchmark, index) for index in range(count)]
         payload = canonical_json_bytes(items)
         raw_path = raw_root / f"{benchmark}.json"
@@ -173,11 +185,73 @@ def test_external_selection_is_pinned_and_deterministic(external_fixture):
     assert all(item.evaluation_plan.benchmark == "frames" for item in first)
 
 
+@pytest.mark.parametrize(
+    ("adapter_type", "benchmark"),
+    [
+        (LiveDRBenchAdapter, "livedrbench"),
+        (FramesAdapter, "frames"),
+        (DeepResearchBenchAdapter, "deepresearchbench"),
+    ],
+)
+def test_external_adapters_apply_semantic_positive_and_negative_filters(
+    external_fixture, adapter_type, benchmark
+):
+    _, config, _, lock_path, raw_root, snapshot_root = external_fixture
+    adapter = adapter_type(
+        lock_file=lock_path,
+        raw_root=raw_root,
+        snapshot_root=snapshot_root,
+        external_config=config,
+    )
+    positive = _item(benchmark, 0)
+    assert adapter._eligible(positive)  # pyright: ignore[reportPrivateUsage]
+    if benchmark == "livedrbench":
+        negative = {**positive, "task_type": "physics prior-art"}
+    elif benchmark == "frames":
+        negative = {**positive, "evidence_mapping": None}
+        single_document = {**positive, "documents": positive["documents"][:1], "allow_single_document": True}
+        assert not adapter._eligible(single_document)  # pyright: ignore[reportPrivateUsage]
+    else:
+        negative = {**positive, "citations": []}
+    assert not adapter._eligible(negative)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_external_adapter_rechecks_cached_raw_bytes_after_mutation(external_fixture):
+    _, config, _, lock_path, raw_root, snapshot_root = external_fixture
+    adapter = FramesAdapter(
+        lock_file=lock_path,
+        raw_root=raw_root,
+        snapshot_root=snapshot_root,
+        external_config=config,
+    )
+    adapter.select(provider_profile_id="formal-local-vllm", budget_preset="medium")
+    (raw_root / "frames.json").write_bytes(b"[]\n")
+    with pytest.raises(ProviderError, match="hash mismatch"):
+        adapter.select(provider_profile_id="formal-local-vllm", budget_preset="medium")
+
+
 def test_external_raw_and_snapshot_roots_reject_wrong_suffix(tmp_path: Path):
     with pytest.raises(ValueError):
         fixed_external_root(tmp_path / "not-raw", kind="raw")
     with pytest.raises(ValueError):
         fixed_external_root(tmp_path / "not-snapshot", kind="snapshot")
+
+
+def test_external_root_is_bound_to_explicit_repository(tmp_path: Path):
+    repo = tmp_path / "repo"
+    outside = tmp_path / "other" / "benchmarks" / "private" / "external" / "raw"
+    outside.mkdir(parents=True)
+    with pytest.raises(ValueError, match="this repository"):
+        fixed_external_root(outside, kind="raw", repo_root=repo)
+
+
+def test_external_json_publication_is_atomic_and_no_replace(tmp_path: Path):
+    target = tmp_path / "nested" / "artifact.json"
+    write_external_json(target, {"version": 1})
+    with pytest.raises(FileExistsError):
+        write_external_json(target, {"version": 1})
+    assert target.read_bytes() == canonical_json_bytes({"version": 1})
+    assert not tuple(target.parent.glob("*.staging"))
 
 
 def test_external_snapshot_lock_path_is_namespaced():

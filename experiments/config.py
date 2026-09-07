@@ -404,6 +404,8 @@ def freeze_config(
         from benchmarks.external.livedrbench import LiveDRBenchAdapter
 
         try:
+            if external_config_path is None or external_lock_path is None:
+                raise ValueError("external config and lock must be supplied together")
             external_source_raw = Path(external_config_path)
             external_lock_raw = Path(external_lock_path)
             if ".." in external_source_raw.parts or ".." in external_lock_raw.parts:
@@ -448,6 +450,7 @@ def freeze_config(
                 raw_root=Path(repo_root) / external.raw_root,
                 snapshot_root=Path(repo_root) / external.snapshot_root,
                 external_config=external,
+                repo_root=Path(repo_root),
             )
             selections = adapter.select(
                 provider_profile_id=template.provider_profile_id,

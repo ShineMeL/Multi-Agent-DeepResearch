@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -103,6 +104,21 @@ def _load_download_lock(path: Path) -> ExternalBenchmarkLock:
     return load_external_lock(path)
 
 
+def _validate_external_config(config: ExternalConfig) -> None:
+    """Use every fixed/configured value at each ingestion boundary."""
+
+    if (
+        config.raw_root != "benchmarks/private/external/raw"
+        or config.documents_staging_root != "benchmarks/private/external/staging"
+        or config.snapshot_root != "benchmarks/snapshots/external"
+    ):
+        raise ValueError("external config roots are not fixed")
+    for benchmark in BENCHMARK_NAMES:
+        spec = config.spec(benchmark)
+        if spec.expected_count != BENCHMARK_COUNTS[benchmark] or not spec.adapter_version:
+            raise ValueError("external config benchmark metadata is not canonical")
+
+
 def _read_json(path: Path) -> object:
     source = Path(path).absolute()
     # The caller must first bind this path to a fixed evaluator root.  Keep a
@@ -119,14 +135,21 @@ def _fixed_file(
     path: Path,
     label: str,
     require_file: bool = False,
+    repo_root: Path | None = None,
 ) -> Path:
     """Bind a file path to one of the three fixed external roots."""
 
     raw_path = Path(path)
     if ".." in raw_path.parts:
         raise ValueError(f"{label} contains traversal")
-    fixed = fixed_external_root(root, kind=kind)
-    candidate = raw_path.absolute()
+    repository = (
+        Path(repo_root).absolute()
+        if repo_root is not None
+        else _infer_repo_root(root, kind=kind)
+    )
+    fixed = fixed_external_root(root, kind=kind, repo_root=repository)
+    candidate = raw_path if raw_path.is_absolute() else repository / raw_path
+    candidate = candidate.absolute()
     try:
         relative = candidate.relative_to(fixed)
     except ValueError as error:
@@ -141,21 +164,70 @@ def _fixed_file(
     )
 
 
-def _public_lock_path(path: Path, *, snapshot_root: Path) -> Path:
+def _infer_repo_root(
+    root: Path,
+    *,
+    kind: Literal["raw", "staging", "snapshot"],
+) -> Path:
+    suffix_length = {"raw": 4, "staging": 4, "snapshot": 3}[kind]
+    absolute = Path(root).absolute()
+    if len(absolute.parts) < suffix_length:
+        raise ValueError("external root cannot determine repository root")
+    return Path(*absolute.parts[:-suffix_length])
+
+
+def _public_lock_path(
+    path: Path,
+    *,
+    snapshot_root: Path,
+    repo_root: Path | None = None,
+) -> Path:
     """Require the final aggregate lock at ``benchmarks/external``."""
 
-    root = fixed_external_root(snapshot_root, kind="snapshot")
+    repository = (
+        Path(repo_root).absolute()
+        if repo_root is not None
+        else _infer_repo_root(snapshot_root, kind="snapshot")
+    )
+    fixed_external_root(snapshot_root, kind="snapshot", repo_root=repository)
     raw_path = Path(path)
     if ".." in raw_path.parts:
         raise ValueError("external lock contains traversal")
-    candidate = raw_path.absolute()
-    expected = root.parents[2] / "benchmarks" / "external" / "external.lock.json"
+    candidate = raw_path if raw_path.is_absolute() else repository / raw_path
+    candidate = candidate.absolute()
+    expected = repository / "benchmarks" / "external" / "external.lock.json"
     # ``root.parents[2]`` is the repository root for the fixed
     # ``<repo>/benchmarks/snapshots/external`` layout.  Comparing the full
     # path catches a caller accidentally writing a second lock beside raw
     # data, while still allowing temporary repositories in tests.
-    if candidate != expected:
+    if os.path.normcase(str(candidate)) != os.path.normcase(str(expected)):
         raise ValueError("external lock must be benchmarks/external/external.lock.json")
+    if candidate.is_symlink():
+        raise ValueError("external lock contains a symlink")
+    return candidate
+
+
+def _fixed_repo_file(path: Path, *, repo_root: Path, relative: str) -> Path:
+    """Bind a CLI metadata file to an exact repository-relative location."""
+
+    repository = Path(repo_root).absolute()
+    candidate = Path(path) if Path(path).is_absolute() else repository / path
+    candidate = candidate.absolute()
+    expected = repository / Path(relative)
+    if ".." in candidate.parts or os.path.normcase(str(candidate)) != os.path.normcase(str(expected)):
+        raise ValueError(f"metadata file must be {relative} inside the repository")
+    current = repository
+    while current != Path(current.anchor):
+        if current.is_symlink():
+            raise ValueError("repository root contains a symlink")
+        current = current.parent
+    current = repository
+    for part in Path(relative).parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError("metadata file contains a symlink")
+    if not candidate.is_file():
+        raise FileNotFoundError(candidate)
     return candidate
 
 
@@ -176,17 +248,46 @@ def _row_id(row: Mapping[str, object]) -> str:
 
 def _eligible(benchmark: BenchmarkName, row: Mapping[str, object]) -> bool:
     if benchmark == "frames":
+        documents_count = 0
         for key in ("documents", "context", "evidence", "sources", "passages"):
             value = row.get(key)
             if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-                return len(cast(Sequence[object], value)) >= 2
+                documents_count = len(cast(Sequence[object], value))
+                break
         mapping = row.get("evidence_mapping")
-        return isinstance(mapping, Mapping) and len(cast(Mapping[object, object], mapping)) >= 2
+        return documents_count >= 2 and isinstance(mapping, Mapping) and bool(cast(Mapping[object, object], mapping))
     if benchmark == "livedrbench":
         value = row.get("task_type", row.get("category", row.get("domain")))
-        return value is None or not any(token in str(value).casefold() for token in ("unrelated", "non-cs", "non_cs"))
+        if value is None:
+            return False
+        text = str(value).casefold().replace("_", "-")
+        padded = f" {text} "
+        return (
+            (
+                any(token in text for token in ("computer-science", "computer science"))
+                or " cs " in padded
+            )
+            and any(
+                token in text
+                for token in ("prior-art", "prior art", "dataset-discovery", "dataset discovery")
+            )
+        )
     value = row.get("task_type", row.get("category", row.get("kind")))
-    return value is None or not any(token in str(value).casefold() for token in ("short-answer", "short_answer"))
+    if value is None or "research-report" not in str(value).casefold().replace("_", "-"):
+        return False
+    citation = next(
+        (row.get(key) for key in ("citations", "citation_metadata", "references")),
+        None,
+    )
+    rubric = row.get("rubric")
+    if isinstance(citation, Mapping):
+        has_citation = bool(cast(Mapping[object, object], citation))
+    elif isinstance(citation, (list, tuple)):
+        has_citation = bool(cast(list[object] | tuple[object, ...], citation))
+    else:
+        has_citation = False
+    has_rubric = isinstance(rubric, Mapping) and bool(cast(Mapping[object, object], rubric))
+    return has_citation and has_rubric
 
 
 def _selected_rows(
@@ -215,21 +316,28 @@ def materialize_records(
     raw_root: Path,
     documents_staging_root: Path,
     selection_manifest_path: Path,
+    repo_root: Path | None = None,
 ) -> ExternalSelectionManifest:
-    raw = fixed_external_root(raw_root, kind="raw")
-    staging = fixed_external_root(documents_staging_root, kind="staging", create=True)
+    _validate_external_config(config)
+    repository = Path(repo_root).absolute() if repo_root is not None else _infer_repo_root(raw_root, kind="raw")
+    raw = fixed_external_root(raw_root, kind="raw", repo_root=repository)
+    staging = fixed_external_root(
+        documents_staging_root, kind="staging", repo_root=repository, create=True
+    )
     download_lock = _fixed_file(
         staging,
         kind="staging",
         path=download_lock_path,
         label="download lock",
         require_file=True,
+        repo_root=repository,
     )
     selection_path = _fixed_file(
         staging,
         kind="staging",
         path=selection_manifest_path,
         label="selection manifest",
+        repo_root=repository,
     )
     lock = _load_download_lock(download_lock)
     rows: list[ExternalSelectionRow] = []
@@ -278,15 +386,22 @@ def build_snapshots(
     documents_staging_root: Path,
     snapshot_root: Path,
     lock_path: Path,
+    repo_root: Path | None = None,
 ) -> ExternalBenchmarkLock:
-    staging = fixed_external_root(documents_staging_root, kind="staging")
-    snapshots = fixed_external_root(snapshot_root, kind="snapshot", create=True)
+    repository = Path(repo_root).absolute() if repo_root is not None else _infer_repo_root(snapshot_root, kind="snapshot")
+    staging = fixed_external_root(
+        documents_staging_root, kind="staging", repo_root=repository
+    )
+    snapshots = fixed_external_root(
+        snapshot_root, kind="snapshot", repo_root=repository, create=True
+    )
     download_lock_file = _fixed_file(
         staging,
         kind="staging",
         path=download_lock_path,
         label="download lock",
         require_file=True,
+        repo_root=repository,
     )
     selection_file = _fixed_file(
         staging,
@@ -294,16 +409,36 @@ def build_snapshots(
         path=selection_manifest_path,
         label="selection manifest",
         require_file=True,
+        repo_root=repository,
     )
-    final_lock_path = _public_lock_path(lock_path, snapshot_root=snapshots)
+    final_lock_path = _public_lock_path(
+        lock_path, snapshot_root=snapshots, repo_root=repository
+    )
     download_lock = _load_download_lock(download_lock_file)
     selection = ExternalSelectionManifest.model_validate(_read_json(selection_file))
     if len(selection.selections) != sum(BENCHMARK_COUNTS.values()):
         raise ValueError("external selection counts are incomplete")
+    source_locks: dict[BenchmarkName, ExternalSourceLock] = {
+        name: download_lock.entry(name) for name in BENCHMARK_NAMES
+    }
+    for row in selection.selections:
+        source = source_locks[row.benchmark]
+        spec = config.spec(row.benchmark)
+        if (
+            row.corpus_version,
+            row.index_version,
+        ) != (source.corpus_version, source.index_version) or (
+            row.corpus_version,
+            row.index_version,
+        ) != (spec.corpus_version, config.index_version):
+            raise ValueError("external selection/config/source versions disagree")
     built = ExternalSnapshotMaterializer().build(
         selection_manifest_path=selection_file,
         documents_staging_root=staging,
         snapshot_root=snapshots,
+        repo_root=repository,
+        external_config=config,
+        source_locks=source_locks,
     )
     by_benchmark: dict[BenchmarkName, list[object]] = {name: [] for name in BENCHMARK_NAMES}
     for snap in built.snapshots:
@@ -320,6 +455,16 @@ def build_snapshots(
                 key=lambda row: (row.task_id, row.external_id),
             )
         )
+        source = download_lock.entry(benchmark)
+        spec = config.spec(benchmark)
+        if any(
+            snap.corpus_version != source.corpus_version
+            or snap.index_version != source.index_version
+            or snap.corpus_version != spec.corpus_version
+            or snap.index_version != config.index_version
+            for snap in snapshots
+        ):
+            raise ValueError("external snapshot/config/source versions disagree")
         entries[benchmark] = source.model_copy(update={"snapshot_locks": snapshots})
     final = ExternalBenchmarkLock(
         livedrbench=entries["livedrbench"],
@@ -330,14 +475,21 @@ def build_snapshots(
     return final
 
 
-def verify_snapshots(*, lock_path: Path, snapshot_root: Path, expected_counts: Mapping[BenchmarkName, int] | None = None) -> dict[str, int]:
-    root = fixed_external_root(snapshot_root, kind="snapshot")
-    lock = load_external_lock(_public_lock_path(lock_path, snapshot_root=root))
-    counts = dict(expected_counts or BENCHMARK_COUNTS)
-    if set(counts) != set(BENCHMARK_NAMES) or any(
-        type(value) is not int or value < 0 for value in counts.values()
-    ):
-        raise ValueError("expected external snapshot counts are invalid")
+def verify_snapshots(
+    *,
+    lock_path: Path,
+    snapshot_root: Path,
+    expected_counts: Mapping[BenchmarkName, int] | None = None,
+    repo_root: Path | None = None,
+) -> dict[str, int]:
+    repository = Path(repo_root).absolute() if repo_root is not None else _infer_repo_root(snapshot_root, kind="snapshot")
+    root = fixed_external_root(snapshot_root, kind="snapshot", repo_root=repository)
+    lock = load_external_lock(
+        _public_lock_path(lock_path, snapshot_root=root, repo_root=repository)
+    )
+    counts = dict(BENCHMARK_COUNTS)
+    if expected_counts is not None and dict(expected_counts) != counts:
+        raise ValueError("expected external snapshot counts must be canonical 10/20/10")
     actual: dict[str, int] = {}
     for benchmark in BENCHMARK_NAMES:
         snapshots = lock.entry(benchmark).snapshot_locks
@@ -356,18 +508,38 @@ def restore(
     documents_staging_root: Path,
     snapshot_root: Path,
     lock_path: Path,
+    repo_root: Path | None = None,
 ) -> dict[str, int]:
     """Rebuild absent ignored snapshots from the committed lock and raw bytes."""
 
-    raw = fixed_external_root(raw_root, kind="raw")
-    staging = fixed_external_root(documents_staging_root, kind="staging", create=True)
-    snapshots = fixed_external_root(snapshot_root, kind="snapshot", create=True)
-    public_lock = _public_lock_path(lock_path, snapshot_root=snapshots)
+    repository = Path(repo_root).absolute() if repo_root is not None else _infer_repo_root(snapshot_root, kind="snapshot")
+    raw = fixed_external_root(raw_root, kind="raw", repo_root=repository)
+    staging = fixed_external_root(
+        documents_staging_root, kind="staging", repo_root=repository, create=True
+    )
+    snapshots = fixed_external_root(
+        snapshot_root, kind="snapshot", repo_root=repository, create=True
+    )
+    public_lock = _public_lock_path(
+        lock_path, snapshot_root=snapshots, repo_root=repository
+    )
     lock = load_external_lock(public_lock)
     rows: list[ExternalSelectionRow] = []
     for benchmark in BENCHMARK_NAMES:
         entry = lock.entry(benchmark)
+        spec = config.spec(benchmark)
+        if (
+            len(entry.snapshot_locks) != BENCHMARK_COUNTS[benchmark]
+            or (entry.corpus_version, entry.index_version, entry.adapter_version)
+            != (spec.corpus_version, config.index_version, spec.adapter_version)
+        ):
+            raise ValueError("external lock/config versions or counts are not canonical")
         for snapshot_lock in entry.snapshot_locks:
+            if (
+                snapshot_lock.corpus_version != entry.corpus_version
+                or snapshot_lock.index_version != entry.index_version
+            ):
+                raise ValueError("external snapshot lock versions disagree with source lock")
             # Rehash raw bytes before deriving ignored documents.  A lock can
             # never cause a different source to be selected silently.
             item = next(
@@ -442,11 +614,22 @@ def restore(
             selection_manifest_path=missing_path,
             documents_staging_root=staging,
             snapshot_root=snapshots,
+            repo_root=repository,
+            external_config=config,
+            source_locks={name: lock.entry(name) for name in BENCHMARK_NAMES},
         )
-    return verify_snapshots(lock_path=public_lock, snapshot_root=snapshots)
+    return verify_snapshots(
+        lock_path=public_lock, snapshot_root=snapshots, repo_root=repository
+    )
 
 
-def download(*, config: ExternalConfig, raw_root: Path, output_path: Path) -> ExternalBenchmarkLock:
+def download(
+    *,
+    config: ExternalConfig,
+    raw_root: Path,
+    output_path: Path,
+    repo_root: Path | None = None,
+) -> ExternalBenchmarkLock:
     """Create a provisional lock only when immutable local payload metadata exists.
 
     No URL is fetched here.  A real ingestion tool may prepare the raw files
@@ -456,12 +639,15 @@ def download(*, config: ExternalConfig, raw_root: Path, output_path: Path) -> Ex
 
     # Validate the caller-selected location without creating an ignored data
     # tree as a side effect of a deliberately unavailable download.
-    raw = fixed_external_root(raw_root, kind="raw")
+    _validate_external_config(config)
+    repository = Path(repo_root).absolute() if repo_root is not None else _infer_repo_root(raw_root, kind="raw")
+    raw = fixed_external_root(raw_root, kind="raw", repo_root=repository)
     output = _fixed_file(
         raw.parent / "staging",
         kind="staging",
         path=output_path,
         label="download lock",
+        repo_root=repository,
     )
     if output.exists() or output.is_symlink():
         raise FileExistsError(output)
@@ -476,9 +662,11 @@ def _parse_counts(value: str) -> dict[BenchmarkName, int]:
         name, _, raw = item.partition("=")
         if name not in BENCHMARK_NAMES or not raw.isdigit():
             raise ValueError("expected counts must use benchmark=count")
+        if name in counts:
+            raise ValueError("expected counts must not repeat a benchmark")
         counts[name] = int(raw)
-    if set(counts) != set(BENCHMARK_NAMES):
-        raise ValueError("expected counts must cover all external benchmarks")
+    if counts != dict(BENCHMARK_COUNTS):
+        raise ValueError("expected counts must be canonical 10/20/10")
     return counts
 
 
@@ -486,16 +674,19 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m benchmarks.scripts.fetch_external")
     sub = parser.add_subparsers(dest="command", required=True)
     download_parser = sub.add_parser("download")
+    download_parser.add_argument("--repo-root", type=Path, required=True)
     download_parser.add_argument("--config", type=Path, required=True)
     download_parser.add_argument("--raw-root", type=Path, required=True)
     download_parser.add_argument("--write-download-lock", type=Path, required=True)
     materialize = sub.add_parser("materialize-records")
+    materialize.add_argument("--repo-root", type=Path, required=True)
     materialize.add_argument("--config", type=Path, required=True)
     materialize.add_argument("--download-lock", type=Path, required=True)
     materialize.add_argument("--raw-root", type=Path, required=True)
     materialize.add_argument("--documents-staging-root", type=Path, required=True)
     materialize.add_argument("--write-selection-manifest", type=Path, required=True)
     build = sub.add_parser("build-snapshots")
+    build.add_argument("--repo-root", type=Path, required=True)
     build.add_argument("--config", type=Path, required=True)
     build.add_argument("--download-lock", type=Path, required=True)
     build.add_argument("--selection-manifest", type=Path, required=True)
@@ -503,10 +694,12 @@ def _parser() -> argparse.ArgumentParser:
     build.add_argument("--snapshot-root", type=Path, required=True)
     build.add_argument("--write-lock", type=Path, required=True)
     verify = sub.add_parser("verify-snapshots")
+    verify.add_argument("--repo-root", type=Path, required=True)
     verify.add_argument("--lock", type=Path, required=True)
     verify.add_argument("--snapshot-root", type=Path, required=True)
     verify.add_argument("--expected-counts", type=str, required=True)
     restore_parser = sub.add_parser("restore")
+    restore_parser.add_argument("--repo-root", type=Path, required=True)
     restore_parser.add_argument("--config", type=Path, required=True)
     restore_parser.add_argument("--raw-root", type=Path, required=True)
     restore_parser.add_argument("--documents-staging-root", type=Path, required=True)
@@ -518,33 +711,46 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        repository = Path(args.repo_root).absolute()
+        config_path = (
+            _fixed_repo_file(
+                args.config,
+                repo_root=repository,
+                relative="benchmarks/configs/external.yaml",
+            )
+            if hasattr(args, "config")
+            else None
+        )
         if args.command == "download":
             download(
-                config=load_external_config(args.config),
+                config=load_external_config(cast(Path, config_path)),
                 raw_root=args.raw_root,
                 output_path=args.write_download_lock,
+                repo_root=args.repo_root,
             )
         elif args.command == "materialize-records":
             materialize_records(
-                config=load_external_config(args.config),
+                config=load_external_config(cast(Path, config_path)),
                 download_lock_path=args.download_lock,
                 raw_root=args.raw_root,
                 documents_staging_root=args.documents_staging_root,
                 selection_manifest_path=args.write_selection_manifest,
+                repo_root=args.repo_root,
             )
         elif args.command == "build-snapshots":
             build_snapshots(
-                config=load_external_config(args.config),
+                config=load_external_config(cast(Path, config_path)),
                 download_lock_path=args.download_lock,
                 selection_manifest_path=args.selection_manifest,
                 documents_staging_root=args.documents_staging_root,
                 snapshot_root=args.snapshot_root,
                 lock_path=args.write_lock,
+                repo_root=args.repo_root,
             )
         elif args.command == "verify-snapshots":
-            print(json.dumps(verify_snapshots(lock_path=args.lock, snapshot_root=args.snapshot_root, expected_counts=_parse_counts(args.expected_counts)), sort_keys=True))
+            print(json.dumps(verify_snapshots(lock_path=args.lock, snapshot_root=args.snapshot_root, expected_counts=_parse_counts(args.expected_counts), repo_root=args.repo_root), sort_keys=True))
         elif args.command == "restore":
-            print(json.dumps(restore(config=load_external_config(args.config), raw_root=args.raw_root, documents_staging_root=args.documents_staging_root, snapshot_root=args.snapshot_root, lock_path=args.lock), sort_keys=True))
+            print(json.dumps(restore(config=load_external_config(cast(Path, config_path)), raw_root=args.raw_root, documents_staging_root=args.documents_staging_root, snapshot_root=args.snapshot_root, lock_path=args.lock, repo_root=args.repo_root), sort_keys=True))
         return 0
     except (OSError, RuntimeError, TypeError, ValueError, ValidationError) as error:
         print(f"EXTERNAL_FETCH_FAILED: {error}", file=sys.stderr)

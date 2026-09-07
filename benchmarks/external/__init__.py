@@ -26,6 +26,7 @@ from .base import (
     load_external_config,
     load_external_lock,
     verify_external_snapshot,
+    write_external_json,
 )
 from .deepresearchbench import DeepResearchBenchAdapter
 from .frames import FramesAdapter
@@ -60,4 +61,5 @@ __all__ = [
     "load_external_config",
     "load_external_lock",
     "verify_external_snapshot",
+    "write_external_json",
 ]

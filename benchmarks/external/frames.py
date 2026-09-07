@@ -20,19 +20,18 @@ class FramesAdapter(BaseExternalAdapter):
         return TaskCategory.MULTI_HOP_HISTORY
 
     def _eligible(self, item: Mapping[str, object]) -> bool:
-        # FRAMES is only meaningful when more than one context item is
-        # locally available.  ``evidence_mapping`` is optional in simple raw
-        # fixtures; the presence of two documents is the non-gold invariant.
+        # FRAMES requires both multi-document context and an explicit mapping
+        # from evidence to the question.  ``allow_single_document`` is never a
+        # substitute for either invariant.
+        documents_count = 0
         for key in ("documents", "context", "evidence", "sources", "passages"):
             value = item.get(key)
             if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-                return len(cast(Sequence[object], value)) >= 2
+                documents_count = len(cast(Sequence[object], value))
+                break
         mapping = item.get("evidence_mapping")
-        if isinstance(mapping, Mapping):
-            return len(cast(Mapping[object, object], mapping)) >= 2
-        # A canonical evidence row can be duplicated by the fixture builder;
-        # leave that decision to the verified snapshot materializer.
-        return item.get("allow_single_document", False) is True
+        has_mapping = isinstance(mapping, Mapping) and bool(cast(Mapping[object, object], mapping))
+        return documents_count >= 2 and has_mapping
 
 
 Adapter = FramesAdapter

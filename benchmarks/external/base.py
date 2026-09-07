@@ -21,6 +21,7 @@ import json
 import os
 import re
 import stat
+import uuid
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -256,6 +257,12 @@ class ExternalSourceLock(SealedModel):
     def benchmark_matches(self) -> Self:
         if any(item.benchmark != self.benchmark for item in self.snapshot_locks):
             raise ValueError("snapshot lock benchmark disagrees with source lock")
+        if any(
+            item.corpus_version != self.corpus_version
+            or item.index_version != self.index_version
+            for item in self.snapshot_locks
+        ):
+            raise ValueError("snapshot lock versions disagree with source lock")
         return self
 
 
@@ -574,12 +581,31 @@ def _is_link_or_reparse(path: Path) -> bool:
     )
 
 
-def fixed_external_root(path: Path, *, kind: Literal["raw", "staging", "snapshot"], create: bool = False) -> Path:
+def _infer_repo_root(
+    path: Path,
+    *,
+    kind: Literal["raw", "staging", "snapshot"],
+) -> Path:
+    suffix_length = {"raw": 4, "staging": 4, "snapshot": 3}[kind]
+    absolute = Path(path).absolute()
+    if len(absolute.parts) < suffix_length:
+        raise ValueError("external root cannot determine repository root")
+    return Path(*absolute.parts[:-suffix_length])
+
+
+def fixed_external_root(
+    path: Path,
+    *,
+    kind: Literal["raw", "staging", "snapshot"],
+    repo_root: Path | None = None,
+    create: bool = False,
+) -> Path:
     """Resolve an external root while preserving the fixed final components.
 
-    Tests use temporary repositories, so the check intentionally validates the
-    semantic suffix (``.../external/raw`` etc.) rather than requiring one
-    particular absolute checkout path.
+    When ``repo_root`` is supplied (as all production boundaries do), the
+    complete path is bound to that checkout.  The fallback is retained only
+    for low-level isolated fixtures; callers that accept user paths must pass
+    the explicit repository root.
     """
 
     expected = {
@@ -588,14 +614,29 @@ def fixed_external_root(path: Path, *, kind: Literal["raw", "staging", "snapshot
         "snapshot": ("benchmarks", "snapshots", "external"),
     }[kind]
     candidate = Path(path)
-    if ".." in candidate.parts or candidate.is_absolute() and any(part == ".." for part in candidate.parts):
+    if ".." in candidate.parts:
         raise ValueError("external root contains traversal")
-    absolute = candidate.absolute()
+    if repo_root is not None:
+        repository = Path(repo_root)
+        if ".." in repository.parts:
+            raise ValueError("repository root contains traversal")
+        repository = repository.absolute()
+        _reject_symlink_prefix(repository)
+        expected_path = repository.joinpath(*expected)
+        absolute = candidate if candidate.is_absolute() else repository / candidate
+        absolute = absolute.absolute()
+        if os.path.normcase(str(absolute)) != os.path.normcase(str(expected_path)):
+            raise ValueError(f"external {kind} root is not fixed to this repository")
+    else:
+        absolute = candidate.absolute()
+        if tuple(part.casefold() for part in absolute.parts[-len(expected) :]) != expected:
+            raise ValueError(f"external {kind} root is not fixed")
     if tuple(part.casefold() for part in absolute.parts[-len(expected) :]) != expected:
         raise ValueError(f"external {kind} root is not fixed")
     _reject_symlink_prefix(absolute)
     if create:
         absolute.mkdir(parents=True, exist_ok=True)
+        _reject_symlink_prefix(absolute)
     return absolute
 
 
@@ -887,32 +928,56 @@ class BaseExternalAdapter:
         raw_root: Path,
         snapshot_root: Path,
         external_config: ExternalConfig | None = None,
+        repo_root: Path | None = None,
     ) -> None:
         self.lock_file = Path(lock_file)
-        self.raw_root = fixed_external_root(raw_root, kind="raw")
-        self.snapshot_root = fixed_external_root(snapshot_root, kind="snapshot")
+        self.repo_root = (
+            Path(repo_root).absolute()
+            if repo_root is not None
+            else _infer_repo_root(raw_root, kind="raw")
+        )
+        expected_lock = self.repo_root / "benchmarks" / "external" / "external.lock.json"
+        candidate_lock = self.lock_file if self.lock_file.is_absolute() else self.repo_root / self.lock_file
+        candidate_lock = candidate_lock.absolute()
+        if os.path.normcase(str(candidate_lock)) != os.path.normcase(str(expected_lock)):
+            raise ValueError("external lock must use the fixed repository path")
+        _reject_symlink_prefix(candidate_lock)
+        self.lock_file = candidate_lock
+        self.raw_root = fixed_external_root(raw_root, kind="raw", repo_root=self.repo_root)
+        self.snapshot_root = fixed_external_root(
+            snapshot_root, kind="snapshot", repo_root=self.repo_root
+        )
         self.external_config = external_config
         self._lock = load_external_lock(self.lock_file)
         self._entry = self._lock.entry(self.benchmark)
         if self._entry.benchmark != self.benchmark:
             raise ValueError("external lock benchmark identity mismatch")
+        if len(self._entry.snapshot_locks) != self.expected_count:
+            raise ValueError("external lock snapshot count is not canonical")
         if external_config is not None:
             spec = external_config.spec(self.benchmark)
-            if spec.expected_count != self.expected_count or spec.adapter_version != self._entry.adapter_version:
+            if (
+                spec.expected_count != BENCHMARK_COUNTS[self.benchmark]
+                or spec.expected_count != self.expected_count
+                or spec.adapter_version != self._entry.adapter_version
+            ):
                 raise ValueError("external config and lock adapter identity mismatch")
             if self._entry.corpus_version != spec.corpus_version or self._entry.index_version != external_config.index_version:
                 raise ValueError("external config and lock corpus/index identity mismatch")
         self._items: dict[str, Mapping[str, object]] | None = None
+        self._raw_payload: bytes | None = None
         self._records: dict[str, tuple[FrozenEvidenceRecord, ...]] = {}
         self._locks_by_task = {lock.task_id: lock for lock in self._entry.snapshot_locks}
         if len(self._locks_by_task) != len(self._entry.snapshot_locks):
             raise ValueError("external snapshot lock task IDs must be unique")
 
     def _load_items(self) -> Mapping[str, Mapping[str, object]]:
-        if self._items is not None:
-            return self._items
         raw_path = _safe_child(self.raw_root, self._entry.raw_relative_path, label="external raw", require_file=True)
-        if sha256_bytes(raw_path.read_bytes()) != self._entry.sha256:
+        # Read once and use exactly those immutable bytes for both hash and
+        # parsing.  A cached selection is revalidated on every access so a
+        # raw-file mutation cannot bypass the lock after the first call.
+        payload = raw_path.read_bytes()
+        if sha256_bytes(payload) != self._entry.sha256:
             raise ProviderError(
                 code="INVALID_SNAPSHOT",
                 provider="external-corpus",
@@ -920,7 +985,17 @@ class BaseExternalAdapter:
                 public_message="external raw payload hash mismatch",
                 retryable=False,
             )
-        rows = _json_objects(raw_path.read_bytes(), source=raw_path)
+        if self._raw_payload is not None and payload != self._raw_payload:
+            raise ProviderError(
+                code="INVALID_SNAPSHOT",
+                provider="external-corpus",
+                operation="raw",
+                public_message="external raw payload changed after selection",
+                retryable=False,
+            )
+        if self._items is not None:
+            return self._items
+        rows = _json_objects(payload, source=raw_path)
         items: dict[str, Mapping[str, object]] = {}
         for row in rows:
             raw_id = row.get("external_id", row.get("id", row.get("task_id", row.get("uid"))))
@@ -931,6 +1006,7 @@ class BaseExternalAdapter:
                 raise ValueError("duplicate external_id in raw payload")
             items[external_id] = row
         self._items = items
+        self._raw_payload = payload
         return items
 
     def _eligible(self, item: Mapping[str, object]) -> bool:
@@ -955,6 +1031,10 @@ class BaseExternalAdapter:
         return lock
 
     def frozen_records_for(self, external_id: str) -> tuple[FrozenEvidenceRecord, ...]:
+        # Revalidate the immutable raw bytes even when normalized records are
+        # cached.  Otherwise a mutation after the first materialization could
+        # bypass the source-lock hash through this cache path.
+        self._load_items()
         if external_id in self._records:
             return self._records[external_id]
         item = self._load_items().get(external_id)
@@ -1048,9 +1128,24 @@ class ExternalSnapshotMaterializer:
         selection_manifest_path: Path,
         documents_staging_root: Path,
         snapshot_root: Path,
+        repo_root: Path | None = None,
+        external_config: ExternalConfig | None = None,
+        source_locks: Mapping[BenchmarkName, ExternalSourceLock] | None = None,
     ) -> ExternalSnapshotBuildResult:
-        staging = fixed_external_root(documents_staging_root, kind="staging")
-        snapshots_root = fixed_external_root(snapshot_root, kind="snapshot", create=True)
+        materializer_repo_root = (
+            Path(repo_root).absolute()
+            if repo_root is not None
+            else _infer_repo_root(documents_staging_root, kind="staging")
+        )
+        staging = fixed_external_root(
+            documents_staging_root, kind="staging", repo_root=materializer_repo_root
+        )
+        snapshots_root = fixed_external_root(
+            snapshot_root,
+            kind="snapshot",
+            repo_root=materializer_repo_root,
+            create=True,
+        )
         raw_selection_path = Path(selection_manifest_path)
         if ".." in raw_selection_path.parts:
             raise ValueError("selection manifest contains traversal")
@@ -1105,8 +1200,27 @@ class ExternalSnapshotMaterializer:
             output = _safe_child(snapshots_root, output_relative, label="external snapshot output")
             if output.exists() or output.is_symlink():
                 raise FileExistsError(output)
-            corpus_version = str(row.get("corpus_version", "external-v1"))
-            index_version = str(row.get("index_version", "bm25-mixed-v1"))
+            corpus_value = row.get("corpus_version")
+            index_value = row.get("index_version")
+            if not isinstance(corpus_value, str) or not isinstance(index_value, str):
+                raise TypeError("external selection versions are required")
+            corpus_version = corpus_value
+            index_version = index_value
+            expected_spec = external_config.spec(benchmark) if external_config else None
+            expected_index_version = external_config.index_version if external_config else None
+            expected_source = source_locks.get(benchmark) if source_locks is not None else None
+            if source_locks is not None and expected_source is None:
+                raise ValueError("external source lock is missing for benchmark")
+            if expected_spec is not None and (
+                corpus_version != expected_spec.corpus_version
+                or index_version != expected_index_version
+            ):
+                raise ValueError("external selection versions disagree with config")
+            if expected_source is not None and (
+                corpus_version != expected_source.corpus_version
+                or index_version != expected_source.index_version
+            ):
+                raise ValueError("external selection versions disagree with source lock")
             built = build_one(
                 task_id=task_id,
                 documents=documents,
@@ -1139,20 +1253,42 @@ class ExternalSnapshotMaterializer:
 
 
 def write_external_json(path: Path, payload: object | bytes) -> Path:
-    """Write one ignored external artifact without replacing an existing file."""
+    """Publish one ignored external artifact with atomic no-replace semantics."""
 
     target = Path(path)
     if ".." in target.parts:
         raise ValueError("external artifact path contains traversal")
     _reject_symlink_prefix(target.parent)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_prefix(target.parent)
+    data = payload if isinstance(payload, bytes) else canonical_json_bytes(payload)
     if target.exists() or target.is_symlink():
         raise FileExistsError(target)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    data = payload if isinstance(payload, bytes) else canonical_json_bytes(payload)
-    with target.open("xb") as handle:
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
+    # Keep the sibling name short enough for Windows' default MAX_PATH while
+    # retaining a per-publication nonce.
+    staging = target.with_name(f".{target.name}.{uuid.uuid4().hex[:8]}.staging")
+    try:
+        with staging.open("xb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        # A hard-link publication is atomic and, unlike a pre-check followed by
+        # rename/replace, cannot overwrite a concurrent existing target.
+        os.link(staging, target)
+        try:
+            directory_fd = os.open(str(target.parent), os.O_RDONLY)
+        except OSError:
+            directory_fd = None
+        if directory_fd is not None:
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        try:
+            staging.unlink()
+        except FileNotFoundError:
+            pass
     return target
 
 
