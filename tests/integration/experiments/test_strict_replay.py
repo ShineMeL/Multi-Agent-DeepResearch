@@ -22,6 +22,11 @@ import pytest
 
 from deepresearch.domain import ResourceUsage, RunBudget
 from deepresearch.providers import ModelMessage, ModelRequest, ProviderError
+from deepresearch.providers.recording import (
+    RecordingModelProvider,
+    RecordingSearchProvider,
+    ReplayBundleWriter,
+)
 from deepresearch.providers.replay import ReplayModelProvider, ReplaySearchProvider
 from deepresearch.providers.replay_schema import (
     REPLAY_REQUEST_SCHEMA_VERSION,
@@ -197,14 +202,41 @@ async def test_replay_success_then_expired_call_clears_usage() -> None:
 
 
 @pytest.mark.asyncio
-async def test_record_then_strict_replay_is_byte_identical() -> None:
-    bundle = ReplayBundle.load(PROVIDER_FIXTURE)
+async def test_record_then_strict_replay_is_byte_identical(tmp_path: Path) -> None:
+    source_bundle = ReplayBundle.load(PROVIDER_FIXTURE)
+    recorded_root = tmp_path / "recorded-bundle"
+    writer = ReplayBundleWriter.create(recorded_root, run_id="recorded-run-v1")
+    writer.configure_model_provider(
+        provider_id=source_bundle.snapshot.providers["model"].provider_id,
+        model_revision=source_bundle.snapshot.providers["model"].model_revision or "",
+    )
+    model = RecordingModelProvider(ReplayModelProvider(source_bundle), writer)
+    search = RecordingSearchProvider(ReplaySearchProvider(source_bundle), writer)
+    token = CancellationToken()
+    await model.complete(_request(), deadline=_future_deadline(), cancellation_token=token)
+    await search.search(
+        "multimodal agents",
+        5,
+        {"language": "en"},
+        deadline=_future_deadline(),
+        cancellation_token=token,
+    )
+    await writer.finalize()
+    bundle = ReplayBundle.load(recorded_root)
+    recorded_manifest_bytes = (recorded_root / "manifest.sha256").read_bytes()
     recorded = await _run_recorded_fixture(bundle, strict=False)
     replayed = await _run_recorded_fixture(bundle, strict=True)
 
     assert replayed.report_bytes == recorded.report_bytes
     assert replayed.evaluation_bytes == recorded.evaluation_bytes
+    assert recorded.manifest_bytes != replayed.manifest_bytes
+    assert json.loads(recorded.manifest_bytes)["replay_parent"] is None
     assert replayed.replay_parent == bundle.snapshot.run_id
+    assert json.loads(replayed.manifest_bytes)["replay_parent"] == bundle.snapshot.run_id
+    assert recorded_manifest_bytes == (recorded_root / "manifest.sha256").read_bytes()
+    assert json.loads((recorded_root / "snapshot.json").read_bytes())["run_id"] == (
+        bundle.snapshot.run_id
+    )
 
 
 def test_replay_key_binds_provider_model_prompt_request_and_schema_versions() -> None:
