@@ -216,6 +216,57 @@ async def test_invalid_candidate_pool_does_not_reuse_completed_raw_result(
 
 
 @pytest.mark.asyncio
+async def test_candidate_pool_failure_rejects_same_key_raw_identity_tampering(
+    tmp_path: Path,
+) -> None:
+    config, task = _config_and_task()
+    runner = ExperimentRunner(
+        launch_agent=SpyLauncher(),
+        task_loader={task.task_id: task},
+        experiment_root=tmp_path,
+        private_root=tmp_path / "private",
+        preflight=False,
+    )
+    group_root = runner._group_root(config)
+    seed = config.replication.seed_values[0]
+    key = runner._idempotency_key(
+        config.experiment_group_id(),
+        "ranker_component",
+        "R1",
+        task.task_id,
+        seed,
+        None,
+        config.budget_preset,
+    )
+    tampered = ExperimentTaskRun(
+        task_id="tampered-task",
+        protocol="ranker_component",
+        variant="R1",
+        planner_id="P1",
+        ranker_id="R1",
+        budget_preset=config.budget_preset,
+        seed=seed,
+        status="failed",
+        validity="invalid",
+        error_code="CANDIDATE_POOL_INVALID",
+        candidate_pool_hash=None,
+        manifest_path="tampered-manifest.json",
+        artifact_ids=(),
+        usage=ResourceUsage.zero(cost_known=True),
+        pricing_snapshot_ids=(config.pricing_snapshot.snapshot_id,),
+        pricing_status="estimated",
+        cost_label="estimated_from_normalized_schedule",
+        category=task.category,
+    )
+    raw_path = group_root / "raw" / f"{key}.json"
+    raw_bytes = canonical_json_bytes(tampered.model_dump(mode="json"))
+    raw_path.write_bytes(raw_bytes)
+
+    with pytest.raises(RuntimeError, match="identity does not match"):
+        await runner.run_ranker_component(config=config, task_ids=[task.task_id])
+
+    assert raw_path.read_bytes() == raw_bytes
+@pytest.mark.asyncio
 async def test_candidate_pool_setup_rejects_missing_manifest_artifact(
     tmp_path: Path,
 ) -> None:

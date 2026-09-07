@@ -139,6 +139,64 @@ async def test_strict_replay_threads_an_injected_clock_and_restores_usage() -> N
 
 
 @pytest.mark.asyncio
+async def test_replay_success_then_miss_clears_usage_and_failure_accounting() -> None:
+    """A failed second call must not inherit the first call's usage."""
+
+    bundle = ReplayBundle.load(PROVIDER_FIXTURE)
+    provider = ReplaySearchProvider(bundle)
+    token = CancellationToken()
+    await provider.search(
+        "multimodal agents",
+        5,
+        {"language": "en"},
+        deadline=_future_deadline(),
+        cancellation_token=token,
+    )
+    assert provider.last_usage is not None
+
+    with pytest.raises(ProviderError) as error:
+        await provider.search(
+            "unknown-query",
+            5,
+            {"language": "en"},
+            deadline=_future_deadline(),
+            cancellation_token=token,
+        )
+
+    assert error.value.code == "REPLAY_MISS"
+    assert error.value.usage is None
+    assert provider.last_usage is None
+    assert provider.live_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_replay_success_then_expired_call_clears_usage() -> None:
+    bundle = ReplayBundle.load(PROVIDER_FIXTURE)
+    provider = ReplaySearchProvider(bundle)
+    token = CancellationToken()
+    await provider.search(
+        "multimodal agents",
+        5,
+        {"language": "en"},
+        deadline=_future_deadline(),
+        cancellation_token=token,
+    )
+
+    with pytest.raises(ProviderError) as error:
+        await provider.search(
+            "multimodal agents",
+            5,
+            {"language": "en"},
+            deadline=0.0,
+            cancellation_token=token,
+        )
+
+    assert error.value.code == "TIMEOUT"
+    assert error.value.usage is None
+    assert provider.last_usage is None
+
+
+@pytest.mark.asyncio
 async def test_record_then_strict_replay_is_byte_identical() -> None:
     bundle = ReplayBundle.load(PROVIDER_FIXTURE)
     recorded = await _run_recorded_fixture(bundle, strict=False)
@@ -242,6 +300,28 @@ async def test_strict_replay_rejects_model_schema_or_identity_mismatch(
         )
     assert error.value.code == "INVALID_SNAPSHOT"
     assert provider.live_calls == 0
+
+
+def test_replay_request_schema_version_mismatch_invalidates_snapshot(
+    tmp_path: Path,
+) -> None:
+    copied = tmp_path / "bundle"
+    shutil.copytree(PROVIDER_FIXTURE, copied)
+    path = copied / "search.jsonl"
+    record = json.loads(path.read_bytes())
+    record["key"]["schema_version"] = "replay-request-v999"
+    record["outcome_sha256"] = hashlib.sha256(_canonical(record["outcome"])).hexdigest()
+    path.write_bytes(_canonical(record) + b"\n")
+    manifest_path = copied / "manifest.sha256"
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest["file_sha256"]["search.jsonl"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    manifest_path.write_bytes(_canonical(manifest) + b"\n")
+
+    with pytest.raises(ProviderError) as error:
+        ReplayBundle.load(copied)
+
+    assert error.value.code == "INVALID_SNAPSHOT"
+    assert "schema_version" in str(error.value.__cause__)
 
 
 @pytest.mark.asyncio

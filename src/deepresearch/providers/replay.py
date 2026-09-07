@@ -58,6 +58,10 @@ class _ReplayProvider:
         self._clock = clock
         self.last_usage: ResourceUsage | None = None
 
+    def _begin_call(self) -> None:
+        """Drop usage from a prior call before any new failure can occur."""
+        self.last_usage = None
+
     def _key(
         self,
         operation: ReplayOperation,
@@ -74,6 +78,7 @@ class _ReplayProvider:
         )
 
     def _lookup(self, key: ReplayRequestKey) -> ReplaySuccess:
+        self._begin_call()
         record = self._bundle.lookup(key)
         self.last_usage = record.usage
         if isinstance(record.outcome, ReplayFailure):
@@ -137,6 +142,7 @@ class ReplayModelProvider(_ReplayProvider):
         deadline: float,
         cancellation_token: CancellationToken,
     ) -> ModelResult[str]:
+        self._begin_call()
         self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation="model.complete")
         key = self._key(
             "model.complete",
@@ -162,6 +168,7 @@ class ReplayModelProvider(_ReplayProvider):
         deadline: float,
         cancellation_token: CancellationToken,
     ) -> StructuredModelResult[T]:
+        self._begin_call()
         self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation="model.structured")
         key = self._key(
             "model.structured",
@@ -195,7 +202,10 @@ class ReplayModelProvider(_ReplayProvider):
         deadline: float,
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[ModelStreamChunk]:
+        self._begin_call()
+
         async def replay_chunks() -> AsyncIterator[ModelStreamChunk]:
+            self._begin_call()
             self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation="model.stream")
             key = self._key(
                 "model.stream",
@@ -238,6 +248,7 @@ class ReplaySearchProvider(_ReplayProvider):
         deadline: float,
         cancellation_token: CancellationToken,
     ) -> list[SearchHit]:
+        self._begin_call()
         self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation="search")
         key = self._key("search", search_request_payload(query, limit, filters))
         outcome = self._lookup(key)
@@ -266,6 +277,7 @@ class ReplayFetcher(_ReplayProvider):
         deadline: float,
         cancellation_token: CancellationToken,
     ) -> RawDocument:
+        self._begin_call()
         self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation="fetch")
         key = self._key("fetch", fetch_request_payload(url))
         outcome = self._lookup(key)
@@ -315,6 +327,7 @@ class ReplayTextEmbedder(_ReplayProvider):
         deadline: float,
         cancellation_token: CancellationToken,
     ) -> tuple[tuple[float, ...], ...]:
+        self._begin_call()
         self._checkpoint(deadline=deadline, cancellation_token=cancellation_token, operation="embed")
         frozen_texts = tuple(texts)
         key = self._key("embed", embed_request_payload(frozen_texts))

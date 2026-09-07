@@ -1929,6 +1929,15 @@ class ExperimentRunner:
         raw_path = self._raw_path(group_root, key)
         existing = self._load_existing(raw_path)
         if existing is not None:
+            self._validate_existing_identity(
+                existing,
+                task_id=task.task_id,
+                protocol="ranker_component",
+                variant=variant,
+                budget=budget,
+                seed=seed,
+                repeat_id=repeat_id,
+            )
             if existing.status == "completed":
                 # A completed record is immutable and must not be reused when
                 # its required pool has become invalid. Keep an additional
