@@ -38,6 +38,10 @@ HumanDimension = Literal[
 ]
 Preference = Literal["X", "Y", "TIE"]
 _PREFERENCES = frozenset({"X", "Y", "TIE"})
+_PSEUDONYM_RE = re.compile(
+    r"^(?:(?:rater|anon)[_-][A-Za-z0-9][A-Za-z0-9_-]{0,63}|[0-9a-f]{16,64})$",
+    re.IGNORECASE,
+)
 
 
 def _nonblank(value: str, *, field: str) -> str:
@@ -258,7 +262,27 @@ def _redact(text: str, values: Sequence[object]) -> str:
         reverse=True,
     )
     for value in candidates:
-        result = re.sub(re.escape(value), "[REDACTED]", result, flags=re.IGNORECASE)
+        if len(value) == 1:
+            # Real experiment variants are often represented as the single
+            # letters ``A`` and ``D``.  Replacing every occurrence would turn
+            # an ordinary report into unreadable text, so redact only a
+            # metadata-labelled or bracketed occurrence (or a report that is
+            # exactly the identifier).
+            if result.strip().casefold() == value.casefold():
+                result = "[REDACTED]"
+                continue
+            labelled = re.compile(
+                rf"(?i)(?<!\w)(?:variant|model|run(?:[_ -]?id)?|system|agent|method)"
+                rf"[_\s:=#-]*{re.escape(value)}(?!\w)"
+            )
+            bracketed = re.compile(
+                rf"(?i)(?<!\w)[\[\(\{{]\s*{re.escape(value)}\s*[\]\)\}}](?!\w)"
+            )
+            result = labelled.sub("[REDACTED]", result)
+            result = bracketed.sub("[REDACTED]", result)
+        else:
+            bounded = re.compile(rf"(?<!\w){re.escape(value)}(?!\w)", re.IGNORECASE)
+            result = bounded.sub("[REDACTED]", result)
     return result
 
 
@@ -346,6 +370,15 @@ class HumanRating(BaseModel):
     @classmethod
     def validate_text(cls, value: str, info: object) -> str:
         return _nonblank(value, field=str(getattr(info, "field_name", "value")))
+
+    @field_validator("rater_id")
+    @classmethod
+    def validate_pseudonymous_rater_id(cls, value: str) -> str:
+        if _PSEUDONYM_RE.fullmatch(value) is None:
+            raise ValueError(
+                "rater_id must be a pseudonymous rater-/anon- identifier or an opaque hex ID"
+            )
+        return value
 
     @field_validator("scores")
     @classmethod
@@ -498,32 +531,58 @@ def _normalise_automatic_metrics(
 
 
 def _ordinal_alpha(groups: Mapping[str, Sequence[int]]) -> float | None:
-    values = [score for scores in groups.values() for score in scores]
+    """Calculate Krippendorff's alpha with the ordinal distance function.
+
+    The ordinal distance uses pooled category frequencies: the gap between
+    two categories is the cumulative frequency between their ranks, with
+    half-weighted endpoints, and that gap is squared.  Units with fewer than
+    two observed ratings contribute no pair, preserving missingness.
+    """
+
+    pairable_groups = [tuple(scores) for scores in groups.values() if len(scores) >= 2]
+    values = [score for scores in pairable_groups for score in scores]
     if len(values) < 2:
         return None
-    observed_numerator = 0.0
-    observed_denominator = 0
-    for scores in groups.values():
-        if len(scores) < 2:
-            continue
-        observed_denominator += len(scores) * (len(scores) - 1) // 2
-        for index, first in enumerate(scores):
-            for second in scores[index + 1 :]:
-                observed_numerator += float((first - second) ** 2)
-    if observed_denominator == 0:
-        return None
-    observed = observed_numerator / observed_denominator
     counts = Counter(values)
-    denominator = len(values) * (len(values) - 1) // 2
-    expected_numerator = 0.0
-    categories = sorted(counts)
-    for index, first in enumerate(categories):
-        for second in categories[index + 1 :]:
-            expected_numerator += counts[first] * counts[second] * float((first - second) ** 2)
-    expected = expected_numerator / denominator if denominator else 0.0
+
+    def distance_squared(first: int, second: int) -> float:
+        if first == second:
+            return 0.0
+        lower, upper = sorted((first, second))
+        cumulative = sum(counts.get(category, 0) for category in range(lower, upper + 1))
+        gap = cumulative - (counts[first] + counts[second]) / 2.0
+        return float(gap**2)
+
+    # The coincidence-matrix form weights each unit's ordered pairs by
+    # 1/(m_u-1), then normalizes by the number of pairable values n.
+    n = sum(len(scores) for scores in pairable_groups)
+    observed_numerator = math.fsum(
+        math.fsum(
+            distance_squared(first, second)
+            for first in scores
+            for second in scores
+            if first != second
+        )
+        / (len(scores) - 1)
+        for scores in pairable_groups
+    )
+    observed = observed_numerator / n
+    expected_numerator = math.fsum(
+        counts[first] * counts[second] * distance_squared(first, second)
+        for first in counts
+        for second in counts
+        if first != second
+    )
+    expected = expected_numerator / (n * (n - 1)) if n > 1 else 0.0
     if expected == 0.0:
         return 1.0 if observed == 0.0 else 0.0
     return float(1.0 - observed / expected)
+
+
+def ordinal_krippendorff_alpha(groups: Mapping[str, Sequence[int]]) -> float | None:
+    """Public wrapper for the ordinal Krippendorff alpha calculation."""
+
+    return _ordinal_alpha(groups)
 
 
 def _average_ranks(values: Sequence[float]) -> list[float]:
@@ -702,6 +761,7 @@ __all__ = [
     "ReportPair",
     "ValidationReport",
     "blind_pair",
+    "ordinal_krippendorff_alpha",
     "summarize_human_ratings",
     "validate_human_ratings",
 ]

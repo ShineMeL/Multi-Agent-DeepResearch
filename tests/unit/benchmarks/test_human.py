@@ -11,6 +11,7 @@ from benchmarks.evaluators.human import (
     HumanRating,
     ReportPair,
     blind_pair,
+    ordinal_krippendorff_alpha,
     summarize_human_ratings,
     validate_human_ratings,
 )
@@ -85,6 +86,30 @@ def test_blinding_is_seeded_but_does_not_expose_mapping() -> None:
     }
 
 
+def test_single_character_variant_redaction_is_context_aware() -> None:
+    pair = ReportPair(
+        task_id="stability-02",
+        left_run_id="run-a-002",
+        right_run_id="run-d-002",
+        left_variant="A",
+        right_variant="D",
+        left_report="Variant A is concise. A useful citation is included.",
+        right_report="Variant D is detailed. Datasets are clearly cited.",
+    )
+    packet = blind_pair(pair, seed=1)
+    payload = packet.model_dump_json()
+    assert "Variant A" not in payload
+    assert "Variant D" not in payload
+    assert "useful citation" in payload or "clearly cited" in payload
+
+
+def test_rater_id_must_follow_pseudonymous_format() -> None:
+    with pytest.raises(ValidationError, match="pseudonymous"):
+        _rating("task-1", "alice@example.com")
+    with pytest.raises(ValidationError, match="pseudonymous"):
+        _rating("task-1", "Alice Zhang")
+
+
 def test_human_rating_schema_rejects_unknown_dimensions_and_bad_scores() -> None:
     with pytest.raises(ValidationError):
         HumanRating(
@@ -144,7 +169,15 @@ def test_human_summary_reports_agreement_and_spearman() -> None:
     }
     assert result.majority_preference == {"X": 1, "Y": 1, "TIE": 0}
     assert result.tie_rate == 0.0
-    assert abs(result.mean_dimension_scores[HUMAN_DIMENSIONS[0]] - 4.0) < 1e-9  # type: ignore[operator]
+    assert result.mean_dimension_scores[HUMAN_DIMENSIONS[0]] == 4.0
+
+
+def test_ordinal_alpha_uses_pooled_category_frequencies() -> None:
+    # The pooled category frequencies make the ordinal distance different
+    # from a plain squared score difference (alpha is -5/12 here).
+    alpha = ordinal_krippendorff_alpha({"task-1": (1, 3), "task-2": (1, 2)})
+    assert alpha is not None
+    assert abs(alpha + 5 / 12) < 1e-12
 
 
 def test_summary_preserves_missingness_and_requires_three_raters() -> None:
