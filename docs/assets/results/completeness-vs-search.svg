@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="420" viewBox="0 0 720 420" role="img" aria-labelledby="completeness-vs-search-title completeness-vs-search-description">
+  <title id="completeness-vs-search-title">Completeness vs search calls</title>
+  <desc id="completeness-vs-search-description">Illustrative deterministic placeholder; no formal result is sealed. Horizontal axis: search calls. Vertical axis: information completeness.</desc>
+  <rect width="720" height="420" fill="#ffffff"/>
+  <text x="360" y="30" text-anchor="middle" font-family="sans-serif" font-size="18" fill="#111827">Completeness vs search calls</text>
+  <line x1="80" y1="350" x2="670" y2="350" stroke="#374151" stroke-width="2"/>
+  <line x1="80" y1="70" x2="80" y2="350" stroke="#374151" stroke-width="2"/>
+  <line x1="80" y1="280" x2="670" y2="280" stroke="#d1d5db"/>
+  <line x1="80" y1="210" x2="670" y2="210" stroke="#d1d5db"/>
+  <line x1="80" y1="140" x2="670" y2="140" stroke="#d1d5db"/>
+  <rect x="150" y="265" width="100" height="85" fill="#2563eb"/>
+  <rect x="315" y="210" width="100" height="140" fill="#f97316"/>
+  <rect x="480" y="295" width="100" height="55" fill="#059669"/>
+  <text x="200" y="370" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#111827">illustrative A</text>
+  <text x="365" y="370" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#111827">illustrative B</text>
+  <text x="530" y="370" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#111827">illustrative C</text>
+  <text x="375" y="405" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#111827">search calls</text>
+  <text x="22" y="210" text-anchor="middle" transform="rotate(-90 22 210)" font-family="sans-serif" font-size="14" fill="#111827">information completeness</text>
+  <text x="360" y="58" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#991b1b">Illustrative placeholder — no formal result is sealed</text>
+</svg>

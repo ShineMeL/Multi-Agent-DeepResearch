@@ -5,12 +5,23 @@ system. The delivered baseline compiles a LangGraph workflow with a fixed P1
 planner and R1 evidence ranker, runs it against a strict offline replay bundle,
 and exports a citation-backed Markdown report.
 
-The current milestone is intentionally narrow: Core foundation / P1+R1 strict
-Replay. It does not claim trained planner or ranker variants, A/B/C/D experiments,
-empirical quality or cost metrics, confidence intervals, manual review, or a
-public service/UI deployment. Those are follow-on milestones.
+The current checkout keeps the Core foundation / P1+R1 strict Replay path
+reproducible. Benchmark publication wiring is present, but formal A/B/C/D
+quality, cost, confidence-interval, external, and human results remain
+unsealed unless a hash-verified public summary is supplied.
 
-## Quickstart
+## Navigation
+
+- [Architecture](#architecture)
+- [Why Planner and Ranker matter](#why-planner-and-ranker-matter)
+- [Replay quickstart](#replay-quickstart)
+- [Live/local quickstart](#livelocal-quickstart)
+- [Benchmark protocol](#benchmark-protocol)
+- [Results](#results)
+- [Reproduction](#reproduction)
+- [Trade-offs and limitations](#trade-offs-and-limitations)
+
+## Replay quickstart
 
 Use Python 3.12 and the locked dependencies. With a standalone `uv` executable:
 
@@ -78,7 +89,12 @@ Keep the budget explicit for Live work. The local-unpriced policy records live
 cost as unknown when no approved pricing catalog is configured; it does not
 pretend that external calls are free.
 
-## Architecture boundaries
+## Live/local quickstart
+
+The Live command above is the local quickstart. It requires credentials and can
+incur provider charges; use Replay when validating the repository or CI path.
+
+## Architecture
 
 - `deepresearch.domain` owns the canonical request, plan, evidence, usage, event,
   configuration, and result models.
@@ -100,6 +116,52 @@ pretend that external calls are free.
 Strict Replay rejects unknown request keys and never falls back to Live. The
 recording/resume surface and richer service composition are documented follow-on
 work; this baseline quickstart only claims the tested offline path above.
+
+## Why Planner and Ranker matter
+
+The planner controls search breadth, redundancy, and stopping decisions. The
+evidence ranker controls which retrieved spans support a claim. They are
+reported as separate protocols so a quality change is not incorrectly
+attributed to a resource reduction or to the other component.
+
+## Benchmark protocol
+
+The benchmark uses fixed task/snapshot hashes, sealed model and environment
+locks, explicit budgets, and deterministic replication. Seeds are aggregated at
+the task level before paired confidence intervals. Optional human and external
+results remain separate from the primary agent intervals. See the [evaluation
+protocol](docs/evaluation.md) for commands, isolation boundaries, formulas, and
+missingness rules.
+
+## Results
+
+The [results page](docs/results.md) is generated only from a verified public
+summary. Until formal aggregates are sealed, it says so explicitly and retains
+negative-result analysis. The checked-in figures are deterministic placeholders
+with accessible descriptions; they do not represent formal CI, human, or
+external data.
+
+![Citation support versus estimated USD (deterministic placeholder; no formal result is sealed)](docs/assets/results/citation-support-vs-usd.svg)
+
+![Information completeness versus search calls (deterministic placeholder; no formal result is sealed)](docs/assets/results/completeness-vs-search.svg)
+
+![A/B/C/D metric overview (deterministic placeholder; no formal result is sealed)](docs/assets/results/abcd-metrics.svg)
+
+## Reproduction
+
+Use the [benchmark plan](docs/superpowers/plans/2026-08-29-benchmark-evaluation.md)
+and the commands in [evaluation.md](docs/evaluation.md). A formal publication
+requires the same sealed config, manifest hashes, model/environment locks,
+replication policy, and evaluator version; a second renderer run must be byte
+stable.
+
+## Trade-offs and limitations
+
+Hash verification and process isolation make publication auditable, but they
+also mean missing human/external artifacts cannot be filled in by the renderer.
+USD values are labelled estimated when derived from the approved pricing
+schedule. The renderer never reads private gold, sealed prompts, raw provider
+responses, or credentials.
 
 ## Roadmap and design documents
 
