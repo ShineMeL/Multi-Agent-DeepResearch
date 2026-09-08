@@ -95,6 +95,31 @@ pretend that external calls are free.
 The Live command above is the local quickstart. It requires credentials and can
 incur provider charges; use Replay when validating the repository or CI path.
 
+## Compose replay showcase
+
+The Compose stack runs the FastAPI service, API-only Streamlit UI, and Postgres
+with named `artifact-data` and `postgres-data` volumes. Set
+`POSTGRES_PASSWORD` and a nonblank, 32-byte-or-longer `SESSION_SIGNING_KEY` in
+your shell or an uncommitted environment file before starting it:
+
+```powershell
+$env:POSTGRES_PASSWORD = "replace-with-a-local-password"
+$env:SESSION_SIGNING_KEY = "replace-with-a-local-signing-key-at-least-32-bytes"
+docker compose up --build
+```
+
+This local Showcase forces only the `replay` execution mode and the
+`replay-default` provider profile. That default catalog entry is deliberately
+empty: configure the API with a complete, non-secret replay route catalog and
+its matching verified replay bundle, and submit only inputs recorded by that
+bundle. The UI cannot supply or override server policy or provider routes.
+
+For public deployment, inject database and session secrets from the platform's
+secret store; do not add them to an image or Compose file. Set the server
+deployment profile to `public_live`, enable `COOKIE_SECURE=true`, and explicitly
+set the provider/mode/purpose/budget allowlists and trusted-proxy CIDRs for that
+deployment.
+
 ## Architecture
 
 - `deepresearch.domain` owns the canonical request, plan, evidence, usage, event,

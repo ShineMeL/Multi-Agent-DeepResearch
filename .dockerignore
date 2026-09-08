@@ -1,0 +1,16 @@
+.git
+.github
+.superpowers
+.worktrees
+.venv/
+.ruff_cache/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+artifacts/
+.cache/
+experiments/*/
+benchmarks/private/
+benchmarks/snapshots/external/
