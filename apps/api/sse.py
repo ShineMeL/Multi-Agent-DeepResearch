@@ -1,9 +1,14 @@
 """Durable cursor replay; manager subscriptions only wake the next store read."""
 
 import asyncio
-from collections.abc import AsyncIterator
+import json
+from collections.abc import AsyncIterator, Collection
 
+from sse_starlette import ServerSentEvent
+
+from deepresearch.domain import RunEvent
 from deepresearch.runtime.manager import RunManager, RunNotFound
+from deepresearch.security import redact
 from deepresearch.storage.protocols import RunStore
 
 HEARTBEAT_SECONDS = 15.0
@@ -14,6 +19,29 @@ _TERMINAL_STATUSES = frozenset({"interrupted", "completed", "failed", "cancelled
 
 class InvalidLastEventId(ValueError):
     """The submitted SSE cursor is not an unsigned decimal integer."""
+
+
+def _event_fields(event: RunEvent, *, secrets: Collection[str]) -> dict[str, str]:
+    return {
+        "id": str(event.seq),
+        "event": str(redact(event.kind, secrets=secrets)),
+        "data": json.dumps(
+            redact(event.model_dump(mode="json"), secrets=secrets),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ),
+    }
+
+
+def encode_sse(event: RunEvent, *, secrets: Collection[str] = ()) -> str:
+    """Encode one complete SSE frame using the same boundary as live streams."""
+    fields = _event_fields(event, secrets=secrets)
+    return (
+        ServerSentEvent(id=fields["id"], event=fields["event"], data=fields["data"])
+        .encode()
+        .decode("utf-8")
+    )
 
 
 def parse_last_event_id(value: str | None) -> int:
@@ -52,7 +80,7 @@ async def event_stream(
                 if event.seq <= cursor:
                     continue
                 cursor = event.seq
-                yield {"id": str(event.seq), "event": event.kind, "data": event.model_dump_json()}
+                yield dict(_event_fields(event, secrets=manager.secrets))
 
             record = await store.get_owned_run(run_id, owner_scope_sha256)
             if record is None:

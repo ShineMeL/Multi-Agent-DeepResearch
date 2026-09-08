@@ -7,7 +7,7 @@ import json
 import os
 import re
 import subprocess
-from collections.abc import AsyncGenerator, Callable, Mapping
+from collections.abc import AsyncGenerator, Callable, Collection, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from decimal import Decimal
 from pathlib import Path
@@ -28,9 +28,10 @@ from deepresearch.providers import (
     UsageReportingSearchProvider,
 )
 from deepresearch.providers.httpx_fetcher import HostSlot, no_op_host_slot
-from deepresearch.reporting import ContentBoundary, MarkdownReportWriter, identity_content_boundary
+from deepresearch.reporting import ContentBoundary, MarkdownReportWriter
 from deepresearch.runtime.manifest import CostCalculator, PricingSnapshot
 from deepresearch.runtime.ports import ResearchRunner
+from deepresearch.security import redact, wrap_untrusted_content
 from deepresearch.storage import FileCache, LocalArtifactStore, LocalEvidenceStore
 from deepresearch.workflow.baseline_graph import BaselineNodeHandlers, build_baseline_graph
 from deepresearch.workflow.runner import LangGraphResearchRunner
@@ -174,6 +175,16 @@ def validate_provider_route_binding(
         or config.request.execution_mode != provider_routes.execution_mode
     ):
         raise ProviderProfileDrift()
+
+
+def public_provider_profile(
+    routes: FrozenProviderRoutes, *, secrets: Collection[str] = ()
+) -> dict[str, Any]:
+    """Keep the frozen digest valid; reject credential-bearing metadata outright."""
+    payload = routes.model_dump(mode="json")
+    if redact(payload, secrets=secrets) != payload:
+        raise ProviderProfileDrift()
+    return payload
 
 
 class PricingCatalog(Protocol):
@@ -559,9 +570,10 @@ class DefaultCoreRunnerBuilder:
         credential_resolver: EnvCredentialResolver,
         artifact_store: LocalArtifactStore,
         evidence_store: LocalEvidenceStore,
-        content_boundary: ContentBoundary = identity_content_boundary,
+        content_boundary: ContentBoundary = wrap_untrusted_content,
         search_slot: SearchSlot = no_op_search_slot,
         host_slot: HostSlot = no_op_host_slot,
+        secrets: Collection[str] = (),
     ) -> None:
         self.provider_constructors = dict(provider_constructors)
         self.credential_resolver = credential_resolver
@@ -570,6 +582,7 @@ class DefaultCoreRunnerBuilder:
         self.content_boundary = content_boundary
         self.search_slot = search_slot
         self.host_slot = host_slot
+        self._secrets = tuple(secrets)
 
     def required_pricing_keys(
         self, config: RunConfig, provider_routes: FrozenProviderRoutes
@@ -610,6 +623,16 @@ class DefaultCoreRunnerBuilder:
             route.operation: self.credential_resolver.resolve(route.credential_ref)
             for route in provider_routes.routes
         }
+        loaded_secrets = (*self._secrets, *(value for value in secrets.values() if value))
+        public_provider_profile(provider_routes, secrets=loaded_secrets)
+        # Core persists config/pricing in checkpoint/audit state. Fail before
+        # composition instead of rewriting its hashed manifest after the fact.
+        metadata = {
+            "config": config.model_dump(mode="json"),
+            "pricing": [item.model_dump(mode="json") for item in pricing_snapshots],
+        }
+        if redact(metadata, secrets=loaded_secrets) != metadata:
+            raise ProviderProfileDrift()
         adapters = {
             operation: self.provider_constructors[route.provider_id](
                 route, secrets[operation], self.host_slot

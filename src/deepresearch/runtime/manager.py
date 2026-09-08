@@ -28,9 +28,11 @@ from deepresearch.runtime.runner_factory import (
     PricingCatalog,
     ProviderProfileDrift,
     ServiceRunnerFactory,
+    public_provider_profile,
     validate_provider_route_binding,
 )
 from deepresearch.runtime.state_machine import validate_cancel, validate_resume
+from deepresearch.security import redact
 from deepresearch.storage.protocols import (
     IdempotencyCollision,
     RunFinalization,
@@ -216,6 +218,10 @@ class RunManager:
     def _lock_for(self, run_id: str) -> AbstractAsyncContextManager[None]:
         return _hold_lock(self._locks, run_id)
 
+    @property
+    def secrets(self) -> tuple[str, ...]:
+        return self._secrets
+
     def _broadcast_lock_for(self, run_id: str) -> AbstractAsyncContextManager[None]:
         return _hold_lock(self._broadcast_locks, run_id)
 
@@ -269,6 +275,10 @@ class RunManager:
             run_id = str(uuid4())
             routes = self.runner_factory.resolve_provider_routes(config.request.provider_profile_id)
             validate_provider_route_binding(config, routes)
+            profile_json = public_provider_profile(routes, secrets=self.secrets)
+            config_json = config.model_dump(mode="json")
+            if redact(config_json, secrets=self.secrets) != config_json:
+                raise ProviderProfileDrift()
             pricing_status, snapshots = self._pricing(config, routes)
             requested_cost = requested_admission_cost(config, pricing_status)
             # Construct before admission so unsupported Core graphs and invalid
@@ -290,10 +300,10 @@ class RunManager:
                 run_id=run_id,
                 thread_id=str(uuid4()),
                 status="queued",
-                config_json=config.model_dump(mode="json"),
+                config_json=config_json,
                 pricing_status=pricing_status,
                 pricing_snapshots=snapshots,
-                provider_profile_json=routes.model_dump(mode="json"),
+                provider_profile_json=profile_json,
                 provider_profile_sha256=routes.configuration_sha256,
                 config_sha256=digest,
                 owner_scope_sha256=scope,
@@ -593,7 +603,10 @@ class RunManager:
             subscription.event.set()
 
     async def emit(self, event: RunEvent) -> None:
-        persisted = await self.store.append_event(event)
+        safe = event.model_copy(
+            update={"public_payload": redact(event.public_payload, secrets=self.secrets)}
+        )
+        persisted = await self.store.append_event(safe)
         await self.broadcast_persisted(persisted)
 
     async def broadcast_persisted(self, event: RunEvent) -> None:

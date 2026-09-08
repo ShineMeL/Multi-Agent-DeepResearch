@@ -1,5 +1,6 @@
 """Allowlisted public errors; exception text and validation inputs stay private."""
 
+from collections.abc import Collection
 from typing import Literal
 
 from fastapi import FastAPI, Request
@@ -17,6 +18,7 @@ from deepresearch.runtime.manager import (
 )
 from deepresearch.runtime.runner_factory import ProviderProfileDrift, ResearchGraphUnavailable
 from deepresearch.runtime.state_machine import InvalidTransition
+from deepresearch.security import redact
 
 from .sse import InvalidLastEventId
 
@@ -89,7 +91,7 @@ class APIError(Exception):
         self.retry_after = retry_after
 
 
-def error_response(error: APIError) -> JSONResponse:
+def error_response(error: APIError, *, secrets: Collection[str] = ()) -> JSONResponse:
     status, message = _ERRORS[error.code]
     headers = {"Cache-Control": "no-store"}
     if error.retry_after is not None:
@@ -99,7 +101,9 @@ def error_response(error: APIError) -> JSONResponse:
         content={
             "code": error.code,
             "message": message,
-            "run_id": None if error.code == "RUN_NOT_FOUND" else error.run_id,
+            "run_id": (
+                None if error.code == "RUN_NOT_FOUND" else redact(error.run_id, secrets=secrets)
+            ),
             "retry_after": error.retry_after,
         },
         headers=headers,
@@ -108,7 +112,8 @@ def error_response(error: APIError) -> JSONResponse:
 
 async def handle_error(request: Request, error: Exception) -> JSONResponse:
     if isinstance(error, APIError):
-        return error_response(error)
+        manager = getattr(request.app.state, "manager", None)
+        return error_response(error, secrets=getattr(manager, "secrets", ()))
     code: PublicErrorCode
     if isinstance(error, RunNotFound):
         code = "RUN_NOT_FOUND"
