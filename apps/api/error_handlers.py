@@ -18,6 +18,8 @@ from deepresearch.runtime.manager import (
 from deepresearch.runtime.runner_factory import ProviderProfileDrift, ResearchGraphUnavailable
 from deepresearch.runtime.state_machine import InvalidTransition
 
+from .sse import InvalidLastEventId
+
 PublicErrorCode = Literal[
     "INVALID_REQUEST",
     "DEPLOYMENT_POLICY_VIOLATION",
@@ -110,6 +112,8 @@ async def handle_error(request: Request, error: Exception) -> JSONResponse:
     code: PublicErrorCode
     if isinstance(error, RunNotFound):
         code = "RUN_NOT_FOUND"
+    elif isinstance(error, InvalidLastEventId):
+        code = "INVALID_LAST_EVENT_ID"
     elif isinstance(error, RequestValidationError):
         code = "INVALID_REQUEST"
     elif isinstance(error, PolicyViolation):
@@ -146,6 +150,7 @@ def install_error_handlers(app: FastAPI) -> None:
     for kind in (
         APIError,
         RunNotFound,
+        InvalidLastEventId,
         RequestValidationError,
         PolicyViolation,
         MissingPricingSnapshot,

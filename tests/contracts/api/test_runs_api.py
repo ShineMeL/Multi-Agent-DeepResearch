@@ -7,15 +7,14 @@ from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from ipaddress import ip_network
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Any
 
 import pytest
-from fastapi import Depends, FastAPI, Request
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from langgraph.checkpoint.memory import InMemorySaver
 
 from apps.api import create_app
-from apps.api.dependencies import get_owned_run
 from apps.api.error_handlers import APIError
 from apps.api.identity import OwnerIdentity, TrustedClientIpResolver
 from apps.api.schemas import CreateRunRequest, RunAccepted, RunViewResponse
@@ -27,7 +26,6 @@ from deepresearch.runtime.runner_factory import (
     ResearchGraphUnavailable,
 )
 from deepresearch.storage import LocalArtifactStore
-from deepresearch.storage.protocols import RunView
 from tests.fakes.service_store import FakeRunStore, make_record
 from tests.integration.replay.test_baseline_graph import config
 from tests.unit.runtime.test_manager import Factory, policy
@@ -74,12 +72,6 @@ def rig(tmp_path: Path) -> Iterator[Rig]:
         artifact_store=artifacts,
         session_secret=SECRET,
     )
-
-    # Task 5 owns production SSE. Exercise its shared owned-lookup dependency
-    # here so a bare framework 404 cannot falsely prove event ownership.
-    @app.get("/runs/{run_id}/events")
-    async def events(owned: Annotated[RunView, Depends(get_owned_run)]) -> dict[str, str]:
-        return {"run_id": owned.run_id}
 
     @app.get("/_identity")
     async def identity(request: Request) -> OwnerIdentity:

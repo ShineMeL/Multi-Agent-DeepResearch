@@ -10,6 +10,7 @@ from deepresearch.storage import LocalArtifactStore
 
 from .error_handlers import install_error_handlers
 from .identity import OwnerSessionMiddleware, TrustedClientIpResolver
+from .routes_events import router as events_router
 from .routes_runs import router
 
 
@@ -35,6 +36,7 @@ def create_app(
         secure=deployment_policy.forced_access_profile == "public_live",
     )
     app.include_router(router)
+    app.include_router(events_router)
     return app
 
 
