@@ -1,69 +1,164 @@
-"""HTTP/SSE + durable SQLite + real Core, recording/replaying an offline model.
+"""HTTP/SSE + durable SQLite + real Core in strict replay execution mode.
 
-Search/fetch/parse/embed use deterministic test providers. This hybrid fixture
-is not a shipped replay-default bundle or a production research-v1 graph.
+Record deterministic test providers, then replay model/search/fetch/embed through
+Core replay adapters with the real HTML parser. Strict replay completion is an
+expected failure until the service builder binds Core's required replay_parent.
 """
 
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 
 from apps.api import create_app
+from deepresearch.domain import RunConfig
+from deepresearch.providers import ProviderUsageResult, RawDocument
 from deepresearch.providers.httpx_fetcher import no_op_host_slot
-from deepresearch.providers.recording import RecordingModelProvider, ReplayBundleWriter
+from deepresearch.providers.parsers import HtmlParser
+from deepresearch.providers.recording import (
+    RecordingFetcher,
+    RecordingModelProvider,
+    RecordingSearchProvider,
+    RecordingTextEmbedder,
+    ReplayBundleWriter,
+)
+from deepresearch.providers.replay import ReplayBundle
 from deepresearch.runtime.checkpointers import open_service_checkpointer
 from deepresearch.runtime.manifest import RunManifest
 from deepresearch.runtime.runner_factory import (
+    FilePricingCatalog,
     FileProviderRouteCatalog,
     ProviderConstructor,
     default_provider_constructors,
 )
 from deepresearch.storage.migrations.runner import upgrade_service_schema
 from deepresearch.storage.sqlalchemy_store import SqlAlchemyRunStore
+from tests.integration.replay.test_baseline_graph import CountingOfflineFetcher
 from tests.integration.replay.test_manager_replay import (
     setup,  # pyright: ignore[reportUnknownVariableType] - existing untyped fixture
 )
-from tests.unit.runtime.test_runner_factory_execution import freeze
+from tests.unit.runtime.test_runner_factory_execution import freeze, pricing, route
 
 
-async def test_full_service_model_replay_has_artifacts_terminal_event_and_owned_reconnect(
+class HtmlOfflineFetcher(CountingOfflineFetcher):
+    """Supply actual HTML so the production parser is used in both phases."""
+
+    async def fetch_with_usage(
+        self, url: str, **kwargs: object
+    ) -> ProviderUsageResult[RawDocument]:
+        result = await super().fetch_with_usage(url, **kwargs)
+        html = (
+            "<html><head><title>Offline evidence</title></head><body><article><p>"
+            "Offline research evidence supports a reproducible baseline workflow. "
+            "The fixed planner selects sources, extracts their supporting evidence, "
+            "and writes a report with citations. This frozen article supplies enough "
+            "main text to exercise the production HTML parser while keeping the example "
+            f"independent of external websites. Source: {url}</p></article></body></html>"
+        )
+        return ProviderUsageResult(
+            value=result.value.model_copy(update={"body_bytes": html.encode()}),
+            usage=result.usage,
+        )
+
+
+class MissingReplayParent(RuntimeError):
+    """Only the diagnosed replay composition gap may satisfy the strict xfail."""
+
+
+@pytest.mark.parametrize(
+    "strict_replay",
+    [
+        pytest.param(False, id="offline-recording"),
+        pytest.param(
+            True,
+            id="strict-replay",
+            marks=pytest.mark.xfail(
+                strict=True,
+                raises=MissingReplayParent,
+                reason="service builder sets replay_parent=None; Core requires it in replay mode",
+            ),
+        ),
+    ],
+)
+async def test_full_service_has_artifacts_terminal_event_and_owned_reconnect(
     tmp_path: Path,
+    strict_replay: bool,
 ):
     writer = ReplayBundleWriter.create(tmp_path / "bundle", run_id="service-recording")
-    for replaying in (False, True):
+    for replaying in (False, True) if strict_replay else (False,):
         root = tmp_path / str(replaying)
         manager, conf, calls, artifacts, _ = setup(root)
         factory: Any = manager.runner_factory
         builder = factory.builder
         routes = factory.route_catalog.resolve("offline")
-        model_route = next(item for item in routes.routes if item.operation == "model")
+        parser = HtmlParser()
+        fetcher = HtmlOfflineFetcher(calls)
+        rows = [item.model_dump(mode="json") for item in routes.routes if item.operation != "parse"]
+        rows.append(route("parse", parser))
+        parser_constructor: ProviderConstructor = lambda route, secret, slot, provider=parser: (
+            provider
+        )
+        fetch_constructor: ProviderConstructor = lambda route, secret, slot, provider=fetcher: (
+            provider
+        )
+        builder.provider_constructors[parser.parser_id] = parser_constructor
+        builder.provider_constructors[fetcher.provider_id] = fetch_constructor
+        snapshots = tuple(
+            pricing(
+                row["provider_id"],
+                endpoint,
+                row["model_id"] or row["operation"],
+                "1" if row["operation"] == "model" else "0",
+            )
+            for row in rows
+            for endpoint in (
+                ("complete", "structured") if row["operation"] == "model" else (row["operation"],)
+            )
+        )
+        manager.pricing_catalog = FilePricingCatalog({"offline": snapshots})
         if replaying:
-            rows = [item.model_dump(mode="json") for item in routes.routes]
+            conf = conf.model_copy(
+                update={"request": conf.request.model_copy(update={"execution_mode": "replay"})}
+            )
+            manager.deployment_policy = replace(
+                manager.deployment_policy, allowed_execution_modes=frozenset({"replay"})
+            )
             for row in rows:
-                if row["operation"] == "model":
+                if row["operation"] != "parse":
                     row["parameters"] = {"bundle_path": str(tmp_path / "bundle")}
-            factory.route_catalog = FileProviderRouteCatalog({"offline": freeze(conf, rows)})
-            builder.provider_constructors[model_route.provider_id] = (
-                default_provider_constructors()["replay"]
-            )
+                    builder.provider_constructors[row["provider_id"]] = (
+                        default_provider_constructors()["replay"]
+                    )
         else:
-            delegate = builder.provider_constructors[model_route.provider_id](
-                model_route, None, no_op_host_slot
-            )
-            writer.register_provider(
-                "model",
-                provider_id=model_route.provider_id,
-                model_id=model_route.model_id,
-                model_revision=model_route.model_revision,
-            )
-            recorded = RecordingModelProvider(delegate, writer)
-            constructor: ProviderConstructor = lambda route, secret, slot, provider=recorded: (
-                provider
-            )
-            builder.provider_constructors[model_route.provider_id] = constructor
+            wrappers: dict[str, Any] = {
+                "model": RecordingModelProvider,
+                "search": RecordingSearchProvider,
+                "fetch": RecordingFetcher,
+                "embed": RecordingTextEmbedder,
+            }
+            for frozen_route in routes.routes:
+                if frozen_route.operation == "parse":
+                    continue
+                delegate = builder.provider_constructors[frozen_route.provider_id](
+                    frozen_route, None, no_op_host_slot
+                )
+                if frozen_route.operation == "model":
+                    writer.register_provider(
+                        "model",
+                        provider_id=frozen_route.provider_id,
+                        model_id=frozen_route.model_id,
+                        model_revision=frozen_route.model_revision,
+                    )
+                recorded = wrappers[frozen_route.operation](delegate, writer)
+                constructor: ProviderConstructor = lambda route, secret, slot, provider=recorded: (
+                    provider
+                )
+                builder.provider_constructors[frozen_route.provider_id] = constructor
+        factory.route_catalog = FileProviderRouteCatalog({"offline": freeze(conf, rows)})
         store = SqlAlchemyRunStore(f"sqlite+aiosqlite:///{root / 'runs.sqlite'}", root)
         await upgrade_service_schema(store.engine)
         manager.store = store
@@ -79,13 +174,15 @@ async def test_full_service_model_replay_has_artifacts_terminal_event_and_owned_
                     artifact_store=artifacts,
                     session_secret=b"s" * 32,
                 )
-                body = {
+                body: dict[str, Any] = {
                     "request": conf.request.model_dump(mode="json"),
                     "workflow_id": "baseline-v1",
                     "planner_id": "P1",
                     "ranker_id": "R1",
                     "seed": 0,
                 }
+                if replaying:
+                    assert body["request"]["execution_mode"] == "replay"
                 async with httpx.AsyncClient(
                     transport=httpx.ASGITransport(app=app), base_url="https://testserver"
                 ) as client:
@@ -100,6 +197,36 @@ async def test_full_service_model_replay_has_artifacts_terminal_event_and_owned_
                     )
                     assert repeated.json()["run_id"] == run_id
                     final = await client.get(f"/runs/{run_id}")
+                    if replaying and final.json()["status"] == "failed":
+                        # Do not hide unrelated assertion failures under the xfail.
+                        assert final.json()["error_code"] == "INVALID_WORKFLOW_CONFIG"
+                        failed_record = await store.get_run(run_id)
+                        assert failed_record is not None and failed_record.status == "failed"
+                        assert (
+                            RunConfig.model_validate(
+                                failed_record.config_json
+                            ).request.execution_mode
+                            == "replay"
+                        )
+                        failed_artifact = await client.get(f"/runs/{run_id}/artifacts/manifest")
+                        assert failed_artifact.status_code == 200
+                        failed_manifest = RunManifest.model_validate_json(failed_artifact.content)
+                        assert failed_manifest.provider_profiles[0].execution_mode == "replay"
+                        assert failed_manifest.replay_parent is None
+                        assert failed_manifest.failure_codes == ("INVALID_WORKFLOW_CONFIG",)
+                        assert failed_manifest.provider_calls == ()
+                        assert not calls
+                        failed_events = await store.list_events_after(run_id, 0)
+                        assert failed_events[-1].kind == "run_failed"
+                        assert failed_events[-1].error_code == "INVALID_WORKFLOW_CONFIG"
+                        assert any(
+                            event.node == "ValidateRequest"
+                            and event.error_code == "INVALID_WORKFLOW_CONFIG"
+                            for event in failed_events
+                        )
+                        raise MissingReplayParent(
+                            "strict replay accepted/persisted, but replay_parent=None rejects Core validation"
+                        )
                     assert final.json()["status"] == "completed", final.text
                     for kind in ("report", "evidence", "manifest"):
                         artifact = await client.get(f"/runs/{run_id}/artifacts/{kind}")
@@ -108,8 +235,13 @@ async def test_full_service_model_replay_has_artifacts_terminal_event_and_owned_
                             manifest = RunManifest.model_validate_json(artifact.content)
                             assert manifest.pricing_snapshots
                             assert manifest.pricing_status == "estimated"
+                            if replaying:
+                                assert manifest.provider_profiles[0].execution_mode == "replay"
                             record = await store.get_run(run_id)
                             assert record is not None
+                            assert RunConfig.model_validate(
+                                record.config_json
+                            ).request.execution_mode == ("replay" if replaying else "live")
                             assert manifest.pricing_snapshots == record.pricing_snapshots
                             assert (
                                 manifest.provider_profiles[0].configuration_sha256
@@ -168,5 +300,6 @@ async def test_full_service_model_replay_has_artifacts_terminal_event_and_owned_
             await store.engine.dispose()
         if not replaying:
             await writer.finalize()
+            assert ReplayBundle.load(tmp_path / "bundle").verify().valid
         else:
-            assert not any(key.startswith("model:") for key in calls)
+            assert not calls

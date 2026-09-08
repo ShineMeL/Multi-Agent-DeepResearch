@@ -4,13 +4,45 @@ The API and Streamlit client can start with SQLite or the supplied Compose
 Postgres deployment. A healthy server is not proof of a runnable research demo:
 the default `replay-default` profile has **empty routes and no bundled recording**.
 Configure a complete server-side route catalog and matching verified replay
-bundle before submitting work. Arbitrary questions cannot replay recordings for
+bundle before submitting work. These inputs are necessary but currently
+insufficient for strict replay completion: `DefaultCoreRunnerBuilder` supplies
+`replay_parent=None`, while Core requires a nonempty parent audit identity for
+replay/hybrid runs. A correctly configured strict replay request can return HTTP
+202 and persist its run, then fail at `ValidateRequest` with
+`INVALID_WORKFLOW_CONFIG` before any provider invocation. The service builder
+needs an explicit, validated recorded-parent binding before Showcase replay can
+complete; there is no environment variable or catalog parameter that fills this
+gap today. Arbitrary questions cannot replay recordings for
 different inputs. There is no automatic live fallback on `REPLAY_MISS`.
 
 The implemented production composition supports `baseline-v1` with `P1` / `R1`.
 Explicitly choose these in API requests and the UI. The API's default
 `research-v1` remains unavailable (`RESEARCH_GRAPH_UNAVAILABLE`); this runbook
 does not claim that graph or an out-of-box Showcase bundle exists.
+
+## PowerShell preparation
+
+The commands below support Windows PowerShell 5.1 and PowerShell 7. Define this
+helper once in the terminal before either startup sequence. It uses the instance
+RNG API available in .NET Framework; each call returns 32 random bytes encoded
+as Base64. Assign its result as shown below to keep it out of terminal output.
+
+```powershell
+function New-DeploymentSecret {
+    $secretBytes = New-Object byte[] 32
+    $secretRng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $secretRng.GetBytes($secretBytes)
+        return [Convert]::ToBase64String($secretBytes)
+    }
+    finally {
+        $secretRng.Dispose()
+    }
+}
+```
+
+Assign the function result to an environment variable as shown below; invoking
+the function without assignment would print its result.
 
 ## Local SQLite
 
@@ -19,7 +51,7 @@ commands create local state under `artifacts` and `deepresearch.db`:
 
 ```powershell
 uv sync --all-extras --locked
-$env:SESSION_SIGNING_KEY = [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
+$env:SESSION_SIGNING_KEY = New-DeploymentSecret
 $env:LANGGRAPH_STRICT_MSGPACK = 'true'
 $env:DATABASE_URL = 'sqlite+aiosqlite:///./deepresearch.db'
 $env:ARTIFACT_ROOT = './artifacts'
@@ -56,8 +88,8 @@ Docker Engine and the Compose plugin must be installed and running. Supply the
 raw database password separately from the URI-encoded connection URL:
 
 ```powershell
-$env:POSTGRES_PASSWORD = [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
-$env:SESSION_SIGNING_KEY = [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
+$env:POSTGRES_PASSWORD = New-DeploymentSecret
+$env:SESSION_SIGNING_KEY = New-DeploymentSecret
 $encodedPassword = [uri]::EscapeDataString($env:POSTGRES_PASSWORD)
 $env:DATABASE_URL = "postgresql+asyncpg://deepresearch:${encodedPassword}@postgres:5432/deepresearch"
 docker compose config --quiet
@@ -208,11 +240,17 @@ docker build -t multi-agent-deep-research .
 
 Compose validation requires the three disposable local environment values shown
 above; CI supplies clearly labeled CI-only values and requires no provider
-secrets. The service e2e test records and replays a deterministic model through
-the real HTTP/SSE, SQLite and Core pipeline, with offline search/fetch/parse/embed
-test providers. It verifies artifact downloads, owner isolation, idempotency,
-event reconnection and reopening persisted rows. It is a hybrid test fixture,
-not proof of a configured production Showcase bundle. Existing contract tests
+secrets. The passing service e2e records deterministic offline model, search,
+fetch and embedding providers through the real HTTP/SSE, SQLite and Core
+pipeline with the production HTML parser. It verifies artifact downloads, owner
+isolation, idempotency, event reconnection and reopening persisted rows.
+A separate strict-replay case submits `execution_mode="replay"`, constructs all
+four Core replay adapters from that verified recording, and asserts HTTP 202,
+persisted replay mode and the exact missing-parent validation failure described
+above. It is marked strict xfail for that specific failure only: any other
+failure remains red, and successful replay completion becomes XPASS/failure so
+the marker must be removed when parent binding is implemented. Neither case
+proves an available production Showcase bundle. Existing contract tests
 cover health failure, policy, SSRF, redaction and unavailable graph/resume paths.
 
 Windows checkouts can rewrite hash-addressed fixture bytes to CRLF. A
