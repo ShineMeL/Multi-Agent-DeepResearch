@@ -8,6 +8,7 @@ import secrets
 from dataclasses import dataclass
 from ipaddress import IPv4Address, IPv4Network, IPv6Address, IPv6Network, ip_address
 
+from pydantic import SecretStr
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -108,10 +109,12 @@ class OwnerSessionMiddleware:
         self,
         app: ASGIApp,
         *,
-        session_secret: bytes,
+        session_secret: bytes | SecretStr,
         ip_resolver: TrustedClientIpResolver,
         secure: bool = False,
     ) -> None:
+        if isinstance(session_secret, SecretStr):
+            session_secret = session_secret.get_secret_value().encode("utf-8")
         if len(session_secret) < 32:
             raise ValueError("session secret must contain at least 32 bytes")
         self.app = app

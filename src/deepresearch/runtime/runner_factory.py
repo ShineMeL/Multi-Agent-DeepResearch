@@ -236,7 +236,10 @@ class FileProviderRouteCatalog:
     @classmethod
     def load(cls, path: Path | None) -> FileProviderRouteCatalog:
         raw_profiles: dict[str, Any] = (
-            {"replay": {"execution_mode": "replay", "routes": []}}
+            {
+                name: {"execution_mode": "replay", "routes": []}
+                for name in ("replay", "replay-default")
+            }
             if path is None
             else _profiles(path)
         )
