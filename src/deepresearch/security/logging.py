@@ -3,6 +3,7 @@
 import logging
 from collections.abc import Collection
 from copy import copy
+from typing import cast
 
 from .redaction import redact
 
@@ -14,9 +15,18 @@ class RedactingFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> logging.LogRecord:
         safe = copy(record)
-        # Render first: preserves numeric/mapping %-formatting and covers
-        # arbitrary objects in msg/args without retaining their credentials.
-        safe.msg = str(redact(record.getMessage(), secrets=self._secrets))
+        # Preserve structured sensitive keys until recursive redaction has
+        # inspected them. Retain the outer %-format argument tuple/mapping.
+        # String templates must retain their placeholders until interpolation.
+        safe.msg = (
+            record.msg if isinstance(record.msg, str) else redact(record.msg, secrets=self._secrets)
+        )
+        if isinstance(record.args, tuple):
+            safe.args = tuple(redact(arg, secrets=self._secrets) for arg in record.args)
+        elif record.args:
+            safe.args = cast(dict[str, object], redact(record.args, secrets=self._secrets))
+        # The second pass covers object representations and interpolated text.
+        safe.msg = str(redact(safe.getMessage(), secrets=self._secrets))
         safe.args = ()
         safe.message = safe.msg
         exception = (

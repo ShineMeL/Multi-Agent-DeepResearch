@@ -9,6 +9,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from langgraph.checkpoint.memory import InMemorySaver
@@ -87,6 +88,122 @@ def test_logging_filter_copies_record_and_redacts_exception_chain_and_cached_tex
     assert SECRET not in output.getvalue()
 
 
+@pytest.mark.parametrize("mapping", [False, True])
+def test_logging_redacts_structured_arguments_without_loaded_secrets(mapping):
+    headers = {"x-api-key": "review-api-credential", "Authorization": "Basic review-basic"}
+    record = logging.LogRecord(
+        "security",
+        logging.INFO,
+        __file__,
+        1,
+        "headers=%(headers)s count=%(count)d" if mapping else "headers=%s count=%d",
+        ({"headers": headers, "count": 2},) if mapping else (headers, 2),
+        None,
+    )
+    output = io.StringIO()
+    handler = logging.StreamHandler(output)
+    handler.addFilter(RedactingFilter(secrets=()))
+    handler.handle(record)
+    assert "review-api-credential" not in output.getvalue()
+    assert "review-basic" not in output.getvalue()
+    assert "count=2" in output.getvalue()
+    assert headers["x-api-key"] == "review-api-credential"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "headers={'x-api-key': 'review-api-credential'}",
+        '{"api_key": "review-api-credential"}',
+        "{'Authorization': 'Basic review-api-credential'}",
+        "Authorization: Basic review-api-credential",
+    ],
+)
+def test_quoted_credentials_are_redacted_in_message_and_exception_text(text):
+    try:
+        raise RuntimeError(text)
+    except RuntimeError:
+        record = logging.LogRecord("security", logging.ERROR, __file__, 1, text, (), sys.exc_info())
+    safe = RedactingFilter(secrets=()).filter(record)
+    assert "review-api-credential" not in logging.Formatter().format(safe)
+
+
+def test_credential_assignment_format_placeholder_remains_valid():
+    record = logging.LogRecord(
+        "security",
+        logging.INFO,
+        __file__,
+        1,
+        "api_key=%s count=%d",
+        ("review-api-credential", 3),
+        None,
+    )
+    safe = RedactingFilter(secrets=()).filter(record)
+    assert safe.getMessage() == "api_key=[REDACTED] count=3"
+
+
+def test_url_userinfo_and_fragment_credentials_are_redacted():
+    url = "https://user:review-password@public.example/file#access_token=review-token&q=visible"
+    safe = redact(url, secrets=())
+    assert "review-password" not in safe and "review-token" not in safe
+    assert "public.example/file" in safe and "q=visible" in safe
+    assert redact(safe, secrets=()) == safe
+
+
+@pytest.mark.parametrize(
+    "parameter",
+    [
+        "X-Amz-Signature",
+        "x-amz-signature",
+        "X-Amz-Credential",
+        "X-Amz-Security-Token",
+        "X-Goog-Signature",
+        "X-Goog-Credential",
+        "AWSAccessKeyId",
+        "Signature",
+        "sig",
+        "access_token",
+        "api_key",
+        "%58-Amz-Signature",
+    ],
+)
+def test_signed_url_credentials_redacted_without_changing_core_url_policy(parameter):
+    from deepresearch.retrieval import canonicalize_url
+
+    url = f"https://public.example/file?q=visible&{parameter}=review-signature&z=last"
+    canonical = canonicalize_url(url)
+    assert "review-signature" in canonical
+    safe = redact({"url": url}, secrets=())["url"]
+    assert "review-signature" not in safe
+    assert "q=visible" in safe and "z=last" in safe
+    assert redact(safe, secrets=()) == safe
+    event = make_event(1).model_copy(update={"public_payload": {"url": url}})
+    assert "review-signature" not in encode_sse(event)
+    assert event.public_payload["url"] == url
+
+
+def test_httpx_request_log_redacts_signed_url_without_network():
+    output = io.StringIO()
+    handler = logging.StreamHandler(output)
+    handler.addFilter(RedactingFilter(secrets=()))
+    logger = logging.getLogger("httpx")
+    previous_level = logger.level
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    url = "https://public.example/file?X-Amz-Signature=review-signature"
+    try:
+        with httpx.Client(
+            transport=httpx.MockTransport(lambda request: httpx.Response(200))
+        ) as client:
+            response = client.get(url)
+        assert str(response.request.url) == url
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+    assert "HTTP Request: GET" in output.getvalue()
+    assert "review-signature" not in output.getvalue()
+
+
 @pytest.fixture
 async def secured(tmp_path):
     conf = config()
@@ -137,6 +254,17 @@ async def test_emit_redacts_before_sqlite_and_sse_preserving_original_and_sequen
     ]
     assert [frame["id"] for frame in frames] == ["1", "2", "3"]
     assert SECRET not in json.dumps(frames)
+
+
+async def test_signed_url_redacted_before_durable_store_without_loaded_signature(secured):
+    manager, store = secured
+    url = "https://public.example/file?X-Amz-Signature=review-signature&q=visible"
+    event = make_event(1).model_copy(update={"public_payload": {"url": url}})
+    await manager.emit(event)
+    durable = await store.list_events_after("r1", 0)
+    assert "review-signature" not in durable[0].model_dump_json()
+    assert "q=visible" in durable[0].public_payload["url"]
+    assert event.public_payload["url"] == url
 
 
 async def test_public_errors_do_not_echo_secret_exception_or_optional_run_id(secured):
