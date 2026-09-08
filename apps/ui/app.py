@@ -259,8 +259,9 @@ def main() -> None:
         "Production research-v1 is unavailable. This showcase submits baseline-v1 replay runs."
     )
     st.info(
-        "A complete replay profile and matching bundle must be configured on the API server. "
-        "The default replay-default catalog entry is empty. Replay inputs must match the bundle."
+        "A complete replay profile and matching verified bundle must be configured on the API "
+        "server. The default replay-default catalog entry is empty; replay inputs must match "
+        "the bundle exactly."
     )
     if "showcase" not in st.session_state or st.session_state["showcase"].closed:
         st.session_state["showcase"] = _session_resource(
@@ -273,7 +274,9 @@ def main() -> None:
         question = st.text_area("Question recorded in the replay bundle", key="question")
         language = st.selectbox("Report language", ["en", "zh"])
         source_language = st.selectbox("Source language", ["en", "zh"])
-        budget = st.selectbox("Budget", ["low", "medium"])
+        # The shipped baseline bundle was recorded with the medium planner
+        # budget, so the out-of-box replay form must select that identity.
+        budget = st.selectbox("Budget", ["low", "medium"], index=1)
         profile = st.text_input(
             "API replay profile",
             value=os.environ.get("DEEPRESEARCH_REPLAY_PROFILE_ID", "replay-default"),

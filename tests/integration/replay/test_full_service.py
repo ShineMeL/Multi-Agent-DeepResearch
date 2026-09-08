@@ -1,8 +1,8 @@
 """HTTP/SSE + durable SQLite + real Core in strict replay execution mode.
 
 Record deterministic test providers, then replay model/search/fetch/embed through
-Core replay adapters with the real HTML parser. Strict replay completion is an
-expected failure until the service builder binds Core's required replay_parent.
+Core replay adapters with the real HTML parser. Strict replay is covered against
+the shipped baseline bundle in a separate service-level test below.
 """
 
 import asyncio
@@ -73,23 +73,10 @@ class HtmlOfflineFetcher(CountingOfflineFetcher):
         )
 
 
-class MissingReplayParent(RuntimeError):
-    """Only the diagnosed replay composition gap may satisfy the strict xfail."""
-
-
 @pytest.mark.parametrize(
     "strict_replay",
     [
         pytest.param(False, id="offline-recording"),
-        pytest.param(
-            True,
-            id="strict-replay",
-            marks=pytest.mark.xfail(
-                strict=True,
-                raises=MissingReplayParent,
-                reason="service builder sets replay_parent=None; Core requires it in replay mode",
-            ),
-        ),
     ],
 )
 async def test_full_service_has_artifacts_terminal_event_and_owned_reconnect(
@@ -268,36 +255,6 @@ async def test_full_service_has_artifacts_terminal_event_and_owned_reconnect(
                     )
                     assert repeated.json()["run_id"] == run_id
                     final = await client.get(f"/runs/{run_id}")
-                    if replaying and final.json()["status"] == "failed":
-                        # Do not hide unrelated assertion failures under the xfail.
-                        assert final.json()["error_code"] == "INVALID_WORKFLOW_CONFIG"
-                        failed_record = await store.get_run(run_id)
-                        assert failed_record is not None and failed_record.status == "failed"
-                        assert (
-                            RunConfig.model_validate(
-                                failed_record.config_json
-                            ).request.execution_mode
-                            == "replay"
-                        )
-                        failed_artifact = await client.get(f"/runs/{run_id}/artifacts/manifest")
-                        assert failed_artifact.status_code == 200
-                        failed_manifest = RunManifest.model_validate_json(failed_artifact.content)
-                        assert failed_manifest.provider_profiles[0].execution_mode == "replay"
-                        assert failed_manifest.replay_parent is None
-                        assert failed_manifest.failure_codes == ("INVALID_WORKFLOW_CONFIG",)
-                        assert failed_manifest.provider_calls == ()
-                        assert not calls
-                        failed_events = await store.list_events_after(run_id, 0)
-                        assert failed_events[-1].kind == "run_failed"
-                        assert failed_events[-1].error_code == "INVALID_WORKFLOW_CONFIG"
-                        assert any(
-                            event.node == "ValidateRequest"
-                            and event.error_code == "INVALID_WORKFLOW_CONFIG"
-                            for event in failed_events
-                        )
-                        raise MissingReplayParent(
-                            "strict replay accepted/persisted, but replay_parent=None rejects Core validation"
-                        )
                     assert final.json()["status"] == "completed", final.text
                     for kind in ("report", "evidence", "manifest"):
                         artifact = await client.get(f"/runs/{run_id}/artifacts/{kind}")
@@ -374,3 +331,133 @@ async def test_full_service_has_artifacts_terminal_event_and_owned_reconnect(
             assert ReplayBundle.load(tmp_path / "bundle").verify().valid
         else:
             assert not calls
+
+
+async def test_full_service_strict_replay_completes_against_verified_baseline_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    source = Path("tests/fixtures/replay/baseline").resolve()
+    bundle_root = tmp_path / "bundle"
+    bundle_root.mkdir()
+    for item in source.iterdir():
+        if item.is_file():
+            (bundle_root / item.name).write_bytes(item.read_bytes().replace(b"\r\n", b"\n"))
+    bundle = ReplayBundle.load(bundle_root)
+    verification = bundle.verify()
+    assert verification.valid
+    snapshot = json.loads((bundle_root / "snapshot.json").read_text(encoding="utf-8"))
+
+    rows: list[dict[str, Any]] = []
+    for operation in ("model", "search", "fetch", "embed"):
+        provider = snapshot["providers"][operation]
+        rows.append(
+            {
+                "operation": operation,
+                "provider_id": provider["provider_id"],
+                "endpoint_type": "chat.completions" if operation == "model" else operation,
+                "model_id": provider["model_id"],
+                "model_revision": provider["model_revision"],
+                "base_url": None,
+                "credential_ref": None,
+                "fallback_rank": 0,
+                "parameters": {"bundle_path": str(bundle_root)},
+            }
+        )
+    rows.append(
+        {
+            "operation": "parse",
+            "provider_id": "baseline-parser-router",
+            "endpoint_type": "parse",
+            "model_id": None,
+            "model_revision": None,
+            "base_url": None,
+            "credential_ref": None,
+            "fallback_rank": 0,
+            "parameters": {},
+        }
+    )
+    profiles_path = tmp_path / "profiles.json"
+    profiles_path.write_text(
+        json.dumps({"profiles": {"offline": {"execution_mode": "replay", "routes": rows}}}),
+        encoding="utf-8",
+    )
+    pricing_rows = [
+        pricing(
+            row["provider_id"],
+            endpoint,
+            row["model_id"] or row["operation"],
+            "0",
+        ).model_dump(mode="json")
+        for row in rows
+        for endpoint in (
+            ("complete", "structured") if row["operation"] == "model" else (row["operation"],)
+        )
+    ]
+    pricing_path = tmp_path / "pricing.json"
+    pricing_path.write_text(
+        json.dumps({"profiles": {"offline": pricing_rows}}),
+        encoding="utf-8",
+    )
+
+    def runtime_clock() -> BaselineRuntimeHooks:
+        clock = ControlledSegmentClock(monotonic_start=time.monotonic(), utc_offset_seconds=0)
+        return BaselineRuntimeHooks(monotonic=clock.monotonic, utc_now=clock.utc_now)
+
+    monkeypatch.setattr("deepresearch.runtime.runner_factory.paired_runtime_hooks", runtime_clock)
+
+    settings = ServiceSettings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'runs.sqlite'}",
+        artifact_root=tmp_path,
+        checkpoint_sqlite_path=tmp_path / "checkpoints.sqlite",
+        provider_profile_catalog_path=profiles_path,
+        pricing_catalog_path=pricing_path,
+        deployment_access_profile="local",
+        allowed_execution_modes=("replay",),
+        allowed_provider_profile_ids=("offline",),
+        allowed_run_purposes=("demo",),
+        allowed_budget_presets=("medium",),
+        session_signing_key=SecretStr("s" * 32),
+        langgraph_strict_msgpack=True,
+    )
+    app = create_hosted_app(settings)
+    async with app.router.lifespan_context(app):
+        body = {
+            "request": {
+                "question": "Compare planner strategies",
+                "output_requirements": {"answer_shape": "markdown"},
+                "report_language": "en",
+                "source_languages": ["en"],
+                "freshness_requirement": {"kind": "none"},
+                "execution_mode": "replay",
+                "access_profile": "showcase",
+                "provider_profile_id": "offline",
+                "run_purpose": "demo",
+                "budget_preset": "medium",
+            },
+            "workflow_id": "baseline-v1",
+            "planner_id": "P1",
+            "ranker_id": "R1",
+            "seed": 0,
+        }
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="https://testserver"
+        ) as client:
+            accepted = await client.post(
+                "/runs", json=body, headers={"Idempotency-Key": "strict-replay-1"}
+            )
+            assert accepted.status_code == 202, accepted.text
+            run_id = accepted.json()["run_id"]
+            await asyncio.wait_for(app.state.manager.wait(run_id), 30)
+            final = await client.get(f"/runs/{run_id}")
+            assert final.status_code == 200
+            assert final.json()["status"] == "completed", final.text
+            manifest_response = await client.get(f"/runs/{run_id}/artifacts/manifest")
+            assert manifest_response.status_code == 200
+            manifest = RunManifest.model_validate_json(manifest_response.content)
+            assert manifest.replay_parent == snapshot["run_id"]
+            assert manifest.provider_profiles[0].execution_mode == "replay"
+            assert "baseline-parser-router" in manifest.provider_profiles[0].provider_ids
+            events_response = await client.get(f"/runs/{run_id}/events")
+            assert events_response.status_code == 200
+            assert "run_completed" in events_response.text

@@ -4,16 +4,12 @@ The API and Streamlit client can start with SQLite or the supplied Compose
 Postgres deployment. A healthy server is not proof of a runnable research demo:
 the default `replay-default` profile has **empty routes and no bundled recording**.
 Configure a complete server-side route catalog and matching verified replay
-bundle before submitting work. These inputs are necessary but currently
-insufficient for strict replay completion: `DefaultCoreRunnerBuilder` supplies
-`replay_parent=None`, while Core requires a nonempty parent audit identity for
-replay/hybrid runs. A correctly configured strict replay request can return HTTP
-202 and persist its run, then fail at `ValidateRequest` with
-`INVALID_WORKFLOW_CONFIG` before any provider invocation. The service builder
-needs an explicit, validated recorded-parent binding before Showcase replay can
-complete; there is no environment variable or catalog parameter that fills this
-gap today. Arbitrary questions cannot replay recordings for
-different inputs. There is no automatic live fallback on `REPLAY_MISS`.
+bundle before submitting work. Strict replay now derives Core's `replay_parent`
+from the verified bundle snapshot and uses the built-in parser router for mixed
+HTML/PDF recordings. The local-only replay composition preserves the shipped
+baseline request identity; live/public compositions retain the untrusted-content
+boundary. Arbitrary questions cannot replay recordings for different inputs, and
+there is no automatic live fallback on `REPLAY_MISS`.
 
 The implemented production composition supports `baseline-v1` with `P1` / `R1`.
 Explicitly choose these in API requests and the UI. The API's default
@@ -180,6 +176,24 @@ and add their container paths to the API environment. The supplied Compose
 file does not mount catalogs or replay bundles for you. Use paths within the
 container, not host paths embedded in route parameters.
 
+### Optional Kimi model route
+
+Kimi exposes an OpenAI-compatible chat-completions API. For a live baseline
+profile, use the `openai-compatible` model route with a server-side
+`credential_ref` of `MODEL_API_KEY`; select the endpoint for the account's
+region (for example, `https://api.moonshot.cn/v1` for a CN account) and set the
+model ID to one enabled for that account, such as `kimi-k3`. Keep the key out of
+the catalog and inject it only as `MODEL_API_KEY`. The profile still needs a
+separately configured search route (currently Tavily) and all required pricing
+snapshots before a public/live run is admitted.
+
+Kimi's official built-in `$web_search` tool is a different tool-call protocol;
+this service does not treat it as a `SearchProvider` or silently convert its
+encrypted tool output into evidence. Wire it through a dedicated provider
+adapter and tests before enabling it in a live catalog. See the [Kimi API
+overview](https://platform.kimi.ai/docs/api/overview) and [official web-search
+guide](https://platform.kimi.ai/docs/guide/use-web-search).
+
 Admission freezes non-secret routes and their canonical configuration SHA-256,
 plus pricing snapshots, into durable run state and audit data. No client can
 override these server-selected routes. Public live and formal benchmark runs
@@ -282,19 +296,16 @@ fetch and embedding providers through the real HTTP/SSE, SQLite and Core
 pipeline with the production HTML parser. It verifies artifact downloads, owner
 isolation, idempotency, event reconnection and reopening persisted rows.
 A separate strict-replay case starts the production `main.create_app` lifespan
-with on-disk route/pricing catalogs, submits `execution_mode="replay"`, constructs
-all four Core replay adapters through the shipped registry, and asserts HTTP 202,
-persisted replay mode and the exact missing-parent validation failure described
-above. It is marked strict xfail for that specific failure only: any other
-failure remains red, and successful replay completion becomes XPASS/failure so
-the marker must be removed when parent binding is implemented. Neither case
-proves an available production Showcase bundle. Existing contract tests
+with on-disk route/pricing catalogs and a verified LF copy of the shipped baseline
+bundle, submits `execution_mode="replay"`, constructs the replay adapters and
+parser router through the shipped registry, and asserts HTTP 202, durable
+completion, the recorded parent identity, artifacts, and event replay. Neither
+case claims that arbitrary questions can use that bundle. Existing contract tests
 cover health failure, policy, SSRF, redaction and unavailable graph/resume paths.
 The e2e uses Core's existing deterministic clock fixture. With independent real
 UTC and monotonic clocks, Core can reject a manifest with `active wall time
 exceeds the run envelope`, producing `PERSIST_RESULTS_FAILED`; this pre-existing
-Core precision issue remains outside the service changes and is not covered by
-the missing-parent xfail.
+Core precision issue remains outside the service changes.
 
 Windows checkouts can rewrite hash-addressed fixture bytes to CRLF. A
 `REPLAY_CORRUPT`/hash mismatch in a frozen fixture must be investigated against

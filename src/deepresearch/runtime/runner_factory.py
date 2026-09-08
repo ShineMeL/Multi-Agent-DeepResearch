@@ -21,6 +21,7 @@ from deepresearch.providers import (
     Fetcher,
     ModelProvider,
     Parser,
+    ProviderError,
     SearchProvider,
     TextEmbedder,
     UsageReportingSearchProvider,
@@ -34,7 +35,11 @@ from deepresearch.runtime.provenance import resolve_build_provenance
 from deepresearch.security import redact, wrap_untrusted_content
 from deepresearch.storage import FileCache, LocalArtifactStore, LocalEvidenceStore
 from deepresearch.workflow.baseline_graph import BaselineNodeHandlers, build_baseline_graph
-from deepresearch.workflow.runner import LangGraphResearchRunner
+from deepresearch.workflow.runner import (
+    BaselineRuntimeHooks,
+    LangGraphResearchRunner,
+    paired_runtime_hooks,
+)
 
 _SECRET = re.compile(r"(?i)(authorization|api.?key|password|secret|bearer|cookie|access.?token)")
 _PARAMETERS = frozenset(
@@ -44,12 +49,63 @@ _PARAMETERS = frozenset(
         "snapshot_id",
     }
 )
+_RUNTIME_PROFILE_PLACEHOLDER = "runtime-profile-bound-v1"
 
 
 def _canonical(value: object) -> bytes:
     return json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
     ).encode("utf-8")
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON object member")
+        value[key] = item
+    return value
+
+
+def _reject_json_constant(value: str) -> object:
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+def _bind_runtime_profile_request(request: Any) -> Any:
+    """Remove the circular profile digest from fixed-planner replay identity.
+
+    The public ``provider_profile_id`` remains frozen in ``RunConfig`` and the
+    service manifest.  Only the planner model request uses a stable marker so
+    the request hash can be recorded before the profile digest is known.
+    """
+    if getattr(request, "prompt_version", None) != "fixed-planner-v1":
+        return request
+    messages_value: object = getattr(request, "messages", None)
+    if not isinstance(messages_value, tuple) or not messages_value:
+        return request
+    messages = cast("tuple[Any, ...]", messages_value)
+    last: Any = messages[-1]
+    content = getattr(last, "content", None)
+    if not isinstance(content, str):
+        return request
+    try:
+        payload_value = json.loads(
+            content,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (RecursionError, TypeError, ValueError, json.JSONDecodeError):
+        return request
+    if type(payload_value) is not dict or "provider_profile_id" not in payload_value:
+        return request
+    payload = cast("dict[str, object]", payload_value)
+    payload["provider_profile_id"] = _RUNTIME_PROFILE_PLACEHOLDER
+    message_copy = getattr(last, "model_copy", None)
+    request_copy = getattr(request, "model_copy", None)
+    if not callable(message_copy) or not callable(request_copy):
+        return request
+    bound_message = message_copy(update={"content": _canonical(payload).decode("utf-8")})
+    return request_copy(update={"messages": (*messages[:-1], bound_message)})
 
 
 class ProviderProfileDrift(RuntimeError):
@@ -323,6 +379,37 @@ class EnvCredentialResolver:
         return os.environ[credential_ref]
 
 
+class _ParserRouter:
+    """Select the first built-in parser supporting a document media type."""
+
+    parser_id = "baseline-parser-router"
+    parser_version = "baseline-parser-v1"
+
+    def __init__(self, parsers: tuple[Parser, ...]) -> None:
+        self._parsers = parsers
+
+    def supports(self, content_type: str) -> bool:
+        return any(parser.supports(content_type) for parser in self._parsers)
+
+    async def parse(self, raw_document: Any, **kwargs: Any) -> Any:
+        for parser in self._parsers:
+            if parser.supports(raw_document.content_type):
+                parsed = await parser.parse(raw_document, **kwargs)
+                return parsed.model_copy(
+                    update={
+                        "parser_id": self.parser_id,
+                        "parser_version": self.parser_version,
+                    }
+                )
+        raise ProviderError(
+            code="PARSE_UNSUPPORTED",
+            provider=self.parser_id,
+            operation="parse",
+            public_message="document media type is unsupported",
+            retryable=False,
+        )
+
+
 def default_provider_constructors() -> dict[str, ProviderConstructor]:
     from deepresearch.providers.embeddings import DeterministicHashTextEmbedder
     from deepresearch.providers.httpx_fetcher import HttpxFetcher
@@ -382,6 +469,14 @@ def default_provider_constructors() -> dict[str, ProviderConstructor]:
             raise ProviderProfileDrift()
         return TavilySearchProvider(api_key=SecretStr(secret), endpoint=str(route.base_url))
 
+    def parser_router(
+        route: FrozenProviderRoute, secret: str | None, slot: HostSlot
+    ) -> ProviderAdapter:
+        del slot
+        if route.operation != "parse" or secret is not None:
+            raise ProviderProfileDrift()
+        return _ParserRouter((HtmlParser(), PdfParser()))
+
     return {
         "replay": replay,
         "openai-compatible": model,
@@ -390,6 +485,7 @@ def default_provider_constructors() -> dict[str, ProviderConstructor]:
         "trafilatura-html": lambda route, secret, slot: HtmlParser(),
         "pdf": lambda route, secret, slot: PdfParser(),
         "pymupdf-pdf": lambda route, secret, slot: PdfParser(),
+        "baseline-parser-router": parser_router,
         "httpx-fetcher": lambda route, secret, slot: HttpxFetcher(
             transport=PinnedPeerTransport(), host_slot=slot
         ),
@@ -418,28 +514,35 @@ class CoreRunnerBuilder(Protocol):
 class _BoundModel:
     """Supply the frozen identity while keeping Core request/result types intact."""
 
-    def __init__(self, delegate: ModelProvider, route: FrozenProviderRoute) -> None:
+    def __init__(
+        self,
+        delegate: ModelProvider,
+        route: FrozenProviderRoute,
+        *,
+        bind_runtime_profile: bool = False,
+    ) -> None:
         if route.model_id is None or route.model_revision is None:
             raise ProviderProfileDrift()
         self.delegate = delegate
         self.provider_id = delegate.provider_id
         self.model_id = route.model_id
         self.model_revision = route.model_revision
+        self._bind_runtime_profile = bind_runtime_profile
+
+    def _request(self, request: Any) -> Any:
+        rebound = request.model_copy(update={"model_id": self.model_id})
+        if self._bind_runtime_profile:
+            return _bind_runtime_profile_request(rebound)
+        return rebound
 
     async def complete(self, request: Any, **kwargs: Any) -> Any:
-        return await self.delegate.complete(
-            request.model_copy(update={"model_id": self.model_id}), **kwargs
-        )
+        return await self.delegate.complete(self._request(request), **kwargs)
 
     async def structured(self, request: Any, output_schema: type[Any], **kwargs: Any) -> Any:
-        return await self.delegate.structured(
-            request.model_copy(update={"model_id": self.model_id}), output_schema, **kwargs
-        )
+        return await self.delegate.structured(self._request(request), output_schema, **kwargs)
 
     def stream(self, request: Any, **kwargs: Any) -> Any:
-        return self.delegate.stream(
-            request.model_copy(update={"model_id": self.model_id}), **kwargs
-        )
+        return self.delegate.stream(self._request(request), **kwargs)
 
 
 class _SlottedSearch:
@@ -577,6 +680,7 @@ class DefaultCoreRunnerBuilder:
         search_slot: SearchSlot = no_op_search_slot,
         host_slot: HostSlot = no_op_host_slot,
         secrets: Collection[str] = (),
+        runtime_hooks: BaselineRuntimeHooks | None = None,
     ) -> None:
         self.provider_constructors = dict(provider_constructors)
         self.credential_resolver = credential_resolver
@@ -586,6 +690,7 @@ class DefaultCoreRunnerBuilder:
         self.search_slot = search_slot
         self.host_slot = host_slot
         self._secrets = tuple(secrets)
+        self.runtime_hooks = runtime_hooks
 
     def required_pricing_keys(
         self, config: RunConfig, provider_routes: FrozenProviderRoutes
@@ -609,6 +714,33 @@ class DefaultCoreRunnerBuilder:
         routes = {route.operation: route for route in provider_routes.routes}
         if set(routes) != {"model", "search", "fetch", "parse", "embed"}:
             raise ProviderProfileDrift()
+        replay_parent: str | None = None
+        if provider_routes.execution_mode == "replay":
+            # Core requires the recorded run identity before ValidateRequest.  The
+            # identity is part of the verified bundle snapshot, never a client or
+            # catalog-supplied secret-bearing field.  Require one shared bundle for
+            # all replayed operations so the audit parent cannot be ambiguous.
+            bundle_paths: set[str] = set()
+            for operation, route in routes.items():
+                if operation == "parse":
+                    continue
+                path = route.parameters.get("bundle_path")
+                if not isinstance(path, str) or not path:
+                    raise ProviderProfileDrift()
+                bundle_paths.add(path)
+            if len(bundle_paths) != 1:
+                raise ProviderProfileDrift()
+            from deepresearch.providers.replay_schema import ReplayBundle
+
+            try:
+                bundle = ReplayBundle.load(Path(next(iter(bundle_paths))))
+                if not bundle.verify().valid:
+                    raise ProviderProfileDrift()
+                replay_parent = bundle.snapshot.run_id
+            except ProviderProfileDrift:
+                raise
+            except (OSError, TypeError, ValueError, ProviderError):
+                raise ProviderProfileDrift() from None
         # Only single routes are currently supported by the Core composition.
         # Reject an unsupported deployment policy before any adapter construction.
         constructor_keys = {
@@ -691,10 +823,15 @@ class DefaultCoreRunnerBuilder:
                         DeterministicHashTextEmbedder,
                         HtmlParser,
                         PdfParser,
+                        _ParserRouter,
                     ),
                 ):
                     raise ProviderProfileDrift()
-        model = _BoundModel(cast(ModelProvider, adapters["model"]), routes["model"])
+        model = _BoundModel(
+            cast(ModelProvider, adapters["model"]),
+            routes["model"],
+            bind_runtime_profile=provider_routes.execution_mode == "replay",
+        )
         planner = FixedPlanner(
             model=model,
             artifact_store=self.artifact_store,
@@ -736,11 +873,14 @@ class DefaultCoreRunnerBuilder:
             seed_supported=config.seed is not None,
             pricing_status="estimated" if pricing_snapshots else "unknown",
             pricing_snapshots=pricing_snapshots,
-            replay_parent=None,
+            replay_parent=replay_parent,
             writer_prompt_version=config.prompt_versions.get("writer", "baseline-writer-v1"),
         )
         baseline = build_baseline_graph(handlers.as_dependencies(checkpointer))
-        return LangGraphResearchRunner(baseline_graph=baseline)
+        return LangGraphResearchRunner(
+            baseline_graph=baseline,
+            runtime_hooks=self.runtime_hooks or paired_runtime_hooks(),
+        )
 
 
 class ServiceRunnerFactory(Protocol):

@@ -16,7 +16,9 @@ def replay_payload(
     *,
     report_language: str = "en",
     source_languages: tuple[str, ...] = ("en",),
-    budget_preset: Literal["low", "medium"] = "low",
+    # The shipped baseline fixture was recorded with the medium planner
+    # budget; replay request identity includes this field.
+    budget_preset: Literal["low", "medium"] = "medium",
     provider_profile_id: str = "replay-default",
     seed: int = 0,
 ) -> dict[str, object]:
@@ -24,7 +26,10 @@ def replay_payload(
         raise ValueError("Question and replay profile are required")
     request = ResearchRequest(
         question=question.strip(),
-        output_requirements={},
+        # Keep the Showcase request identity aligned with the shipped baseline
+        # recording.  Replay is exact by design; even this output-shape field is
+        # part of the planner request hash.
+        output_requirements={"answer_shape": "markdown"},
         report_language=report_language,
         source_languages=source_languages,
         freshness_requirement=FreshnessRequirement(kind="none"),

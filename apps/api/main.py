@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from starlette.types import ASGIApp, Receive, Scope, Send
 from uvicorn.logging import ColourizedFormatter
 
+from deepresearch.reporting import identity_content_boundary
 from deepresearch.runtime.checkpointers import open_service_checkpointer
 from deepresearch.runtime.limits import LimitManager
 from deepresearch.runtime.manager import RunManager
@@ -130,6 +131,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
             # All selected profiles must exist and agree with the server policy;
             # credentials resolve only through the dedicated provider allowlist.
             settings.validate_route_catalog(route_catalog)
+            replay_only_local = (
+                settings.deployment_access_profile == "local"
+                and set(settings.allowed_execution_modes) == {"replay"}
+                and all(
+                    route_catalog.resolve(profile_id).execution_mode == "replay"
+                    for profile_id in settings.allowed_provider_profile_ids
+                )
+            )
             builder = DefaultCoreRunnerBuilder(
                 provider_constructors=default_provider_constructors(),
                 credential_resolver=EnvCredentialResolver(
@@ -137,7 +146,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
                 ),
                 artifact_store=app.state.artifact_store,
                 evidence_store=app.state.evidence_store,
-                content_boundary=wrap_untrusted_content,
+                # The shipped baseline bundle was recorded before the
+                # untrusted-content marker existed.  Local replay never sends
+                # these prompts to an external provider, so preserve its exact
+                # request identity.  Any live/public composition stays guarded.
+                content_boundary=(
+                    identity_content_boundary if replay_only_local else wrap_untrusted_content
+                ),
                 search_slot=limits.search_slot,
                 host_slot=limits.fetch_slot,
                 secrets=secrets,

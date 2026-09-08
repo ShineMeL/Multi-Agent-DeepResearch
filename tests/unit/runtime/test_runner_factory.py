@@ -5,6 +5,37 @@ from pathlib import Path
 import pytest
 
 
+def test_paired_runtime_hooks_keep_manifest_wall_clock_ahead_of_monotonic(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Service runners must use one elapsed-time source for audit envelopes."""
+    import deepresearch.workflow.runner as runner_module
+
+    ticks = iter((100.0, 100.0, 100.0, 100.5, 100.5))
+    monkeypatch.setattr(runner_module.time, "monotonic", lambda: next(ticks))
+    hooks = runner_module.paired_runtime_hooks()
+
+    start = hooks.monotonic()
+    started_at = hooks.utc_now()
+    finish = hooks.monotonic()
+    finished_at = hooks.utc_now()
+
+    assert finish - start == 0.5
+    assert (finished_at - started_at).total_seconds() >= finish - start
+
+
+def test_paired_runtime_hooks_advance_equal_monotonic_samples(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import deepresearch.workflow.runner as runner_module
+
+    monkeypatch.setattr(runner_module.time, "monotonic", lambda: 100.0)
+    hooks = runner_module.paired_runtime_hooks()
+
+    first, second, third = hooks.utc_now(), hooks.utc_now(), hooks.utc_now()
+    assert first < second < third
+
+
 def test_tool_routes_have_nonempty_pricing_keys(tmp_path):
     from deepresearch.runtime.runner_factory import (
         DefaultCoreRunnerBuilder,
@@ -342,6 +373,67 @@ def test_concrete_builder_compiles_real_core_baseline_with_same_saver(tmp_path: 
     )
     assert isinstance(runner, LangGraphResearchRunner)
     assert runner._baseline_graph.checkpointer is saver
+    audit_composition = runner._baseline_graph._baseline_audit_composition
+    assert audit_composition.replay_parent == snapshot["run_id"]
+
+
+def test_replay_bound_model_stabilizes_runtime_profile_in_planner_request():
+    from decimal import Decimal
+    from types import SimpleNamespace
+
+    from deepresearch.providers import ModelMessage, ModelRequest
+    from deepresearch.runtime.runner_factory import FrozenProviderRoute, _BoundModel
+
+    route = FrozenProviderRoute(
+        operation="model",
+        provider_id="baseline-model",
+        endpoint_type="chat.completions",
+        model_id="baseline-model-v1",
+        model_revision="c" * 40,
+        base_url=None,
+        credential_ref=None,
+        fallback_rank=0,
+        parameters={"bundle_path": "bundle"},
+    )
+    request = ModelRequest(
+        model_id="baseline-model-v1",
+        messages=(
+            ModelMessage(
+                role="user",
+                content=(
+                    '{"access_profile":"local","provider_profile_id":"replay-default",'
+                    '"question":"Compare planner strategies"}'
+                ),
+            ),
+        ),
+        temperature=Decimal(0),
+        seed=0,
+        max_output_tokens=128,
+        prompt_version="fixed-planner-v1",
+        system_prompt_hash="a" * 64,
+        tool_schema_hash="b" * 64,
+        output_schema_hash="c" * 64,
+    )
+    delegate = SimpleNamespace(provider_id="baseline-model")
+
+    bound = _BoundModel(delegate, route, bind_runtime_profile=True)
+    rebound = bound._request(request)
+
+    payload = json.loads(rebound.messages[-1].content)
+    assert payload["provider_profile_id"] == "runtime-profile-bound-v1"
+    assert payload["access_profile"] == "local"
+
+
+def test_baseline_parser_router_accepts_html_and_pdf_documents():
+    from deepresearch.providers.parsers import HtmlParser, PdfParser
+    from deepresearch.runtime.runner_factory import _ParserRouter
+
+    parser = _ParserRouter((HtmlParser(), PdfParser()))
+
+    assert parser.parser_id == "baseline-parser-router"
+    assert parser.parser_version == "baseline-parser-v1"
+    assert parser.supports("text/html")
+    assert parser.supports("application/pdf")
 
 
 def test_default_catalog_is_strict_replay_and_credentials_are_allowlisted(monkeypatch):

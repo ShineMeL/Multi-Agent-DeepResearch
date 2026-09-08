@@ -32,7 +32,7 @@ async def test_service_executes_and_audits_without_git_executable(
         monkeypatch.setenv("DEEPRESEARCH_CODE_COMMIT", revision)
     clock = ControlledSegmentClock(monotonic_start=time.monotonic(), utc_offset_seconds=0)
     monkeypatch.setattr(
-        "deepresearch.workflow.runner.BaselineRuntimeHooks",
+        "deepresearch.runtime.runner_factory.paired_runtime_hooks",
         lambda: BaselineRuntimeHooks(monotonic=clock.monotonic, utc_now=clock.utc_now),
     )
     builder, conf, routes, snapshots, _, artifacts = composition(tmp_path)

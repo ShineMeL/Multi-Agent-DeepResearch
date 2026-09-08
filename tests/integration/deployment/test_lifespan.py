@@ -19,6 +19,7 @@ from apps.api.main import create_app
 from apps.api.schemas import CreateRunRequest
 from apps.api.settings import ServiceSettings
 from deepresearch.domain import ResourceUsage
+from deepresearch.reporting import identity_content_boundary
 from deepresearch.runtime.runner_factory import (
     DefaultCoreRunnerBuilder,
     FileProviderRouteCatalog,
@@ -160,6 +161,15 @@ async def test_lifespan_composes_concrete_resources_with_shared_limits(app, monk
         )
     assert app.state.accepting_runs is False
     assert app.state.checkpointer_ready is False
+
+
+async def test_local_replay_composition_preserves_shipped_fixture_identity(settings):
+    local = settings.model_copy(update={"deployment_access_profile": "local"})
+    app = create_app(local)
+
+    async with app.router.lifespan_context(app):
+        builder = app.state.manager.runner_factory.builder
+        assert builder.content_boundary is identity_content_boundary
 
 
 async def test_startup_marks_running_runs_interrupted(app):

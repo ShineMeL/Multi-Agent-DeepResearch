@@ -114,6 +114,13 @@ def test_empty_default_profile_failure_is_displayed_without_fake_success(tmp_pat
         assert session.run_id is None
 
 
+def test_replay_payload_uses_the_baseline_fixture_output_shape():
+    payload = replay_payload("Compare planner strategies")
+
+    assert payload["request"]["output_requirements"] == {"answer_shape": "markdown"}
+    assert payload["request"]["budget_preset"] == "medium"
+
+
 def test_app_submits_replay_shows_downloads_metrics_and_preserves_session():
     seen, keys = [], []
     manifest = {
@@ -167,6 +174,7 @@ def test_app_submits_replay_shows_downloads_metrics_and_preserves_session():
         app.run()
         assert not app.exception
         assert any("research-v1" in warning.value for warning in app.warning)
+        assert next(item for item in app.selectbox if item.label == "Budget").value == "medium"
         app.text_area(key="question").input("Showcase question")
         app.button(key="FormSubmitter:replay_request-Start replay").click().run()
         assert session.finished.wait(3)
