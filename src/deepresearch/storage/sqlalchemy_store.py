@@ -18,6 +18,7 @@ from deepresearch.runtime.admission import Admission
 from deepresearch.storage.migrations.runner import lock_service_transaction
 from deepresearch.storage.models import RunEventRow, RunRow, UsageLedgerRow
 from deepresearch.storage.protocols import (
+    DailyCostLimitExceeded,
     IdempotencyCollision,
     RunFinalization,
     RunRecord,
@@ -272,6 +273,14 @@ class SqlAlchemyRunStore:
         _amount(amount)
         _amount(limit)
         async with self._write() as session:
+            attempts = list(
+                await session.scalars(
+                    select(UsageLedgerRow).where(UsageLedgerRow.run_id == run_id).with_for_update()
+                )
+            )
+            for existing in attempts:
+                if existing.state == "reserved":
+                    return Admission(existing.reservation_id, existing.attempt_no)
             rows = list(
                 await session.scalars(
                     select(UsageLedgerRow).where(UsageLedgerRow.day == day).with_for_update()
@@ -282,8 +291,8 @@ class SqlAlchemyRunStore:
                 Decimal(0),
             )
             if total + amount > limit:
-                raise ValueError("daily cost limit exceeded")
-            attempt = max((row.attempt_no for row in rows if row.run_id == run_id), default=0) + 1
+                raise DailyCostLimitExceeded("daily cost limit exceeded")
+            attempt = max((row.attempt_no for row in attempts), default=0) + 1
             reservation_id = str(uuid4())
             session.add(
                 UsageLedgerRow(

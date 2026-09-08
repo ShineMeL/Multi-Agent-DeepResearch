@@ -9,6 +9,7 @@ from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
 
 from deepresearch.runtime.deployment_policy import PolicyViolation
+from deepresearch.runtime.limits import RateLimitExceeded
 from deepresearch.runtime.manager import (
     CheckpointResumeUnavailable,
     IdempotencyConflict,
@@ -111,6 +112,8 @@ def error_response(error: APIError, *, secrets: Collection[str] = ()) -> JSONRes
 
 
 async def handle_error(request: Request, error: Exception) -> JSONResponse:
+    if isinstance(error, RateLimitExceeded):
+        return error_response(APIError("RATE_LIMITED", retry_after=error.retry_after))
     if isinstance(error, APIError):
         manager = getattr(request.app.state, "manager", None)
         return error_response(error, secrets=getattr(manager, "secrets", ()))
@@ -154,6 +157,7 @@ async def handle_error(request: Request, error: Exception) -> JSONResponse:
 def install_error_handlers(app: FastAPI) -> None:
     for kind in (
         APIError,
+        RateLimitExceeded,
         RunNotFound,
         InvalidLastEventId,
         RequestValidationError,

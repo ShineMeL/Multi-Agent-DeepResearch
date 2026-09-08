@@ -54,6 +54,10 @@ class IdempotencyCollision(RuntimeError):
     """Raised when an idempotency key names a different run."""
 
 
+class DailyCostLimitExceeded(ValueError):
+    """The durable total cannot accommodate another reservation."""
+
+
 @dataclass(frozen=True)
 class StartupRecovery:
     interrupted_run_ids: tuple[str, ...]
@@ -148,6 +152,7 @@ class RunStore(Protocol):
 
 
 __all__ = [
+    "DailyCostLimitExceeded",
     "IdempotencyCollision",
     "RunFinalization",
     "RunRecord",
