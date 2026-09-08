@@ -2,8 +2,10 @@
 
 import json
 from pathlib import Path, PurePosixPath
+from urllib.parse import quote
 
 import yaml
+from sqlalchemy.engine import make_url
 
 
 def test_compose_packages_api_ui_and_postgres_without_embedded_secrets():
@@ -26,8 +28,8 @@ def test_compose_packages_api_ui_and_postgres_without_embedded_secrets():
     assert "_stcore/health" in " ".join(ui["healthcheck"]["test"])
     assert "pg_isready" in " ".join(postgres["healthcheck"]["test"])
 
-    assert environment["DATABASE_URL"].startswith("postgresql+asyncpg://deepresearch:")
-    assert "${POSTGRES_PASSWORD:?" in environment["DATABASE_URL"]
+    assert environment["DATABASE_URL"].startswith("${DATABASE_URL:?")
+    assert "POSTGRES_PASSWORD" not in environment["DATABASE_URL"]
     assert environment["ARTIFACT_ROOT"] == "/var/lib/deepresearch/artifacts"
     checkpoint = environment["CHECKPOINT_SQLITE_PATH"]
     assert checkpoint == "/var/lib/deepresearch/artifacts/checkpoints.sqlite"
@@ -40,7 +42,24 @@ def test_compose_packages_api_ui_and_postgres_without_embedded_secrets():
     assert json.loads(environment["ALLOWED_PROVIDER_PROFILE_IDS"]) == ["replay-default"]
     assert environment["SESSION_SIGNING_KEY"].startswith("${SESSION_SIGNING_KEY:?")
     assert postgres["environment"]["POSTGRES_PASSWORD"].startswith("${POSTGRES_PASSWORD:?")
+    assert postgres["user"] == "postgres"
+    assert postgres["init"] is True
+    assert postgres["security_opt"] == ["no-new-privileges:true"]
+    assert postgres["cap_drop"] == ["ALL"]
     assert ui["environment"]["DEEPRESEARCH_API_URL"] == "http://api:8000"
+
+
+def test_compose_accepts_an_independently_uri_encoded_special_character_password():
+    config = yaml.safe_load(Path("docker-compose.yml").read_text(encoding="utf-8"))
+    database_url = config["services"]["api"]["environment"]["DATABASE_URL"]
+    password = "pa@ss:word/#percent%"
+    encoded_url = (
+        f"postgresql+asyncpg://deepresearch:{quote(password, safe='')}@postgres:5432/deepresearch"
+    )
+
+    assert database_url.startswith("${DATABASE_URL:?")
+    assert "POSTGRES_PASSWORD" not in database_url
+    assert make_url(encoded_url).password == password
 
 
 def test_docker_context_excludes_local_secrets_and_runtime_data():

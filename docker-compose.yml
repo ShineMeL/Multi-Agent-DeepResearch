@@ -8,7 +8,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql+asyncpg://deepresearch:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/deepresearch
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set to a URI-encoded postgresql+asyncpg URL}
       ARTIFACT_ROOT: /var/lib/deepresearch/artifacts
       CHECKPOINT_SQLITE_PATH: /var/lib/deepresearch/artifacts/checkpoints.sqlite
       LANGGRAPH_STRICT_MSGPACK: "true"
@@ -66,6 +66,9 @@ services:
 
   postgres:
     image: postgres:16
+    # The named image account remains stable across image UID changes and lets
+    # the official entrypoint initialize PGDATA without an arbitrary numeric UID.
+    user: postgres
     environment:
       POSTGRES_DB: deepresearch
       POSTGRES_USER: deepresearch
@@ -77,6 +80,11 @@ services:
       retries: 12
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
 
 volumes:
   artifact-data:

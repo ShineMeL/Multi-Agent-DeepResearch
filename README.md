@@ -99,14 +99,23 @@ incur provider charges; use Replay when validating the repository or CI path.
 
 The Compose stack runs the FastAPI service, API-only Streamlit UI, and Postgres
 with named `artifact-data` and `postgres-data` volumes. Set
-`POSTGRES_PASSWORD` and a nonblank, 32-byte-or-longer `SESSION_SIGNING_KEY` in
-your shell or an uncommitted environment file before starting it:
+`POSTGRES_PASSWORD`, an independently URI-encoded `DATABASE_URL`, and a
+nonblank, 32-byte-or-longer `SESSION_SIGNING_KEY` in your shell or an
+uncommitted environment file before starting it. Construct the URL by encoding
+the password as a URI component; this matters for passwords containing `@`,
+`:`, `/`, `#`, or `%`:
 
 ```powershell
 $env:POSTGRES_PASSWORD = "replace-with-a-local-password"
+$encodedPassword = [uri]::EscapeDataString($env:POSTGRES_PASSWORD)
+$env:DATABASE_URL = "postgresql+asyncpg://deepresearch:${encodedPassword}@postgres:5432/deepresearch"
 $env:SESSION_SIGNING_KEY = "replace-with-a-local-signing-key-at-least-32-bytes"
 docker compose up --build
 ```
+
+The Compose service uses the official image's named `postgres` account rather
+than a brittle numeric UID, so its entrypoint can initialize the named data
+volume while the database remains non-root.
 
 This local Showcase forces only the `replay` execution mode and the
 `replay-default` provider profile. That default catalog entry is deliberately
