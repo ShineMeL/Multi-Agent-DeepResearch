@@ -18,6 +18,16 @@ from apps.ui.api_client import ArtifactKind, ResearchApiClient, RunView, StreamR
 from apps.ui.replay import ShowcaseSession, replay_payload
 
 
+def _release_session(session: ShowcaseSession) -> None:
+    session.close()
+
+
+@st.cache_resource(scope="session", on_release=_release_session)
+def _session_resource(base_url: str) -> ShowcaseSession:
+    """Streamlit releases this resource on browser disconnect/session shutdown."""
+    return ShowcaseSession(ResearchApiClient(base_url))
+
+
 def _table(rows: list[dict[str, Any]]) -> None:
     # Streamlit's overload includes optional dependency types without stubs.
     st.dataframe(rows, hide_index=True)  # pyright: ignore[reportUnknownMemberType]
@@ -185,8 +195,9 @@ def _results(session: ShowcaseSession, view: RunView) -> None:
         st.info("Report is not yet available.")
 
 
-@st.fragment(run_every=1)
-def _run_panel(session: ShowcaseSession, watching_at_render: bool) -> None:
+def _run_panel(
+    session: ShowcaseSession, watching_at_render: bool, automatic_at_render: bool = False
+) -> None:
     if session.run_id is None:
         return
     session.drain()
@@ -194,23 +205,43 @@ def _run_panel(session: ShowcaseSession, watching_at_render: bool) -> None:
         # Refresh the form outside this fragment when a reader finishes, so a
         # completed run does not leave Start replay disabled indefinitely.
         st.rerun()
+    session.refresh()
+    view = session.view
+    if session.poll_error:
+        st.error(_error_message(session.poll_error))
+    if session.stream_error:
+        st.warning(_error_message(session.stream_error))
+    if not session.automatic_refresh:
+        st.caption("Automatic refresh is paused. Use Retry status to check again.")
     try:
-        view = session.api.get_run(session.run_id)
+        if st.button("Retry status"):
+            session.retry_status()
+            st.rerun()
         resume, cancel, reconnect = st.columns(3)
-        if resume.button("Resume", disabled=view.status != "interrupted"):
+        if resume.button("Resume", disabled=view is None or view.status != "interrupted"):
             view = session.api.resume(session.run_id)
+            session.update_view(view)
             session.watch()
+            st.rerun()
         if cancel.button(
-            "Cancel", disabled=view.status not in {"queued", "running", "interrupted"}
+            "Cancel",
+            disabled=view is None or view.status not in {"queued", "running", "interrupted"},
         ):
             view = session.api.cancel(session.run_id)
+            session.update_view(view)
+            st.rerun()
         if reconnect.button("Reconnect events", disabled=session.watching):
+            session.retry_status()
             session.watch()
-        if session.stream_error:
-            st.warning(_error_message(session.stream_error))
-        _results(session, view)
+            st.rerun()
+        if view is not None:
+            _results(session, view)
+        else:
+            st.info("Waiting for run status.")
     except (httpx.HTTPError, ValueError, TypeError) as error:
         st.error(_error_message(error))
+    if automatic_at_render and not session.automatic_refresh:
+        st.rerun()
 
 
 def main() -> None:
@@ -224,9 +255,9 @@ def main() -> None:
         "A complete replay profile and matching bundle must be configured on the API server. "
         "The default replay-default catalog entry is empty. Replay inputs must match the bundle."
     )
-    if "showcase" not in st.session_state:
-        st.session_state["showcase"] = ShowcaseSession(
-            ResearchApiClient(os.environ.get("DEEPRESEARCH_API_URL", "http://127.0.0.1:8000"))
+    if "showcase" not in st.session_state or st.session_state["showcase"].closed:
+        st.session_state["showcase"] = _session_resource(
+            os.environ.get("DEEPRESEARCH_API_URL", "http://127.0.0.1:8000")
         )
     session = cast(ShowcaseSession, st.session_state["showcase"])
     if session.pending:
@@ -257,7 +288,10 @@ def main() -> None:
             st.rerun()
         except (httpx.HTTPError, ValueError) as error:
             st.error(_error_message(error))
-    _run_panel(session, watching_at_render=session.watching)
+    automatic = session.automatic_refresh
+    st.fragment(run_every=1 if automatic else None)(_run_panel)(
+        session, watching_at_render=session.watching, automatic_at_render=automatic
+    )
 
 
 if __name__ == "__main__":

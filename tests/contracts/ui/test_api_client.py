@@ -123,7 +123,7 @@ def test_replay_request_matches_strict_api_and_retains_cookie_for_all_routes():
 
 
 def test_client_reconnects_from_last_durable_sequence(monkeypatch):
-    monkeypatch.setattr("apps.ui.api_client.time.sleep", lambda _: None)
+    monkeypatch.setattr(ResearchApiClient, "_wait_for_reconnect", lambda self, _: False)
     cursors = []
 
     def respond(request):
@@ -145,7 +145,7 @@ def test_client_reconnects_from_last_durable_sequence(monkeypatch):
 
 @pytest.mark.parametrize("historical_status", ["interrupted", "completed", "failed", "cancelled"])
 def test_historical_node_status_does_not_override_current_run(monkeypatch, historical_status):
-    monkeypatch.setattr("apps.ui.api_client.time.sleep", lambda _: None)
+    monkeypatch.setattr(ResearchApiClient, "_wait_for_reconnect", lambda self, _: False)
     cursors, statuses = [], []
 
     def respond(request):
@@ -185,7 +185,7 @@ def test_empty_eof_checks_current_terminal_run(status):
 
 
 def test_unterminated_frame_never_advances_cursor(monkeypatch):
-    monkeypatch.setattr("apps.ui.api_client.time.sleep", lambda _: None)
+    monkeypatch.setattr(ResearchApiClient, "_wait_for_reconnect", lambda self, _: False)
     cursors = []
 
     def respond(request):
@@ -203,7 +203,7 @@ def test_unterminated_frame_never_advances_cursor(monkeypatch):
 
 
 def test_bounded_reconnect_exposes_cursor(monkeypatch):
-    monkeypatch.setattr("apps.ui.api_client.time.sleep", lambda _: None)
+    monkeypatch.setattr(ResearchApiClient, "_wait_for_reconnect", lambda self, _: False)
     cursors = []
 
     def respond(request):

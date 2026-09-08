@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import time
 from collections.abc import Iterable, Iterator
+from threading import Event
 from typing import Literal, Self
 from urllib.parse import quote
 
@@ -64,6 +64,8 @@ def _sse_data(lines: Iterable[str]) -> Iterator[str]:
 class ResearchApiClient:
     def __init__(self, base_url: str, *, transport: httpx.BaseTransport | None = None) -> None:
         self.client = httpx.Client(base_url=base_url, timeout=30, transport=transport)
+        self._stream_stop = Event()
+        self._stream_response: httpx.Response | None = None
 
     def __enter__(self) -> Self:
         return self
@@ -72,7 +74,17 @@ class ResearchApiClient:
         self.close()
 
     def close(self) -> None:
+        self.stop_events()
         self.client.close()
+
+    def stop_events(self) -> None:
+        self._stream_stop.set()
+        response = self._stream_response
+        if response is not None:
+            response.close()
+
+    def _wait_for_reconnect(self, seconds: float) -> bool:
+        return self._stream_stop.wait(seconds)
 
     @staticmethod
     def _run_path(run_id: str) -> str:
@@ -88,7 +100,7 @@ class ResearchApiClient:
         return RunAccepted.model_validate_json(response.content)
 
     def get_run(self, run_id: str) -> RunView:
-        response = self.client.get(self._run_path(run_id))
+        response = self.client.get(self._run_path(run_id), timeout=5)
         response.raise_for_status()
         return RunView.model_validate_json(response.content)
 
@@ -105,16 +117,26 @@ class ResearchApiClient:
     def events(self, run_id: str, last_event_id: int = 0) -> Iterator[RunEvent]:
         if type(last_event_id) is not int or last_event_id < 0:
             raise ValueError("last_event_id must be a nonnegative integer")
+        if self.client.is_closed:
+            return
+        self._stream_stop.clear()
         cursor = last_event_id
         for attempt in range(6):
+            if self._stream_stop.is_set() or self.client.is_closed:
+                return
             try:
                 with self.client.stream(
                     "GET",
                     f"{self._run_path(run_id)}/events",
                     headers={"Last-Event-ID": str(cursor), "Accept": "text/event-stream"},
                 ) as response:
+                    self._stream_response = response
+                    if self._stream_stop.is_set():
+                        return
                     response.raise_for_status()
                     for data in _sse_data(response.iter_lines()):
+                        if self._stream_stop.is_set():
+                            return
                         event = RunEvent.model_validate_json(data)
                         if event.run_id != run_id:
                             raise ValueError("event belongs to another run")
@@ -124,12 +146,16 @@ class ResearchApiClient:
                         yield event
                 # Node status is not service status, and an interrupted run may
                 # already have resumed. Drain durable frames before checking EOF.
-                if self.get_run(run_id).status in _TERMINAL:
+                if self._stream_stop.is_set() or self.get_run(run_id).status in _TERMINAL:
                     return
             except httpx.TransportError:
                 pass
-            if attempt < 5:
-                time.sleep(min(2 ** (attempt + 1), 8))
+            finally:
+                self._stream_response = None
+            if attempt < 5 and self._wait_for_reconnect(min(2 ** (attempt + 1), 8)):
+                return
+        if self._stream_stop.is_set():
+            return
         raise StreamReconnectExhausted(run_id, cursor)
 
     def download_artifact(self, run_id: str, kind: ArtifactKind) -> bytes:

@@ -1,6 +1,7 @@
 import json
 import logging
 from pathlib import Path
+from threading import Event
 
 import httpx
 import pytest
@@ -9,7 +10,7 @@ from streamlit.testing.v1 import AppTest
 
 from apps.api.main import create_app
 from apps.api.settings import ServiceSettings
-from apps.ui.api_client import ResearchApiClient
+from apps.ui.api_client import ResearchApiClient, StreamReconnectExhausted
 from apps.ui.replay import ShowcaseSession, replay_payload
 from deepresearch.domain import RunEvent
 from tests.contracts.ui.test_api_client import frame, view
@@ -185,6 +186,10 @@ def test_app_submits_replay_shows_downloads_metrics_and_preserves_session():
         assert {f"/runs/r1/artifacts/{kind}" for kind in ("report", "evidence", "manifest")} <= set(
             seen
         )
+        status_reads = seen.count("/runs/r1")
+        for _ in range(3):
+            app.run()
+        assert seen.count("/runs/r1") == status_reads
 
 
 def test_submit_retry_keeps_idempotency_key_and_payload():
@@ -216,7 +221,7 @@ def test_submit_retry_keeps_idempotency_key_and_payload():
 
 
 def test_background_watch_restarts_from_persisted_cursor(monkeypatch):
-    monkeypatch.setattr("apps.ui.api_client.time.sleep", lambda _: None)
+    monkeypatch.setattr(ResearchApiClient, "_wait_for_reconnect", lambda self, _: False)
     cursors = []
     fail = True
 
@@ -262,6 +267,8 @@ def test_app_resume_refusal_keeps_run_and_cancel_remains_available():
         app = AppTest.from_file(str(Path("apps/ui/app.py").resolve()), default_timeout=5)
         app.session_state["showcase"] = session
         app.run()
+        assert session.poll_finished.wait(2)
+        app.run()
         next(button for button in app.button if button.label == "Resume").click().run()
         assert not app.exception
         assert any("Checkpoint continuation is unavailable" in error.value for error in app.error)
@@ -285,6 +292,8 @@ def test_active_run_metrics_use_durable_usage_before_final_usage_is_published():
         )
         app = AppTest.from_file(str(Path("apps/ui/app.py").resolve()), default_timeout=5)
         app.session_state["showcase"] = session
+        app.run()
+        assert session.poll_finished.wait(2)
         app.run()
         assert not app.exception
         assert any(metric.label == "Tokens" and metric.value == "15" for metric in app.metric)
@@ -316,3 +325,155 @@ else:
         app.run()
         assert not app.exception
         assert not next(button for button in app.button if button.label == "Start replay").disabled
+
+
+@pytest.mark.parametrize("status", ["completed", "cancelled", "failed", "interrupted"])
+def test_final_run_stops_status_reads_even_after_many_refresh_ticks(status):
+    calls = []
+    with ResearchApiClient(
+        "http://api",
+        transport=httpx.MockTransport(
+            lambda request: calls.append(request) or httpx.Response(200, json=view(status))
+        ),
+    ) as client:
+        session = ShowcaseSession(client, run_id="r1")
+        session.refresh(now=0)
+        assert session.poll_finished.wait(2)
+        session.drain(now=0)
+        for tick in range(1, 3600):
+            session.refresh(now=tick)
+        assert len(calls) == 1
+        assert not session.automatic_refresh
+        assert session.view.status == status
+
+
+def test_poll_transport_failures_back_off_then_require_explicit_retry():
+    calls = []
+    fail = True
+
+    def respond(request):
+        calls.append(request)
+        if fail:
+            raise httpx.ConnectError("offline")
+        return httpx.Response(200, json=view())
+
+    with ResearchApiClient("http://api", transport=httpx.MockTransport(respond)) as client:
+        session = ShowcaseSession(client, run_id="r1")
+        for tick, expected in ((0, 1), (1, 1), (2, 2), (5, 2), (6, 3), (3600, 3)):
+            session.refresh(now=tick)
+            assert session.poll_finished.wait(2)
+            session.drain(now=tick)
+            assert len(calls) == expected
+        assert not session.automatic_refresh
+        assert session.poll_error is not None
+        fail = False
+        session.retry_status()
+        session.refresh(now=3601)
+        assert session.poll_finished.wait(2)
+        session.drain(now=3601)
+        assert len(calls) == 4
+        assert session.view.status == "completed"
+
+
+def test_missing_run_stops_after_one_status_read():
+    calls = []
+    with ResearchApiClient(
+        "http://api",
+        transport=httpx.MockTransport(lambda request: calls.append(request) or httpx.Response(404)),
+    ) as client:
+        session = ShowcaseSession(client, run_id="r1")
+        session.refresh(now=0)
+        assert session.poll_finished.wait(2)
+        session.drain(now=0)
+        session.refresh(now=3600)
+        assert len(calls) == 1
+        assert not session.automatic_refresh
+
+
+def test_status_request_is_background_and_only_one_is_in_flight():
+    entered, release = Event(), Event()
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        entered.set()
+        assert release.wait(3)
+        return httpx.Response(200, json=view())
+
+    with ResearchApiClient("http://api", transport=httpx.MockTransport(respond)) as client:
+        session = ShowcaseSession(client, run_id="r1")
+        try:
+            session.refresh(now=0)
+            assert entered.wait(1)
+            assert not session.poll_finished.is_set()
+            session.refresh(now=100)
+            assert len(calls) == 1
+        finally:
+            release.set()
+            assert session.poll_finished.wait(2)
+
+
+def test_exhausted_stream_pauses_automatic_status_reads():
+    calls = []
+    with ResearchApiClient(
+        "http://api",
+        transport=httpx.MockTransport(
+            lambda request: calls.append(request) or httpx.Response(200, json=view("running"))
+        ),
+    ) as client:
+        session = ShowcaseSession(client, run_id="r1")
+        session.stream_error = StreamReconnectExhausted("r1", 8)
+        session.refresh(now=0)
+        assert not calls
+        assert not session.automatic_refresh
+
+
+def test_session_close_stops_reader_and_closes_client():
+    entered, released = Event(), Event()
+
+    class WaitingStream(httpx.SyncByteStream):
+        def __iter__(self):
+            entered.set()
+            assert released.wait(3)
+            yield b": closed\n\n"
+
+        def close(self):
+            released.set()
+
+    client = ResearchApiClient(
+        "http://api",
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, stream=WaitingStream())),
+    )
+    session = ShowcaseSession(client, run_id="r1")
+    session.watch()
+    assert entered.wait(1)
+    session.close()
+    assert session.finished.wait(2)
+    session.close()
+    assert client.client.is_closed
+    assert session.closed
+    assert not session.automatic_refresh
+
+
+def test_streamlit_session_resource_release_closes_actual_ui_client(monkeypatch):
+    from streamlit.runtime.caching import clear_session_resource_cache
+
+    from apps.ui import app as ui
+
+    client = ResearchApiClient(
+        "http://api", transport=httpx.MockTransport(lambda _: httpx.Response(200, json=view()))
+    )
+    monkeypatch.setattr(ui, "ResearchApiClient", lambda _: client)
+    app = AppTest.from_string("""
+import streamlit as st
+from streamlit.runtime.scriptrunner_utils.script_run_context import get_script_run_ctx
+from apps.ui.app import _session_resource
+st.session_state["resource"] = _session_resource("http://api")
+st.session_state["session_id"] = get_script_run_ctx().session_id
+""")
+    app.run()
+    assert not app.exception
+    session = app.session_state["resource"]
+    clear_session_resource_cache(app.session_state["session_id"])
+    assert session.closed
+    assert client.client.is_closed
