@@ -79,7 +79,7 @@ def test_frozen_parameters_cannot_be_mutated_after_hashing():
     from deepresearch.runtime.runner_factory import FrozenProviderRoute
 
     route = FrozenProviderRoute(
-        operation="model",
+        operation="search",
         provider_id="test",
         endpoint_type="model",
         model_id="m",
@@ -87,10 +87,10 @@ def test_frozen_parameters_cannot_be_mutated_after_hashing():
         base_url=None,
         credential_ref=None,
         fallback_rank=0,
-        parameters={"temperature": 0},
+        parameters={"snapshot_id": "v1"},
     )
     with pytest.raises(TypeError):
-        route.parameters["temperature"] = 1
+        route.parameters["snapshot_id"] = "v2"
 
 
 def test_snapshot_cost_resolver_prices_tool_identity_and_excludes_cached_input():
@@ -115,7 +115,7 @@ def test_snapshot_cost_resolver_prices_tool_identity_and_excludes_cached_input()
     snapshot = PricingSnapshot(
         snapshot_id="p",
         provider_id="provider",
-        endpoint_type="chat.completions",
+        endpoint_type="complete",
         model_id="model",
         effective_at="2026-08-29T00:00:00Z",
         currency="USD",
@@ -191,7 +191,6 @@ def test_catalog_strips_secrets_and_frozen_routes_reject_credentials_in_urls(tmp
         "credential_ref": "TEST_SERVICE_TOKEN",
         "fallback_rank": 0,
         "parameters": {
-            "temperature": 0,
             "api_key": "actual-api-key",
             "headers": {"Authorization": "Bearer actual-api-key"},
         },
@@ -203,7 +202,7 @@ def test_catalog_strips_secrets_and_frozen_routes_reject_credentials_in_urls(tmp
     )
     frozen = FileProviderRouteCatalog.load(path).resolve("live")
     assert "actual-api-key" not in frozen.model_dump_json()
-    assert frozen.routes[0].parameters == {"temperature": 0}
+    assert frozen.routes[0].parameters == {}
     unsafe = frozen.routes[0].model_dump(mode="json")
     unsafe["base_url"] = "https://user:password@example.com"
     with pytest.raises(ValidationError):
@@ -283,12 +282,13 @@ def test_concrete_builder_compiles_real_core_baseline_with_same_saver(tmp_path: 
         (bundle / file.name).write_bytes(file.read_bytes().replace(b"\r\n", b"\n"))
     snapshot = json.loads((bundle / "snapshot.json").read_text())
     conf = config()
+    conf = conf.model_copy(update={"budget": conf.budget.model_copy(update={"max_cost_usd": None})})
     rows = []
     for operation, provider in snapshot["providers"].items():
         rows.append(
             {
                 "operation": operation,
-                "provider_id": "replay",
+                "provider_id": provider["provider_id"],
                 "endpoint_type": operation,
                 "model_id": provider["model_id"],
                 "model_revision": provider["model_revision"],
@@ -301,7 +301,7 @@ def test_concrete_builder_compiles_real_core_baseline_with_same_saver(tmp_path: 
     rows.append(
         {
             "operation": "parse",
-            "provider_id": "html",
+            "provider_id": "trafilatura-html",
             "endpoint_type": "parse",
             "model_id": None,
             "model_revision": None,
@@ -322,8 +322,12 @@ def test_concrete_builder_compiles_real_core_baseline_with_same_saver(tmp_path: 
         )
     )
     routes = FileProviderRouteCatalog.load(path).resolve(conf.request.provider_profile_id)
+    registry = default_provider_constructors()
+    registry.update(
+        {provider["provider_id"]: registry["replay"] for provider in snapshot["providers"].values()}
+    )
     builder = DefaultCoreRunnerBuilder(
-        provider_constructors=default_provider_constructors(),
+        provider_constructors=registry,
         credential_resolver=EnvCredentialResolver(frozenset()),
         artifact_store=LocalArtifactStore(tmp_path),
         evidence_store=LocalEvidenceStore(tmp_path),

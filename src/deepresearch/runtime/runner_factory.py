@@ -38,13 +38,9 @@ from deepresearch.workflow.runner import LangGraphResearchRunner
 _SECRET = re.compile(r"(?i)(authorization|api.?key|password|secret|bearer|cookie|access.?token)")
 _PARAMETERS = frozenset(
     {
-        "temperature",
-        "seed",
-        "max_output_tokens",
         "dimension",
         "bundle_path",
         "snapshot_id",
-        "timeout_seconds",
     }
 )
 
@@ -116,6 +112,22 @@ class FrozenProviderRoute(BaseModel):
             raise ValueError("base URL must not contain credentials, query or fragment")
         if set(self.parameters) - _PARAMETERS:
             raise ValueError("route parameters contain unsupported or secret fields")
+        allowed: set[str] = {"snapshot_id"} if self.operation in {"search", "fetch"} else set()
+        if self.operation != "parse":
+            allowed.add("bundle_path")
+        if self.operation == "embed" and self.provider_id == "deterministic-hash":
+            allowed.add("dimension")
+        if set(self.parameters) - allowed:
+            raise ValueError("route parameters are not supported by this operation")
+        if "dimension" in self.parameters:
+            dimension = self.parameters["dimension"]
+            if type(dimension) is not int or not 1 <= dimension <= 65536:
+                raise ValueError("embedding dimension must be an integer from 1 through 65536")
+        for key in ("bundle_path", "snapshot_id"):
+            if key in self.parameters and (
+                not isinstance(self.parameters[key], str) or not self.parameters[key]
+            ):
+                raise ValueError("route path and snapshot parameters must be nonempty strings")
         for value in self.parameters.values():
             if type(value) not in {str, int, float, bool, type(None)}:
                 raise ValueError("route parameters must be nonsecret scalar values")
@@ -243,7 +255,7 @@ class FileProviderRouteCatalog:
                 clean["parameters"] = {
                     name: value
                     for name, value in cast(dict[str, Any], parameters).items()
-                    if name in _PARAMETERS
+                    if not (_SECRET.search(name) or name.lower() in {"token", "key", "headers"})
                 }
                 routes.append(FrozenProviderRoute.model_validate(clean))
             ordered = sorted(
@@ -330,6 +342,13 @@ def default_provider_constructors() -> dict[str, ProviderConstructor]:
         }
         if route.operation not in constructors:
             raise ProviderProfileDrift()
+        snapshot = bundle.provider_snapshot(route.operation)
+        if (
+            snapshot.provider_id != route.provider_id
+            or snapshot.model_id != route.model_id
+            or snapshot.model_revision != route.model_revision
+        ):
+            raise ProviderProfileDrift()
         return cast(ProviderAdapter, constructors[route.operation](bundle))
 
     def model(route: FrozenProviderRoute, secret: str | None, slot: HostSlot) -> ProviderAdapter:
@@ -354,11 +373,15 @@ def default_provider_constructors() -> dict[str, ProviderConstructor]:
         "openai-compatible": model,
         "tavily": search,
         "html": lambda route, secret, slot: HtmlParser(),
+        "trafilatura-html": lambda route, secret, slot: HtmlParser(),
         "pdf": lambda route, secret, slot: PdfParser(),
+        "pymupdf-pdf": lambda route, secret, slot: PdfParser(),
         "httpx-fetcher": lambda route, secret, slot: HttpxFetcher(
             transport=PinnedPeerTransport(), host_slot=slot
         ),
-        "deterministic-hash": lambda route, secret, slot: DeterministicHashTextEmbedder(),
+        "deterministic-hash": lambda route, secret, slot: DeterministicHashTextEmbedder(
+            dimension=cast(int, route.parameters.get("dimension", 384))
+        ),
     }
 
 
@@ -466,9 +489,66 @@ class _SnapshotCostResolver:
             return None
         route = matches[0]
         snapshot = self.snapshots.get(
-            (route.provider_id, route.endpoint_type, route.model_id or route.operation)
+            (
+                route.provider_id,
+                "complete" if route.operation == "model" else route.operation,
+                route.model_id or route.operation,
+            )
         )
         return None if snapshot is None else self.calculator.estimate(usage, snapshot).total_usd
+
+
+def _required_pricing_keys(routes: FrozenProviderRoutes) -> set[tuple[str, str, str]]:
+    # Core's method endpoint, not the transport API path, is the audited identity.
+    return {
+        (route.provider_id, endpoint, route.model_id or route.operation)
+        for route in routes.routes
+        for endpoint in (
+            ("complete", "structured") if route.operation == "model" else (route.operation,)
+        )
+    }
+
+
+def _rates(snapshot: PricingSnapshot) -> tuple[Decimal, ...]:
+    return (
+        snapshot.input_tokens_per_million_usd,
+        snapshot.output_tokens_per_million_usd,
+        snapshot.cached_tokens_per_million_usd,
+        snapshot.reasoning_tokens_per_million_usd,
+    )
+
+
+def _validate_pricing(routes: FrozenProviderRoutes, snapshots: tuple[PricingSnapshot, ...]) -> None:
+    indexed = {_pricing_key(snapshot): snapshot for snapshot in snapshots}
+    if len(indexed) != len(snapshots) or not _required_pricing_keys(routes) <= indexed.keys():
+        raise ProviderProfileDrift()
+    for route in routes.routes:
+        if route.operation == "model":
+            complete = indexed[(route.provider_id, "complete", route.model_id or "model")]
+            structured = indexed[(route.provider_id, "structured", route.model_id or "model")]
+            # UsageCostResolver receives operation='model' without a method endpoint.
+            # Different rates cannot be resolved honestly with that Core interface.
+            if _rates(complete) != _rates(structured):
+                raise ProviderProfileDrift()
+        elif any(
+            _rates(indexed[(route.provider_id, route.operation, route.model_id or route.operation)])
+        ):
+            # Core provider-call auditing only permits zero/unknown non-model costs.
+            raise ProviderProfileDrift()
+
+
+def _validate_adapter_identity(route: FrozenProviderRoute, adapter: ProviderAdapter) -> None:
+    actual = getattr(adapter, "parser_id" if route.operation == "parse" else "provider_id", None)
+    if actual != route.provider_id:
+        raise ProviderProfileDrift()
+    if route.operation in {"model", "embed"}:
+        if not route.model_id or not route.model_revision:
+            raise ProviderProfileDrift()
+        if (
+            getattr(adapter, "model_id", route.model_id) != route.model_id
+            or getattr(adapter, "model_revision", None) != route.model_revision
+        ):
+            raise ProviderProfileDrift()
 
 
 class DefaultCoreRunnerBuilder:
@@ -495,11 +575,7 @@ class DefaultCoreRunnerBuilder:
         self, config: RunConfig, provider_routes: FrozenProviderRoutes
     ) -> set[tuple[str, str, str]]:
         del config
-        return {
-            (route.provider_id, route.endpoint_type, route.model_id or route.operation)
-            for route in provider_routes.routes
-            if route.operation != "parse"
-        }
+        return _required_pricing_keys(provider_routes)
 
     def build(
         self,
@@ -523,18 +599,13 @@ class DefaultCoreRunnerBuilder:
             for route in provider_routes.routes
         ):
             raise ProviderProfileDrift()
-        if provider_routes.execution_mode == "replay" and any(
-            route.provider_id not in {"replay", "html", "pdf", "deterministic-hash"}
-            for route in provider_routes.routes
-        ):
-            raise ProviderProfileDrift()
         if (
-            config.request.access_profile == "public_live"
+            pricing_snapshots
+            or config.budget.max_cost_usd is not None
+            or config.request.access_profile == "public_live"
             or config.request.run_purpose == "benchmark"
-        ) and not self.required_pricing_keys(config, provider_routes) <= {
-            _pricing_key(item) for item in pricing_snapshots
-        }:
-            raise ProviderProfileDrift()
+        ):
+            _validate_pricing(provider_routes, pricing_snapshots)
         secrets = {
             route.operation: self.credential_resolver.resolve(route.credential_ref)
             for route in provider_routes.routes
@@ -545,6 +616,50 @@ class DefaultCoreRunnerBuilder:
             )
             for operation, route in routes.items()
         }
+        for operation, adapter in adapters.items():
+            frozen = routes[operation]
+            _validate_adapter_identity(frozen, adapter)
+            if "bundle_path" in frozen.parameters:
+                from deepresearch.providers.replay import (
+                    ReplayFetcher,
+                    ReplayModelProvider,
+                    ReplaySearchProvider,
+                    ReplayTextEmbedder,
+                )
+
+                if not isinstance(
+                    adapter,
+                    (ReplayFetcher, ReplayModelProvider, ReplaySearchProvider, ReplayTextEmbedder),
+                ):
+                    raise ProviderProfileDrift()
+            if (
+                "dimension" in frozen.parameters
+                and getattr(adapter, "dimension", None) != frozen.parameters["dimension"]
+            ):
+                raise ProviderProfileDrift()
+            if provider_routes.execution_mode == "replay":
+                from deepresearch.providers.embeddings import DeterministicHashTextEmbedder
+                from deepresearch.providers.parsers import HtmlParser, PdfParser
+                from deepresearch.providers.replay import (
+                    ReplayFetcher,
+                    ReplayModelProvider,
+                    ReplaySearchProvider,
+                    ReplayTextEmbedder,
+                )
+
+                if not isinstance(
+                    adapter,
+                    (
+                        ReplayFetcher,
+                        ReplayModelProvider,
+                        ReplaySearchProvider,
+                        ReplayTextEmbedder,
+                        DeterministicHashTextEmbedder,
+                        HtmlParser,
+                        PdfParser,
+                    ),
+                ):
+                    raise ProviderProfileDrift()
         model = _BoundModel(cast(ModelProvider, adapters["model"]), routes["model"])
         planner = FixedPlanner(
             model=model,
