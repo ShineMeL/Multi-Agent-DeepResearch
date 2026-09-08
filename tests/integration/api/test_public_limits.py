@@ -16,7 +16,7 @@ from deepresearch.runtime.limits import LimitManager
 from deepresearch.runtime.manager import RunManager, owner_scope_sha256
 from deepresearch.runtime.runner_factory import FilePricingCatalog
 from deepresearch.storage import LocalArtifactStore
-from deepresearch.storage.models import RunRow
+from deepresearch.storage.models import RunRow, UsageLedgerRow
 from deepresearch.storage.sqlalchemy_store import SqlAlchemyRunStore
 from tests.fakes.service_store import make_record
 from tests.integration.replay.test_baseline_graph import config
@@ -26,13 +26,13 @@ from tests.unit.runtime.test_runner_factory_execution import pricing
 from tests.unit.storage.test_sqlite_store import store as store  # noqa: PLC0414 - pytest fixture
 
 
-def public_config():
+def public_config(execution_mode="live"):
     conf = config()
     return conf.model_copy(
         update={
             "request": conf.request.model_copy(
                 update={
-                    "execution_mode": "live",
+                    "execution_mode": execution_mode,
                     "access_profile": "public_live",
                     "budget_preset": "medium",
                 }
@@ -42,8 +42,8 @@ def public_config():
     )
 
 
-def setup_service(store, tmp_path, *, daily_limit="10", clock=None):
-    conf = public_config()
+def setup_service(store, tmp_path, *, daily_limit="10", clock=None, execution_mode="live"):
+    conf = public_config(execution_mode)
     factory = Factory(conf)
     factory.required = {("p", "complete", "m")}
     factory.runner.cost = Decimal("0.10")
@@ -77,6 +77,50 @@ async def post(app, body, ip="127.0.0.1"):
         base_url="https://testserver",
     ) as client:
         return await client.post("/runs", json=body)
+
+
+@pytest.mark.parametrize("ledger_unavailable", [False, True])
+async def test_replay_forced_public_live_needs_no_daily_reservation(
+    store,
+    tmp_path,
+    monkeypatch,
+    ledger_unavailable,
+):
+    app, manager, factory, _, body = setup_service(
+        store,
+        tmp_path,
+        daily_limit="0",
+        execution_mode="replay",
+    )
+    body["request"]["access_profile"] = "local"
+    factory.runner.finish.set()
+
+    async def unavailable(*args):
+        raise OSError("daily ledger unavailable")
+
+    if ledger_unavailable:
+        monkeypatch.setattr(store, "reserve_daily_cost", unavailable)
+    try:
+        response = await post(app, body)
+        assert response.status_code == 202
+        run_id = response.json()["run_id"]
+        accepted = await store.get_run(run_id)
+        assert accepted.config_json["request"]["access_profile"] == "public_live"
+        assert accepted.config_json["request"]["execution_mode"] == "replay"
+        assert accepted.admission_reservation_id is None
+        assert accepted.admission_attempt_no is None
+        assert (await manager.wait(run_id)).status == "completed"
+        async with store.session_factory() as session:
+            assert (
+                await session.scalar(
+                    select(func.count())
+                    .select_from(UsageLedgerRow)
+                    .where(UsageLedgerRow.run_id == run_id)
+                )
+                == 0
+            )
+    finally:
+        await manager.shutdown(0)
 
 
 async def test_third_run_returns_public_429_without_creating_a_run(store, tmp_path):

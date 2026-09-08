@@ -130,6 +130,10 @@ class LimitManager:
             or requested_cost_usd > medium_cost
         ):
             raise ValueError("public cost must be finite and within the medium budget")
+        # RunManager signals exempt replay with zero cost, even when deployment
+        # policy normalizes its access profile to public_live.
+        if requested_cost_usd == 0:
+            return Admission(None, None)
         async with self._admission_lock:
             if run_id in self._local_admissions:
                 return self._local_admissions[run_id]
