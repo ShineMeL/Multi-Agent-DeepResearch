@@ -6,14 +6,12 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 from collections.abc import AsyncGenerator, Callable, Collection, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal, Never, Protocol, TypeAlias, cast
 
-from langgraph.checkpoint.base import BaseCheckpointSaver
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, JsonValue, SecretStr, model_validator
 
 from deepresearch.domain import ExecutionMode, ResourceUsage, RunConfig
@@ -29,8 +27,10 @@ from deepresearch.providers import (
 )
 from deepresearch.providers.httpx_fetcher import HostSlot, no_op_host_slot
 from deepresearch.reporting import ContentBoundary, MarkdownReportWriter
+from deepresearch.runtime.checkpointers import BaseCheckpointSaver
 from deepresearch.runtime.manifest import CostCalculator, PricingSnapshot
 from deepresearch.runtime.ports import ResearchRunner
+from deepresearch.runtime.provenance import resolve_build_provenance
 from deepresearch.security import redact, wrap_untrusted_content
 from deepresearch.storage import FileCache, LocalArtifactStore, LocalEvidenceStore
 from deepresearch.workflow.baseline_graph import BaselineNodeHandlers, build_baseline_graph
@@ -603,6 +603,7 @@ class DefaultCoreRunnerBuilder:
         cost_calculator: type[CostCalculator],
     ) -> ResearchRunner:
         validate_provider_route_binding(config, provider_routes)
+        provenance = resolve_build_provenance()
         if config.workflow_id == "research-v1":
             raise ResearchGraphUnavailable()
         routes = {route.operation: route for route in provider_routes.routes}
@@ -610,9 +611,16 @@ class DefaultCoreRunnerBuilder:
             raise ProviderProfileDrift()
         # Only single routes are currently supported by the Core composition.
         # Reject an unsupported deployment policy before any adapter construction.
-        if any(
-            route.fallback_rank != 0 or route.provider_id not in self.provider_constructors
-            for route in provider_routes.routes
+        constructor_keys = {
+            operation: (
+                "replay"
+                if provider_routes.execution_mode == "replay" and "bundle_path" in route.parameters
+                else route.provider_id
+            )
+            for operation, route in routes.items()
+        }
+        if any(route.fallback_rank != 0 for route in provider_routes.routes) or any(
+            key not in self.provider_constructors for key in constructor_keys.values()
         ):
             raise ProviderProfileDrift()
         if (
@@ -637,7 +645,7 @@ class DefaultCoreRunnerBuilder:
         if redact(metadata, secrets=loaded_secrets) != metadata:
             raise ProviderProfileDrift()
         adapters = {
-            operation: self.provider_constructors[route.provider_id](
+            operation: self.provider_constructors[constructor_keys[operation]](
                 route, secrets[operation], self.host_slot
             )
             for operation, route in routes.items()
@@ -703,12 +711,6 @@ class DefaultCoreRunnerBuilder:
             if isinstance(search, UsageReportingSearchProvider)
             else _SlottedSearch(search, self.search_slot)
         )
-        # The audited Core handlers require actual source and lock identities.
-        repository = Path(__file__).resolve().parents[3]
-        commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
-        ).stdout.strip()
-        lock_digest = hashlib.sha256((repository / "uv.lock").read_bytes()).hexdigest()
         handlers = BaselineNodeHandlers(
             initial_plan_generator=planner,
             ranker=cast(Any, SimilarityRanker(cast(TextEmbedder, adapters["embed"]))),
@@ -728,8 +730,8 @@ class DefaultCoreRunnerBuilder:
             fetch_snapshot_id=str(
                 routes["fetch"].parameters.get("snapshot_id", provider_routes.configuration_sha256)
             ),
-            code_commit=commit,
-            dependency_lock_sha256=lock_digest,
+            code_commit=provenance.code_commit,
+            dependency_lock_sha256=provenance.dependency_lock_sha256,
             provider_profile_configuration_sha256=provider_routes.configuration_sha256,
             seed_supported=config.seed is not None,
             pricing_status="estimated" if pricing_snapshots else "unknown",

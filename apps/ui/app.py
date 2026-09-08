@@ -11,10 +11,17 @@ import os
 from decimal import Decimal
 from typing import Any, Literal, cast
 
-import httpx
 import streamlit as st
 
-from apps.ui.api_client import ArtifactKind, ResearchApiClient, RunView, StreamReconnectExhausted
+from apps.ui.api_client import (
+    ArtifactKind,
+    HTTPError,
+    HTTPStatusError,
+    ResearchApiClient,
+    RunView,
+    StreamReconnectExhausted,
+    TransportError,
+)
 from apps.ui.replay import ShowcaseSession, replay_payload
 
 
@@ -36,7 +43,7 @@ def _table(rows: list[dict[str, Any]]) -> None:
 def _error_message(error: Exception) -> str:
     if isinstance(error, StreamReconnectExhausted):
         return f"Event connection paused at sequence {error.last_event_id}. Reconnect to continue."
-    if isinstance(error, httpx.HTTPStatusError):
+    if isinstance(error, HTTPStatusError):
         try:
             code = error.response.json().get("code")
         except (ValueError, AttributeError):
@@ -56,7 +63,7 @@ def _error_message(error: Exception) -> str:
             code if isinstance(code, str) else "",
             f"API request failed (HTTP {error.response.status_code}).",
         )
-    if isinstance(error, httpx.TransportError):
+    if isinstance(error, TransportError):
         return "Cannot reach the API. Retry using the retained session and request."
     return "The API response or request could not be processed."
 
@@ -165,7 +172,7 @@ def _results(session: ShowcaseSession, view: RunView) -> None:
                     mime=mime,
                     key=f"download_{kind}",
                 )
-        except (httpx.HTTPError, ValueError) as error:
+        except (HTTPError, ValueError) as error:
             st.warning(_error_message(error))
     manifest = _json_object(artifacts.get("manifest"))
     _details(session, manifest)
@@ -238,7 +245,7 @@ def _run_panel(
             _results(session, view)
         else:
             st.info("Waiting for run status.")
-    except (httpx.HTTPError, ValueError, TypeError) as error:
+    except (HTTPError, ValueError, TypeError) as error:
         st.error(_error_message(error))
     if automatic_at_render and not session.automatic_refresh:
         st.rerun()
@@ -286,7 +293,7 @@ def main() -> None:
             session.submit(payload)
             session.watch()
             st.rerun()
-        except (httpx.HTTPError, ValueError) as error:
+        except (HTTPError, ValueError) as error:
             st.error(_error_message(error))
     automatic = session.automatic_refresh
     st.fragment(run_every=1 if automatic else None)(_run_panel)(

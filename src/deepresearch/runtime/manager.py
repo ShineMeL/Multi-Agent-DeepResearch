@@ -15,11 +15,10 @@ from decimal import Decimal
 from typing import Any, Literal, Protocol
 from uuid import uuid4
 
-from langgraph.checkpoint.base import BaseCheckpointSaver
-
-from deepresearch.domain import ResourceUsage, RunConfig, RunEvent
+from deepresearch.domain import RunConfig, RunEvent
 from deepresearch.runtime.admission import AdmissionController, NoOpAdmissionController
 from deepresearch.runtime.cancellation import CancellationToken
+from deepresearch.runtime.checkpointers import BaseCheckpointSaver
 from deepresearch.runtime.deployment_policy import DeploymentPolicy
 from deepresearch.runtime.manifest import PricingSnapshot
 from deepresearch.runtime.ports import ResearchRunner
@@ -41,6 +40,7 @@ from deepresearch.storage.protocols import (
     RunView,
     TerminalEventDraft,
 )
+from deepresearch.storage.usage_recovery import recover_usage
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -338,7 +338,7 @@ class RunManager:
             except BaseException:
                 execution.close()
                 self._tokens.pop(run_id, None)
-                final = self._inactive_finalization(saved, "interrupted", "TASK_START_FAILED")
+                final = await self._inactive_finalization(saved, "interrupted", "TASK_START_FAILED")
                 await self._finalize(saved, final)
                 raise
             self._tasks[run_id] = task
@@ -406,7 +406,7 @@ class RunManager:
             if record.status == "queued" and (token := self._tokens.get(run_id)):
                 self._user_cancel_requested.add(run_id)
                 token.cancel()
-            final = self._inactive_finalization(record, "cancelled", "CANCELLED_BY_USER")
+            final = await self._inactive_finalization(record, "cancelled", "CANCELLED_BY_USER")
             saved = await self._finalize(record, final)
             if record.status == "queued" and (task := self._tasks.get(run_id)):
                 # The run lock prevents start throughout finalization. Keep its
@@ -414,11 +414,13 @@ class RunManager:
                 task.cancel()
             return _view(saved)
 
-    @staticmethod
-    def _inactive_finalization(
+    async def _inactive_finalization(
+        self,
         record: RunRecord,
         status: Literal["cancelled", "interrupted", "failed"],
         code: str,
+        *,
+        never_started: bool = False,
     ) -> RunFinalization:
         return RunFinalization(
             status=status,
@@ -427,7 +429,11 @@ class RunManager:
             report_artifact_id=record.report_artifact_id,
             evidence_graph_artifact_id=record.evidence_graph_artifact_id,
             manifest_artifact_id=record.manifest_artifact_id,
-            final_usage=record.final_usage or ResourceUsage.zero(),
+            final_usage=recover_usage(
+                record.final_usage,
+                await self.store.list_events_after(record.run_id, 0),
+                never_started=never_started or record.status == "queued",
+            ),
             error_code=code,
         )
 
@@ -476,10 +482,11 @@ class RunManager:
                             if current.run_id in self._shutdown_requested
                             else "TASK_START_FAILED"
                         )
-                        final = self._inactive_finalization(
+                        final = await self._inactive_finalization(
                             current,
                             "cancelled" if cancelled else "interrupted",
                             code,
+                            never_started=True,
                         )
                         await self._finalize(current, final)
                     else:
@@ -513,8 +520,16 @@ class RunManager:
                 raise ValueError("runner result identity mismatch")
             final = RunFinalization.from_result(result)
         except Exception:  # noqa: BLE001 - public errors never contain exception text
-            final = self._inactive_finalization(record, "failed", "INTERNAL_ERROR")
+            final = await self._inactive_finalization(record, "failed", "INTERNAL_ERROR")
         async with self._lock_for(record.run_id):
+            if final.final_usage.cost_usd is None:
+                final = replace(
+                    final,
+                    final_usage=recover_usage(
+                        final.final_usage,
+                        await self.store.list_events_after(record.run_id, 0),
+                    ),
+                )
             if record.pricing_status == "estimated" and final.final_usage.cost_usd is None:
                 final = replace(
                     final, status="failed", stop_reason=None, error_code="PRICING_INCOMPLETE"
@@ -560,7 +575,8 @@ class RunManager:
             # Repeating settlement after a failed clear is deliberately idempotent.
             await self.admission.settle(reservation, record.final_usage.cost_usd)
         else:
-            await self.admission.release(reservation)
+            await self.admission.defer_settlement(reservation)
+            return record
         return await self.store.clear_admission(record.run_id, reservation)
 
     async def _broadcast_terminal(self, record: RunRecord) -> None:
@@ -637,7 +653,7 @@ class RunManager:
                         self._shutdown_requested.add(run_id)
                     self._tokens[run_id].cancel()
                     if record.status == "queued":
-                        final = self._inactive_finalization(
+                        final = await self._inactive_finalization(
                             record, "interrupted", "SERVICE_SHUTDOWN"
                         )
                         await self._finalize(record, final)

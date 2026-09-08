@@ -12,6 +12,10 @@ from pydantic import BaseModel, ConfigDict
 
 from deepresearch.domain import ResourceUsage, RunEvent, RunStatus, StopReason
 
+HTTPError = httpx.HTTPError
+HTTPStatusError = httpx.HTTPStatusError
+TransportError = httpx.TransportError
+
 ArtifactKind = Literal["report", "evidence", "manifest"]
 _TERMINAL = {"interrupted", "completed", "failed", "cancelled"}
 

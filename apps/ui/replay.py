@@ -7,9 +7,7 @@ from time import monotonic
 from typing import Literal
 from uuid import uuid4
 
-import httpx
-
-from apps.ui.api_client import ResearchApiClient, RunAccepted, RunView
+from apps.ui.api_client import HTTPError, HTTPStatusError, ResearchApiClient, RunAccepted, RunView
 from deepresearch.domain import FreshnessRequirement, ResearchRequest, RunEvent
 
 
@@ -139,7 +137,7 @@ class ShowcaseSession:
         def read_status() -> None:
             try:
                 queue.put(api.get_run(run_id))
-            except (httpx.HTTPError, ValueError, RuntimeError) as error:
+            except (HTTPError, ValueError, RuntimeError) as error:
                 queue.put(error)
             finally:
                 finished.set()
@@ -160,7 +158,7 @@ class ShowcaseSession:
             self.pending = (payload, str(uuid4()))
         try:
             accepted = self.api.create_run(*self.pending)
-        except httpx.HTTPStatusError as error:
+        except HTTPStatusError as error:
             # An explicit client rejection can be edited. An ambiguous timeout
             # or server failure retains the exact key and payload for retry.
             if error.response.status_code < 500:
@@ -191,7 +189,7 @@ class ShowcaseSession:
             try:
                 for event in api.events(run_id, cursor):
                     queue.put(event)
-            except (httpx.HTTPError, ValueError, RuntimeError) as error:
+            except (HTTPError, ValueError, RuntimeError) as error:
                 queue.put(error)
             finally:
                 finished.set()
@@ -209,7 +207,7 @@ class ShowcaseSession:
             if isinstance(result, Exception):
                 self.poll_error = result
                 self._poll_failures += 1
-                if isinstance(result, httpx.HTTPStatusError) and result.response.status_code in {
+                if isinstance(result, HTTPStatusError) and result.response.status_code in {
                     401,
                     403,
                     404,

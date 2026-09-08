@@ -12,7 +12,7 @@ from sqlalchemy import func, select
 from apps.api import create_app
 from deepresearch.domain import RunBudget
 from deepresearch.runtime.checkpoints import checkpoint_serializer
-from deepresearch.runtime.limits import LimitManager
+from deepresearch.runtime.limits import LimitManager, RateLimitExceeded
 from deepresearch.runtime.manager import RunManager, owner_scope_sha256
 from deepresearch.runtime.runner_factory import FilePricingCatalog
 from deepresearch.storage import LocalArtifactStore
@@ -179,7 +179,7 @@ async def test_signed_session_bucket_returns_exact_retry_after(store, tmp_path):
         await manager.shutdown(0)
 
 
-async def test_restart_then_cancel_releases_persisted_reservation(store, tmp_path):
+async def test_restart_then_cancel_retains_unknown_persisted_reservation(store, tmp_path):
     first = await admit(LimitManager(store, daily_limit=Decimal(1)), "r1", cost="0.50")
     owner = owner_scope_sha256(client_ip="1", session_id="signed-a")
     await store.create_run(
@@ -194,10 +194,13 @@ async def test_restart_then_cancel_releases_persisted_reservation(store, tmp_pat
     _, manager, _, limits, _ = setup_service(store, tmp_path, daily_limit="1")
     try:
         await manager.cancel("r1", owner_scope_sha256=owner)
-        assert await store.ledger_state(first.reservation_id) == "released"
-        assert (await store.get_run("r1")).admission_reservation_id is None
+        await manager.cancel("r1", owner_scope_sha256=owner)
+        await store.reconcile_startup(datetime.now(UTC))
+        assert await store.ledger_state(first.reservation_id) == "reserved"
+        assert (await store.get_run("r1")).admission_reservation_id == first.reservation_id
         await admit(limits, "new-a", cost="0.50")
-        await admit(limits, "new-b", cost="0.50")
+        with pytest.raises(RateLimitExceeded):
+            await admit(limits, "new-b", cost="0.50")
     finally:
         await manager.shutdown(0)
 

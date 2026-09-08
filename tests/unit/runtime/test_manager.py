@@ -164,15 +164,19 @@ async def test_idempotency_owner_scope_and_nonexistent_are_indistinguishable(rig
 
 
 @pytest.mark.parametrize("status", ["queued", "interrupted", "cancelled"])
-async def test_cancel_inactive_is_idempotent_and_releases_persisted_reservation(rig, status):
+async def test_cancel_inactive_is_idempotent_and_preserves_unresolved_reservation(rig, status):
     manager, _, _, store, admission = rig
     await seed(rig, status, admission_reservation_id="durable", admission_attempt_no=4)
     first = await manager.cancel("seed", owner_scope_sha256=OWNER)
     second = await manager.cancel("seed", owner_scope_sha256=OWNER)
     assert first.status == second.status == "cancelled"
     assert second.stop_reason is None
-    assert (await store.get_run("seed")).admission_reservation_id is None
-    assert ("release", "durable") in admission.operations
+    if status == "queued":
+        assert (await store.get_run("seed")).admission_reservation_id is None
+        assert admission.operations == [("settle", "durable", Decimal(0))]
+    else:
+        assert (await store.get_run("seed")).admission_reservation_id == "durable"
+        assert admission.operations == []
     assert len(await store.list_events_after("seed", 0)) == (0 if status == "cancelled" else 1)
     assert not manager._user_cancel_requested
 
@@ -449,7 +453,7 @@ async def test_task_creation_failure_releases_durable_admission(rig, monkeypatch
     saved = await store.get_by_idempotency(OWNER, "scheduling-failure")
     assert saved.status == "interrupted"
     assert saved.admission_reservation_id is None
-    assert admission.operations == [("release", "reservation-1")]
+    assert admission.operations == [("settle", "reservation-1", Decimal(0))]
     assert (await store.list_events_after(saved.run_id, 0))[-1].kind == "run_interrupted"
 
 
@@ -550,7 +554,7 @@ async def test_start_failure_recovers_authoritative_state_without_runner_calls(r
     assert (recovered.status, recovered.error_code) == ("interrupted", "TASK_START_FAILED")
     assert not factory.runner.calls
     assert (await store.get_run(view.run_id)).admission_reservation_id is None
-    assert admission.operations == [("release", "reservation-1")]
+    assert admission.operations == [("settle", "reservation-1", Decimal(0))]
     await asyncio.wait_for(subscription.wait(), 1)
     assert len(await store.list_events_after(view.run_id, 0)) == 1
     await subscription.close()

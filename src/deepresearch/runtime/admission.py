@@ -24,6 +24,8 @@ class AdmissionController(Protocol):
 
     async def release(self, reservation_id: str | None) -> None: ...
 
+    async def defer_settlement(self, reservation_id: str) -> None: ...
+
 
 class NoOpAdmissionController:
     async def admit(
@@ -41,6 +43,9 @@ class NoOpAdmissionController:
         return None
 
     async def release(self, reservation_id: str | None) -> None:
+        return None
+
+    async def defer_settlement(self, reservation_id: str) -> None:
         return None
 
 

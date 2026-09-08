@@ -14,6 +14,7 @@ from deepresearch.storage.protocols import (
     StartupRecovery,
     TerminalEventDraft,
 )
+from deepresearch.storage.usage_recovery import recover_usage
 
 _LEGAL_NONTERMINAL_TRANSITIONS = frozenset({("queued", "running"), ("interrupted", "running")})
 _LEGAL_TERMINAL_TRANSITIONS = {
@@ -189,7 +190,11 @@ class FakeRunStore:
                     report_artifact_id=record.report_artifact_id,
                     evidence_graph_artifact_id=record.evidence_graph_artifact_id,
                     manifest_artifact_id=record.manifest_artifact_id,
-                    final_usage=record.final_usage or ResourceUsage.zero(),
+                    final_usage=recover_usage(
+                        record.final_usage,
+                        self._events[run_id],
+                        never_started=record.status == "queued",
+                    ),
                     error_code="PROCESS_RESTART",
                 ),
                 TerminalEventDraft(
@@ -207,12 +212,18 @@ class FakeRunStore:
             if record is None:
                 reservation.state = "released"
                 released.append(reservation_id)
-            elif record.status in {"completed", "failed", "cancelled"}:
+            elif record.status in {"interrupted", "completed", "failed", "cancelled"}:
+                record = replace(
+                    record,
+                    final_usage=recover_usage(
+                        record.final_usage,
+                        self._events[record.run_id],
+                    ),
+                )
+                self._runs[record.run_id] = record
                 if record.final_usage is not None and record.final_usage.cost_usd is not None:
                     reservation.amount = record.final_usage.cost_usd
                     reservation.state = "settled"
-                else:
-                    reservation.state = "released"
         return StartupRecovery(tuple(interrupted), tuple(sorted(released)))
 
     async def reserve_daily_cost(

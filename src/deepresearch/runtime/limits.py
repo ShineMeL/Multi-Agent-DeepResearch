@@ -195,6 +195,11 @@ class LimitManager:
             await self.store.release_daily_cost(reservation_id)
             await self._release_local(reservation_id)
 
+    async def defer_settlement(self, reservation_id: str) -> None:
+        # Work has stopped, but its unresolved durable bill remains reserved.
+        async with self._admission_lock:
+            await self._release_local(reservation_id)
+
     @asynccontextmanager
     async def search_slot(self) -> AsyncGenerator[None]:
         async with self.search_global:

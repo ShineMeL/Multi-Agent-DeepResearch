@@ -12,6 +12,7 @@ import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import ValidationError
 
+from deepresearch.domain import RunConfig
 from deepresearch.providers.httpx_fetcher import no_op_host_slot
 from deepresearch.runtime import CancellationToken
 from deepresearch.runtime.checkpoints import checkpoint_serializer
@@ -82,7 +83,16 @@ def pricing(provider: str, endpoint: str, model: str, rate: str = "0") -> Pricin
     )
 
 
-def composition(tmp_path: Path):
+def composition(
+    tmp_path: Path,
+) -> tuple[
+    DefaultCoreRunnerBuilder,
+    RunConfig,
+    FrozenProviderRoutes,
+    tuple[PricingSnapshot, ...],
+    Counter[str],
+    LocalArtifactStore,
+]:
     calls: Counter[str] = Counter()
     providers = {
         "model": CountingOfflineModel(_offline_plan(), calls),

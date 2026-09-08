@@ -7,14 +7,19 @@ expected failure until the service builder binds Core's required replay_parent.
 
 import asyncio
 import json
+import time
+from contextlib import AsyncExitStack
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+from pydantic import SecretStr
 
 from apps.api import create_app
+from apps.api.main import create_app as create_hosted_app
+from apps.api.settings import ServiceSettings
 from deepresearch.domain import RunConfig
 from deepresearch.providers import ProviderUsageResult, RawDocument
 from deepresearch.providers.httpx_fetcher import no_op_host_slot
@@ -33,11 +38,14 @@ from deepresearch.runtime.runner_factory import (
     FilePricingCatalog,
     FileProviderRouteCatalog,
     ProviderConstructor,
-    default_provider_constructors,
 )
 from deepresearch.storage.migrations.runner import upgrade_service_schema
 from deepresearch.storage.sqlalchemy_store import SqlAlchemyRunStore
-from tests.integration.replay.test_baseline_graph import CountingOfflineFetcher
+from deepresearch.workflow.runner import BaselineRuntimeHooks
+from tests.integration.replay.test_baseline_graph import (
+    ControlledSegmentClock,
+    CountingOfflineFetcher,
+)
 from tests.integration.replay.test_manager_replay import (
     setup,  # pyright: ignore[reportUnknownVariableType] - existing untyped fixture
 )
@@ -87,6 +95,7 @@ class MissingReplayParent(RuntimeError):
 async def test_full_service_has_artifacts_terminal_event_and_owned_reconnect(
     tmp_path: Path,
     strict_replay: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     writer = ReplayBundleWriter.create(tmp_path / "bundle", run_id="service-recording")
     for replaying in (False, True) if strict_replay else (False,):
@@ -130,9 +139,6 @@ async def test_full_service_has_artifacts_terminal_event_and_owned_reconnect(
             for row in rows:
                 if row["operation"] != "parse":
                     row["parameters"] = {"bundle_path": str(tmp_path / "bundle")}
-                    builder.provider_constructors[row["provider_id"]] = (
-                        default_provider_constructors()["replay"]
-                    )
         else:
             wrappers: dict[str, Any] = {
                 "model": RecordingModelProvider,
@@ -163,17 +169,82 @@ async def test_full_service_has_artifacts_terminal_event_and_owned_reconnect(
         await upgrade_service_schema(store.engine)
         manager.store = store
         try:
-            async with open_service_checkpointer(
-                database_url=f"sqlite+aiosqlite:///{root / 'runs.sqlite'}",
-                sqlite_path=root / "checkpoints.sqlite",
-            ) as saver:
-                manager.checkpointer = saver
-                app = create_app(
-                    manager=manager,
-                    deployment_policy=manager.deployment_policy,
-                    artifact_store=artifacts,
-                    session_secret=b"s" * 32,
-                )
+            async with AsyncExitStack() as stack:
+                if replaying:
+                    # Core compares monotonic active duration to a UTC envelope.
+                    # Keep its existing deterministic clock fixture; all service
+                    # composition, route selection and provider types stay real.
+                    def runtime_clock() -> BaselineRuntimeHooks:
+                        clock = ControlledSegmentClock(
+                            monotonic_start=time.monotonic(),
+                            utc_offset_seconds=0,
+                        )
+                        return BaselineRuntimeHooks(
+                            monotonic=clock.monotonic, utc_now=clock.utc_now
+                        )
+
+                    monkeypatch.setattr(
+                        "deepresearch.workflow.runner.BaselineRuntimeHooks", runtime_clock
+                    )
+                    # Catalog files are the supported runtime input. Lifespan
+                    # constructs the default registry, factory, saver and manager.
+                    profiles_path = root / "profiles.json"
+                    profiles_path.write_text(
+                        json.dumps(
+                            {
+                                "profiles": {
+                                    "offline": {
+                                        "execution_mode": "replay",
+                                        "routes": rows,
+                                    }
+                                }
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    pricing_path = root / "pricing.json"
+                    pricing_path.write_text(
+                        json.dumps(
+                            {
+                                "profiles": {
+                                    "offline": [
+                                        snapshot.model_dump(mode="json") for snapshot in snapshots
+                                    ]
+                                }
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    app = create_hosted_app(
+                        ServiceSettings(
+                            database_url=f"sqlite+aiosqlite:///{root / 'runs.sqlite'}",
+                            artifact_root=root,
+                            checkpoint_sqlite_path=root / "checkpoints.sqlite",
+                            provider_profile_catalog_path=profiles_path,
+                            pricing_catalog_path=pricing_path,
+                            allowed_provider_profile_ids=("offline",),
+                            session_signing_key=SecretStr("s" * 32),
+                            langgraph_strict_msgpack=True,
+                        )
+                    )
+                    await stack.enter_async_context(app.router.lifespan_context(app))
+                    manager = app.state.manager
+                    saver = manager.checkpointer
+                    store = app.state.store
+                else:
+                    saver = await stack.enter_async_context(
+                        open_service_checkpointer(
+                            database_url=f"sqlite+aiosqlite:///{root / 'runs.sqlite'}",
+                            sqlite_path=root / "checkpoints.sqlite",
+                        )
+                    )
+                    manager.checkpointer = saver
+                    app = create_app(
+                        manager=manager,
+                        deployment_policy=manager.deployment_policy,
+                        artifact_store=artifacts,
+                        session_secret=b"s" * 32,
+                    )
                 body: dict[str, Any] = {
                     "request": conf.request.model_dump(mode="json"),
                     "workflow_id": "baseline-v1",

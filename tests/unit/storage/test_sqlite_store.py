@@ -95,7 +95,7 @@ async def test_ledger_ids_attempts_and_settlement_survive_reopening(store, tmp_p
         await other.engine.dispose()
 
 
-async def test_terminal_recovery_settles_known_cost_and_releases_unknown_cost(store):
+async def test_terminal_recovery_settles_known_cost_and_retains_unknown_cost(store):
     day = date(2026, 8, 29)
     settled = await store.reserve_daily_cost(day, "known", Decimal(3), Decimal(10))
     released = await store.reserve_daily_cost(day, "unknown", Decimal(3), Decimal(10))
@@ -108,7 +108,7 @@ async def test_terminal_recovery_settles_known_cost_and_releases_unknown_cost(st
     await store.create_run(make_record("unknown", status="failed"))
     assert (await store.reconcile_startup(datetime.now(UTC))).released_orphan_reservation_ids == ()
     assert await store.ledger_state(settled.reservation_id) == "settled"
-    assert await store.ledger_state(released.reservation_id) == "released"
+    assert await store.ledger_state(released.reservation_id) == "reserved"
 
 
 async def test_concurrent_migration_initialization_is_idempotent(tmp_path):
@@ -163,7 +163,7 @@ async def test_restart_is_durable_and_retains_linked_reservations(store):
         events = await store.list_events_after(run_id, 0)
         assert len(events) == 1
         assert events[0].status == "interrupted"
-    assert await store.ledger_state(linked.reservation_id) == "reserved"
+    assert await store.ledger_state(linked.reservation_id) == "settled"
     assert await store.ledger_state(orphan.reservation_id) == "released"
     assert (await store.reconcile_startup(at)).interrupted_run_ids == ()
 

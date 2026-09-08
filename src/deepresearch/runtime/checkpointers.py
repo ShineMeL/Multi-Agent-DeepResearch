@@ -17,6 +17,8 @@ from deepresearch.runtime.checkpoints import (
 )
 from deepresearch.runtime.ports import CheckpointRef
 
+__all__ = ["BaseCheckpointSaver", "latest_checkpoint_ref", "open_service_checkpointer"]
+
 
 @asynccontextmanager
 async def open_service_checkpointer(

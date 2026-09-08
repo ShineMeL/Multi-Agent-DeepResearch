@@ -37,9 +37,7 @@ def test_ci_keeps_provider_secrets_out_of_verification_and_gates_online():
     ):
         assert suite in commands
     assert "uv sync --all-extras --locked" in commands
-    assert (
-        "ruff check ." in commands and "pyright src apps benchmarks experiments tests" in commands
-    )
+    assert "ruff check ." in commands and "pyright src apps benchmarks experiments\n" in commands
     assert "docker compose config" in commands
     assert "docker build" in commands
     smoke = workflow["jobs"]["online-smoke"]

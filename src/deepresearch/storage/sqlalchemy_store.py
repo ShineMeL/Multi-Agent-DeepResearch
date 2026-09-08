@@ -25,6 +25,7 @@ from deepresearch.storage.protocols import (
     StartupRecovery,
     TerminalEventDraft,
 )
+from deepresearch.storage.usage_recovery import recover_usage
 
 _RECORD = TypeAdapter(RunRecord)
 _NONTERMINAL = frozenset({("queued", "running"), ("interrupted", "running")})
@@ -355,6 +356,9 @@ class SqlAlchemyRunStore:
             )
             for row in stale:
                 record = _record(row)
+                events = await session.scalars(
+                    select(RunEventRow).where(RunEventRow.run_id == row.run_id)
+                )
                 await self._finalize(
                     session,
                     row,
@@ -366,7 +370,11 @@ class SqlAlchemyRunStore:
                         record.report_artifact_id,
                         record.evidence_graph_artifact_id,
                         record.manifest_artifact_id,
-                        record.final_usage or ResourceUsage.zero(),
+                        recover_usage(
+                            record.final_usage,
+                            [RunEvent.model_validate(event.payload_json) for event in events],
+                            never_started=record.status == "queued",
+                        ),
                         "PROCESS_RESTART",
                     ),
                     TerminalEventDraft(occurred_at, "startup", "run_interrupted", {}),
@@ -380,11 +388,17 @@ class SqlAlchemyRunStore:
                 if row is None:
                     reservation.state = "released"
                     released.append(reservation.reservation_id)
-                elif row.status in {"completed", "failed", "cancelled"}:
-                    usage = _record(row).final_usage
-                    if usage is not None and usage.cost_usd is not None:
+                elif row.status in {"interrupted", "completed", "failed", "cancelled"}:
+                    record = _record(row)
+                    events = await session.scalars(
+                        select(RunEventRow).where(RunEventRow.run_id == row.run_id)
+                    )
+                    usage = recover_usage(
+                        record.final_usage,
+                        [RunEvent.model_validate(event.payload_json) for event in events],
+                    )
+                    row.final_usage_json = usage.model_dump(mode="json")
+                    if usage.cost_usd is not None:
                         reservation.amount = str(usage.cost_usd)
                         reservation.state = "settled"
-                    else:
-                        reservation.state = "released"
             return StartupRecovery(tuple(interrupted), tuple(sorted(released)))
