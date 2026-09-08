@@ -174,6 +174,7 @@ async def test_cancel_inactive_is_idempotent_and_releases_persisted_reservation(
     assert (await store.get_run("seed")).admission_reservation_id is None
     assert ("release", "durable") in admission.operations
     assert len(await store.list_events_after("seed", 0)) == (0 if status == "cancelled" else 1)
+    assert not manager._user_cancel_requested
 
 
 @pytest.mark.parametrize("status", ["completed", "failed"])
@@ -450,3 +451,179 @@ async def test_task_creation_failure_releases_durable_admission(rig, monkeypatch
     assert saved.admission_reservation_id is None
     assert admission.operations == [("release", "reservation-1")]
     assert (await store.list_events_after(saved.run_id, 0))[-1].kind == "run_interrupted"
+
+
+@pytest.mark.parametrize("failure", ["settle", "clear"])
+async def test_cancel_retry_settles_known_usage_without_releasing_reservation(rig, failure):
+    manager, conf, factory, store, admission = rig
+    factory.required = {("p", "complete", "m")}
+    manager.pricing_catalog = FilePricingCatalog({"offline": (pricing("p", "complete", "m"),)})
+    factory.runner.cost = Decimal("0.3")
+    view = await create(manager, conf)
+    await factory.runner.started.wait()
+    subscription = await manager.subscribe(view.run_id, owner_scope_sha256=OWNER)
+    original_settle = admission.settle
+    original_clear = store.clear_admission
+
+    async def failed_settle(reservation_id, actual_cost_usd):
+        raise OSError("settlement unavailable")
+
+    async def failed_clear(run_id, reservation_id):
+        raise OSError("clear unavailable")
+
+    if failure == "settle":
+        admission.settle = failed_settle
+    else:
+        store.clear_admission = failed_clear
+    await manager.cancel(view.run_id, owner_scope_sha256=OWNER)
+    with pytest.raises(OSError):
+        await manager.wait(view.run_id)
+    saved = await store.get_run(view.run_id)
+    assert saved.status == "cancelled" and saved.admission_reservation_id == "reservation-1"
+    # A retry while persistence is still unavailable must keep the monetary link.
+    with pytest.raises(OSError):
+        await manager.cancel(view.run_id, owner_scope_sha256=OWNER)
+    assert (await store.get_run(view.run_id)).admission_reservation_id == "reservation-1"
+    assert not any(operation[0] == "release" for operation in admission.operations)
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(subscription.wait(), 0.01)
+    admission.settle = original_settle
+    store.clear_admission = original_clear
+    retried = await manager.cancel(view.run_id, owner_scope_sha256=OWNER)
+    assert retried.status == "cancelled" and retried.final_usage.cost_usd == Decimal("0.3")
+    assert (await store.get_run(view.run_id)).admission_reservation_id is None
+    await asyncio.wait_for(subscription.wait(), 1)
+    assert all(
+        operation == ("settle", "reservation-1", Decimal("0.3"))
+        for operation in admission.operations
+    )
+    assert len(admission.operations) == (1 if failure == "settle" else 3)
+    assert len(await store.list_events_after(view.run_id, 0)) == 1
+    await subscription.close()
+
+
+async def test_interrupted_cancel_settles_persisted_known_usage(rig):
+    manager, _, _, store, admission = rig
+    await seed(
+        rig,
+        "interrupted",
+        admission_reservation_id="durable",
+        admission_attempt_no=2,
+        pricing_status="estimated",
+        final_usage=ResourceUsage.zero().model_copy(update={"cost_usd": Decimal("0.7")}),
+    )
+    result = await manager.cancel("seed", owner_scope_sha256=OWNER)
+    assert result.status == "cancelled" and result.final_usage.cost_usd == Decimal("0.7")
+    assert admission.operations == [("settle", "durable", Decimal("0.7"))]
+    assert (await store.get_run("seed")).admission_reservation_id is None
+
+
+@pytest.mark.parametrize("failure", ["get", "transition_before", "transition_after"])
+async def test_start_failure_recovers_authoritative_state_without_runner_calls(rig, failure):
+    manager, conf, factory, store, admission = rig
+    original_get = store.get_run
+    original_transition = store.transition
+    injected = False
+
+    async def failed_get(run_id):
+        nonlocal injected
+        if failure == "get" and not injected:
+            injected = True
+            raise OSError("read unavailable")
+        return await original_get(run_id)
+
+    async def failed_transition(run_id, expected, target):
+        nonlocal injected
+        if not injected:
+            injected = True
+            if failure == "transition_after":
+                await original_transition(run_id, expected, target)
+            raise OSError("transition reply unavailable")
+        return await original_transition(run_id, expected, target)
+
+    store.get_run = failed_get
+    if failure != "get":
+        store.transition = failed_transition
+    view = await create(manager, conf)
+    subscription = await manager.subscribe(view.run_id, owner_scope_sha256=OWNER)
+    recovered = await manager.wait(view.run_id)
+    assert (recovered.status, recovered.error_code) == ("interrupted", "TASK_START_FAILED")
+    assert not factory.runner.calls
+    assert (await store.get_run(view.run_id)).admission_reservation_id is None
+    assert admission.operations == [("release", "reservation-1")]
+    await asyncio.wait_for(subscription.wait(), 1)
+    assert len(await store.list_events_after(view.run_id, 0)) == 1
+    await subscription.close()
+
+
+async def test_start_failure_keeps_recovery_task_until_store_recovers(rig):
+    manager, conf, factory, store, admission = rig
+    original_get = store.get_run
+    recovery_attempt = asyncio.Event()
+    recovered = asyncio.Event()
+    attempts = 0
+
+    async def unavailable_get(run_id):
+        nonlocal attempts
+        attempts += 1
+        if attempts > 1:
+            recovery_attempt.set()
+        if not recovered.is_set():
+            raise OSError("storage unavailable")
+        return await original_get(run_id)
+
+    store.get_run = unavailable_get
+    view = await create(manager, conf)
+    try:
+        await asyncio.wait_for(recovery_attempt.wait(), 1)
+        task = manager._tasks[view.run_id]
+        assert not task.done()
+        assert (await original_get(view.run_id)).admission_reservation_id == "reservation-1"
+        assert not admission.operations and not factory.runner.calls
+    finally:
+        recovered.set()
+    result = await asyncio.wait_for(manager.wait(view.run_id), 2)
+    assert result.status == "interrupted" and result.error_code == "TASK_START_FAILED"
+
+
+async def test_rejected_ids_and_closed_subscriptions_leave_no_lock_entries(rig):
+    manager, _, _, _, _ = rig
+    await seed(rig, "interrupted")
+    for index in range(50):
+        for run_id in ("seed", f"missing-{index}"):
+            with pytest.raises(RunNotFound):
+                await manager.cancel(run_id, owner_scope_sha256="wrong")
+            with pytest.raises(RunNotFound):
+                await manager.resume(run_id, client_ip="wrong", session_id="wrong")
+            with pytest.raises(RunNotFound):
+                await manager.subscribe(run_id, owner_scope_sha256="wrong")
+        subscription = await manager.subscribe("seed", owner_scope_sha256=OWNER)
+        await subscription.close()
+    assert not manager._locks
+    assert not manager._broadcast_locks
+    assert not manager._subscribers
+
+
+async def test_lock_cleanup_keeps_same_lock_for_active_holders_and_waiters(rig):
+    manager = rig[0]
+    entered = asyncio.Event()
+    waiting = asyncio.Event()
+
+    async def contender():
+        waiting.set()
+        async with manager._lock_for("shared"):
+            entered.set()
+
+    async with manager._lock_for("shared"):
+        first = asyncio.create_task(contender())
+        await waiting.wait()
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        waiting.clear()
+        second = asyncio.create_task(contender())
+        await waiting.wait()
+        assert not entered.is_set()
+    await second
+    assert entered.is_set()
+    assert not manager._locks

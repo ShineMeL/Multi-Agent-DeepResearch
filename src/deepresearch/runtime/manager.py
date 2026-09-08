@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import math
-from collections.abc import Collection
-from dataclasses import replace
+from collections.abc import AsyncGenerator, Awaitable, Callable, Collection
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Literal, Protocol
@@ -37,6 +39,8 @@ from deepresearch.storage.protocols import (
     RunView,
     TerminalEventDraft,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class RunNotFound(LookupError):
@@ -97,11 +101,31 @@ class EventSubscription(Protocol):
     async def close(self) -> None: ...
 
 
+@dataclass
+class _LockEntry:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
+
+
+@asynccontextmanager
+async def _hold_lock(entries: dict[str, _LockEntry], run_id: str) -> AsyncGenerator[None]:
+    entry = entries.setdefault(run_id, _LockEntry())
+    # Count holders AND waiters before the first await. No caller can replace
+    # an entry while another context is using or waiting for its lock.
+    entry.users += 1
+    try:
+        async with entry.lock:
+            yield
+    finally:
+        entry.users -= 1
+        if entry.users == 0:
+            del entries[run_id]
+
+
 class _Subscription:
-    def __init__(self, lock: asyncio.Lock, subscribers: set[_Subscription]) -> None:
+    def __init__(self, close_callback: Callable[[_Subscription], Awaitable[None]]) -> None:
         self.event = asyncio.Event()
-        self.lock = lock
-        self.subscribers = subscribers
+        self.close_callback: Callable[[_Subscription], Awaitable[None]] | None = close_callback
         self.closed = False
 
     async def wait(self) -> None:
@@ -111,10 +135,8 @@ class _Subscription:
             self.event.clear()
 
     async def close(self) -> None:
-        async with self.lock:
-            self.closed = True
-            self.subscribers.discard(self)
-            self.event.set()
+        if self.close_callback is not None:
+            await self.close_callback(self)
 
 
 class _DurableSink:
@@ -182,8 +204,8 @@ class RunManager:
         self._secrets = tuple(secrets)
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._tokens: dict[str, CancellationToken] = {}
-        self._locks: dict[str, asyncio.Lock] = {}
-        self._broadcast_locks: dict[str, asyncio.Lock] = {}
+        self._locks: dict[str, _LockEntry] = {}
+        self._broadcast_locks: dict[str, _LockEntry] = {}
         self._subscribers: dict[str, set[_Subscription]] = {}
         self._user_cancel_requested: set[str] = set()
         self._shutdown_requested: set[str] = set()
@@ -191,8 +213,11 @@ class RunManager:
         self._creation_lock = asyncio.Lock()
         self._shutdown_lock = asyncio.Lock()
 
-    def _lock_for(self, run_id: str) -> asyncio.Lock:
-        return self._locks.setdefault(run_id, asyncio.Lock())
+    def _lock_for(self, run_id: str) -> AbstractAsyncContextManager[None]:
+        return _hold_lock(self._locks, run_id)
+
+    def _broadcast_lock_for(self, run_id: str) -> AbstractAsyncContextManager[None]:
+        return _hold_lock(self._broadcast_locks, run_id)
 
     def _ensure_open(self) -> None:
         if self._closing:
@@ -304,7 +329,7 @@ class RunManager:
                 execution.close()
                 self._tokens.pop(run_id, None)
                 final = self._inactive_finalization(saved, "interrupted", "TASK_START_FAILED")
-                await self._finalize(saved, final, settle=False)
+                await self._finalize(saved, final)
                 raise
             self._tasks[run_id] = task
             task.add_done_callback(lambda done: self._forget(run_id, done))
@@ -316,9 +341,10 @@ class RunManager:
             self._tokens.pop(run_id, None)
         self._user_cancel_requested.discard(run_id)
         self._shutdown_requested.discard(run_id)
-        # Consume task failures; wait() still propagates them to its caller.
-        if not task.cancelled():
-            task.exception()
+        # Retrieving the exception prevents orphan-task warnings. Also record a
+        # stable diagnostic when no caller is currently awaiting wait().
+        if not task.cancelled() and task.exception() is not None:
+            _LOGGER.error("Run %s task failed; durable recovery is required", run_id)
 
     async def _owned(self, run_id: str, scope: str) -> RunRecord:
         record = await self.store.get_owned_run(run_id, scope)
@@ -356,10 +382,9 @@ class RunManager:
         async with self._lock_for(run_id):
             record = await self._owned(run_id, owner_scope_sha256)
             if record.status == "cancelled":
-                await self.admission.release(record.admission_reservation_id)
-                return _view(
-                    await self.store.clear_admission(run_id, record.admission_reservation_id)
-                )
+                saved = await self._complete_accounting(record)
+                await self._broadcast_terminal(saved)
+                return _view(saved)
             validate_cancel(record.status)
             if record.status == "running":
                 token = self._tokens.get(run_id)
@@ -368,13 +393,16 @@ class RunManager:
                 self._user_cancel_requested.add(run_id)
                 token.cancel()
                 return _view(record)
-            if record.status == "queued":
-                if token := self._tokens.get(run_id):
-                    token.cancel()
-                if task := self._tasks.get(run_id):
-                    task.cancel()
+            if record.status == "queued" and (token := self._tokens.get(run_id)):
+                self._user_cancel_requested.add(run_id)
+                token.cancel()
             final = self._inactive_finalization(record, "cancelled", "CANCELLED_BY_USER")
-            return _view(await self._finalize(record, final, settle=False))
+            saved = await self._finalize(record, final)
+            if record.status == "queued" and (task := self._tasks.get(run_id)):
+                # The run lock prevents start throughout finalization. Keep its
+                # recovery task alive if persistence fails before this point.
+                task.cancel()
+            return _view(saved)
 
     @staticmethod
     def _inactive_finalization(
@@ -400,12 +428,60 @@ class RunManager:
         runner: ResearchRunner,
         token: CancellationToken,
     ) -> None:
-        async with self._lock_for(record.run_id):
-            current = await self.store.get_run(record.run_id)
-            if current is None or current.status != "queued":
-                return
-            record = await self.store.transition(record.run_id, "queued", "running")
+        recover = False
+        try:
+            async with self._lock_for(record.run_id):
+                current = await self.store.get_run(record.run_id)
+                if current is None or current.status != "queued":
+                    return
+                if token.is_cancelled():
+                    recover = True
+                else:
+                    record = await self.store.transition(record.run_id, "queued", "running")
+        except Exception:  # noqa: BLE001 - retry from authoritative state, never rerun Core
+            recover = True
+            _LOGGER.warning("Run %s startup failed; durable recovery is pending", record.run_id)
+        if recover:
+            await self._recover_start(record)
+            return
         await self._execute(record, config, runner, token)
+
+    async def _recover_start(self, original: RunRecord) -> None:
+        delay = 0.1
+        while True:
+            try:
+                async with self._lock_for(original.run_id):
+                    # A transition/finalization may have committed before its
+                    # response failed. Never retry using the stale expected status.
+                    current = await self.store.get_run(original.run_id)
+                    if current is None:
+                        await self.admission.release(original.admission_reservation_id)
+                        return
+                    if current.status in {"queued", "running"}:
+                        cancelled = current.run_id in self._user_cancel_requested
+                        code = (
+                            "CANCELLED_BY_USER"
+                            if cancelled
+                            else "SERVICE_SHUTDOWN"
+                            if current.run_id in self._shutdown_requested
+                            else "TASK_START_FAILED"
+                        )
+                        final = self._inactive_finalization(
+                            current,
+                            "cancelled" if cancelled else "interrupted",
+                            code,
+                        )
+                        await self._finalize(current, final)
+                    else:
+                        saved = await self._complete_accounting(current)
+                        await self._broadcast_terminal(saved)
+                    return
+            except Exception:  # noqa: BLE001 - retain active task/admission until durable recovery
+                # Keep the task registered and the reservation linked throughout
+                # an outage. Release the run lock while waiting so cancel/shutdown
+                # can signal intent. No provider or graph work is retried.
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 1.0)
 
     async def _execute(
         self,
@@ -449,30 +525,40 @@ class RunManager:
                     is_partial=True,
                     error_code="SERVICE_SHUTDOWN",
                 )
-            await self._finalize(record, final, settle=final.final_usage.cost_usd is not None)
+            await self._finalize(record, final)
 
     async def _finalize(
         self,
         record: RunRecord,
         final: RunFinalization,
-        *,
-        settle: bool,
     ) -> RunRecord:
         saved, terminal = await self.store.finalize_run(
             record.run_id, record.status, final, _draft(final.status)
         )
-        reservation = saved.admission_reservation_id
-        # Durable terminal comes first. If settlement fails, retain the link for
-        # startup reconciliation; never announce a partially settled lifecycle.
-        if settle and final.final_usage.cost_usd is not None:
-            # settle owns both monetary settlement and the local capacity lease.
-            # A failure retains both the durable reservation and recovery link.
-            await self.admission.settle(reservation, final.final_usage.cost_usd)
-        else:
-            await self.admission.release(reservation)
-        saved = await self.store.clear_admission(saved.run_id, reservation)
+        saved = await self._complete_accounting(saved)
         await self.broadcast_persisted(terminal)
         return saved
+
+    async def _complete_accounting(self, record: RunRecord) -> RunRecord:
+        reservation = record.admission_reservation_id
+        if reservation is None:
+            return record
+        # Durable terminal comes first. If settlement fails, retain the link for
+        # startup reconciliation; never announce a partially settled lifecycle.
+        if record.final_usage is not None and record.final_usage.cost_usd is not None:
+            # settle owns both monetary settlement and the local capacity lease.
+            # Repeating settlement after a failed clear is deliberately idempotent.
+            await self.admission.settle(reservation, record.final_usage.cost_usd)
+        else:
+            await self.admission.release(reservation)
+        return await self.store.clear_admission(record.run_id, reservation)
+
+    async def _broadcast_terminal(self, record: RunRecord) -> None:
+        events = await self.store.list_events_after(record.run_id, 0)
+        for event in reversed(events):
+            if event.kind == f"run_{record.status}" and event.status == record.status:
+                await self.broadcast_persisted(event)
+                return
 
     async def wait(self, run_id: str) -> RunView:
         task = self._tasks.get(run_id)
@@ -489,20 +575,29 @@ class RunManager:
 
     async def subscribe(self, run_id: str, *, owner_scope_sha256: str) -> EventSubscription:
         await self._owned(run_id, owner_scope_sha256)
-        lock = self._broadcast_locks.setdefault(run_id, asyncio.Lock())
-        async with lock:
+        async with self._broadcast_lock_for(run_id):
             subscribers = self._subscribers.setdefault(run_id, set())
-            subscription = _Subscription(lock, subscribers)
+            subscription = _Subscription(lambda item: self._close_subscription(run_id, item))
             subscribers.add(subscription)
             return subscription
+
+    async def _close_subscription(self, run_id: str, subscription: _Subscription) -> None:
+        async with self._broadcast_lock_for(run_id):
+            subscription.closed = True
+            subscribers = self._subscribers.get(run_id)
+            if subscribers is not None:
+                subscribers.discard(subscription)
+                if not subscribers:
+                    del self._subscribers[run_id]
+            subscription.close_callback = None
+            subscription.event.set()
 
     async def emit(self, event: RunEvent) -> None:
         persisted = await self.store.append_event(event)
         await self.broadcast_persisted(persisted)
 
     async def broadcast_persisted(self, event: RunEvent) -> None:
-        lock = self._broadcast_locks.setdefault(event.run_id, asyncio.Lock())
-        async with lock:
+        async with self._broadcast_lock_for(event.run_id):
             for subscription in self._subscribers.get(event.run_id, ()):
                 subscription.event.set()
 
@@ -529,11 +624,11 @@ class RunManager:
                         self._shutdown_requested.add(run_id)
                     self._tokens[run_id].cancel()
                     if record.status == "queued":
-                        task.cancel()
                         final = self._inactive_finalization(
                             record, "interrupted", "SERVICE_SHUTDOWN"
                         )
-                        await self._finalize(record, final, settle=False)
+                        await self._finalize(record, final)
+                        task.cancel()
             # Cooperative Core completion includes saver writes. Do not cancel a
             # task while a checkpoint or durable finalization is in flight.
             await asyncio.gather(*tasks, return_exceptions=True)
