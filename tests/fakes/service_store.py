@@ -15,9 +15,7 @@ from deepresearch.storage.protocols import (
     TerminalEventDraft,
 )
 
-_LEGAL_NONTERMINAL_TRANSITIONS = frozenset(
-    {("queued", "running"), ("interrupted", "running")}
-)
+_LEGAL_NONTERMINAL_TRANSITIONS = frozenset({("queued", "running"), ("interrupted", "running")})
 _LEGAL_TERMINAL_TRANSITIONS = {
     "queued": frozenset({"interrupted", "cancelled"}),
     "running": frozenset({"interrupted", "completed", "failed", "cancelled"}),
@@ -61,9 +59,7 @@ class FakeRunStore:
             return None
         return record
 
-    async def get_by_idempotency(
-        self, scope_sha256: str, idempotency_key: str
-    ) -> RunRecord | None:
+    async def get_by_idempotency(self, scope_sha256: str, idempotency_key: str) -> RunRecord | None:
         run_id = self._idempotency_index.get((scope_sha256, idempotency_key))
         return self._runs.get(run_id) if run_id is not None else None
 
@@ -79,9 +75,7 @@ class FakeRunStore:
             self._idempotency_index[key] = created.run_id
             return created
 
-    async def transition(
-        self, run_id: str, expected: RunStatus, target: RunStatus
-    ) -> RunRecord:
+    async def transition(self, run_id: str, expected: RunStatus, target: RunStatus) -> RunRecord:
         if (expected, target) not in _LEGAL_NONTERMINAL_TRANSITIONS:
             raise ValueError("transition is not a legal nonterminal CAS pair")
         async with self._lock_for(run_id):
@@ -182,21 +176,21 @@ class FakeRunStore:
     async def reconcile_startup(self, occurred_at: datetime) -> StartupRecovery:
         interrupted: list[str] = []
         released: list[str] = []
-        for run_id, record in tuple(self._runs.items()):
-            if record.status != "running":
+        for run_id, record in sorted(self._runs.items()):
+            if record.status not in {"queued", "running"}:
                 continue
             await self.finalize_run(
                 run_id,
-                "running",
+                record.status,
                 RunFinalization(
                     status="interrupted",
                     stop_reason=None,
-                    is_partial=True,
+                    is_partial=record.status == "running",
                     report_artifact_id=record.report_artifact_id,
                     evidence_graph_artifact_id=record.evidence_graph_artifact_id,
                     manifest_artifact_id=record.manifest_artifact_id,
                     final_usage=record.final_usage or ResourceUsage.zero(),
-                    error_code=record.error_code,
+                    error_code="PROCESS_RESTART",
                 ),
                 TerminalEventDraft(
                     timestamp=occurred_at,
@@ -207,14 +201,19 @@ class FakeRunStore:
             )
             interrupted.append(run_id)
         for reservation_id, reservation in self._daily_reservations.items():
-            if (
-                reservation.state == "reserved"
-                and reservation.run_id in self._runs
-                and self._runs[reservation.run_id].status not in {"queued", "running"}
-            ):
+            if reservation.state != "reserved":
+                continue
+            record = self._runs.get(reservation.run_id)
+            if record is None:
                 reservation.state = "released"
                 released.append(reservation_id)
-        return StartupRecovery(tuple(interrupted), tuple(released))
+            elif record.status in {"completed", "failed", "cancelled"}:
+                if record.final_usage is not None and record.final_usage.cost_usd is not None:
+                    reservation.amount = record.final_usage.cost_usd
+                    reservation.state = "settled"
+                else:
+                    reservation.state = "released"
+        return StartupRecovery(tuple(interrupted), tuple(sorted(released)))
 
     async def reserve_daily_cost(
         self, day: date, run_id: str, amount: Decimal, limit: Decimal
