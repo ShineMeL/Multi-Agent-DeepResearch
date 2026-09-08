@@ -2,6 +2,8 @@ import asyncio
 import io
 import json
 import logging
+import subprocess
+import sys
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -446,3 +448,67 @@ async def test_hosted_routes_preserve_owner_isolation_and_durable_sse(app, monke
             missing = await stranger.get("/runs/absent/events")
             assert foreign.status_code == missing.status_code == 404
             assert foreign.json() == missing.json()
+
+
+@pytest.mark.parametrize("use_colors", [False, True])
+def test_uvicorn_actual_logging_configuration_preserves_redacted_access_logs(use_colors):
+    # dictConfig closes/replaces global handlers; isolate it from pytest capture.
+    script = r"""
+import asyncio
+import logging
+import logging.config
+from copy import deepcopy
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from uvicorn.config import LOGGING_CONFIG
+from apps.api.main import create_app
+from apps.api.settings import ServiceSettings
+
+configuration = deepcopy(LOGGING_CONFIG)
+for formatter in configuration["formatters"].values():
+    formatter["use_colors"] = USE_COLORS
+logging.config.dictConfig(configuration)
+
+async def exercise():
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        app = create_app(ServiceSettings(
+            database_url=f"sqlite+aiosqlite:///{root / 'runs.sqlite'}",
+            artifact_root=root / "artifacts",
+            checkpoint_sqlite_path=root / "artifacts" / "checkpoints.sqlite",
+            session_signing_key="private-signing-value-at-least-32-bytes",
+            langgraph_strict_msgpack=True,
+        ))
+        # Exercise repeated installation at factory construction and startup.
+        async with app.router.lifespan_context(app):
+            logging.getLogger("uvicorn.access").info(
+                '%s - "%s %s HTTP/%s" %d',
+                "127.0.0.1:4321", "GET", "/health/live", "1.1", 200,
+            )
+            logging.getLogger("uvicorn.access").info(
+                '%s - "%s %s HTTP/%s" %d',
+                "127.0.0.1:4321", "GET",
+                "/runs/private-signing-value-at-least-32-bytes", "1.1", 404,
+            )
+            logging.getLogger("uvicorn.error").info(
+                "ready %s", "private-signing-value-at-least-32-bytes",
+                extra={"color_message": "ready %s"},
+            )
+
+asyncio.run(exercise())
+""".replace("USE_COLORS", repr(use_colors))
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Logging error" not in result.stderr
+    assert "GET /health/live HTTP/1.1" in result.stdout
+    assert "GET /runs/[REDACTED] HTTP/1.1" in result.stdout
+    assert "200 OK" in result.stdout
+    assert "404 Not Found" in result.stdout
+    assert "private-signing-value-at-least-32-bytes" not in result.stdout + result.stderr
+    assert "ready [REDACTED]" in result.stderr

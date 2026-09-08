@@ -3,11 +3,13 @@
 import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from copy import copy
 from datetime import UTC, datetime
 from ipaddress import ip_network
 
 from fastapi import FastAPI
 from starlette.types import ASGIApp, Receive, Scope, Send
+from uvicorn.logging import ColourizedFormatter
 
 from deepresearch.runtime.checkpointers import open_service_checkpointer
 from deepresearch.runtime.limits import LimitManager
@@ -20,7 +22,7 @@ from deepresearch.runtime.runner_factory import (
     LangGraphServiceRunnerFactory,
     default_provider_constructors,
 )
-from deepresearch.security import wrap_untrusted_content
+from deepresearch.security import redact, wrap_untrusted_content
 from deepresearch.security.logging import RedactingFilter
 from deepresearch.storage import LocalArtifactStore, LocalEvidenceStore
 from deepresearch.storage.migrations.runner import upgrade_service_schema
@@ -54,7 +56,22 @@ class AdmissionGate:
         await self.app(scope, receive, send)
 
 
-def _install_redaction(filter_: RedactingFilter) -> None:
+class _RedactingOutputFormatter(logging.Formatter):
+    """Let Uvicorn consume its structured arguments, then sanitize the output."""
+
+    def __init__(self, delegate: logging.Formatter, secrets: tuple[str, ...]) -> None:
+        super().__init__()
+        self.delegate = delegate
+        self.secrets = secrets
+
+    def format(self, record: logging.LogRecord) -> str:
+        # Formatting can cache message/exception text; do not mutate the record
+        # that other handlers will receive. Only the sanitized string is emitted.
+        rendered = self.delegate.format(copy(record))
+        return str(redact(rendered, secrets=self.secrets))
+
+
+def _install_redaction(secrets: tuple[str, ...]) -> None:
     # Handler filters also protect child loggers and propagated records. Logger
     # filters alone do not run on records emitted by their descendants.
     names = {"deepresearch", "uvicorn", "uvicorn.error", "uvicorn.access"}
@@ -71,8 +88,18 @@ def _install_redaction(filter_: RedactingFilter) -> None:
             logger = logger.parent if logger.propagate else None
     if logging.lastResort is not None:
         handlers.add(logging.lastResort)
+    filter_ = RedactingFilter(secrets=secrets)
     for handler in handlers:
-        handler.addFilter(filter_)
+        formatter = handler.formatter
+        if isinstance(formatter, _RedactingOutputFormatter):
+            formatter.secrets = tuple(dict.fromkeys((*formatter.secrets, *secrets)))
+        elif isinstance(formatter, ColourizedFormatter):
+            # AccessFormatter needs five args; DefaultFormatter can interpolate
+            # color_message with those original args. A flattening record filter
+            # breaks both contracts, so redact after the formatter instead.
+            handler.setFormatter(_RedactingOutputFormatter(formatter, secrets))
+        else:
+            handler.addFilter(filter_)
 
 
 @asynccontextmanager
@@ -81,7 +108,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     app.state.accepting_runs = False
     app.state.checkpointer_ready = False
     secrets = settings.loaded_secret_values()
-    _install_redaction(RedactingFilter(secrets=secrets))
+    _install_redaction(secrets)
     try:
         artifact_root = settings.artifact_root.resolve()
         checkpoint_path = settings.checkpoint_sqlite_path
@@ -139,7 +166,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
 def create_app(settings: ServiceSettings | None = None) -> FastAPI:
     # BaseSettings loads the required fields from the environment at runtime.
     settings = ServiceSettings() if settings is None else settings  # pyright: ignore[reportCallIssue]
-    _install_redaction(RedactingFilter(secrets=settings.loaded_secret_values()))
+    _install_redaction(settings.loaded_secret_values())
     app = FastAPI(lifespan=lifespan)
     app.state.settings = settings
     app.state.accepting_runs = False
