@@ -29,6 +29,9 @@ COPY apps ./apps
 COPY src ./src
 COPY benchmarks ./benchmarks
 COPY models ./models
+COPY deploy ./deploy
+COPY scripts ./scripts
+COPY tests/fixtures/replay/baseline ./tests/fixtures/replay/baseline
 RUN uv sync --frozen --no-dev \
     && uv run python -c "from deepresearch.runtime.provenance import resolve_build_provenance; resolve_build_provenance()" \
     && chown --recursive deepresearch:deepresearch /app /opt/venv

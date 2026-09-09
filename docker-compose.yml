@@ -12,7 +12,9 @@ services:
       ARTIFACT_ROOT: /var/lib/deepresearch/artifacts
       CHECKPOINT_SQLITE_PATH: /var/lib/deepresearch/artifacts/checkpoints.sqlite
       LANGGRAPH_STRICT_MSGPACK: "true"
-      DEPLOYMENT_ACCESS_PROFILE: showcase
+      DEPLOYMENT_ACCESS_PROFILE: local
+      PROVIDER_PROFILE_CATALOG_PATH: /app/deploy/replay/profiles.json
+      PRICING_CATALOG_PATH: /app/deploy/replay/pricing.json
       ALLOWED_EXECUTION_MODES: '["replay"]'
       ALLOWED_PROVIDER_PROFILE_IDS: '["replay-default"]'
       ALLOWED_RUN_PURPOSES: '["demo", "test"]'

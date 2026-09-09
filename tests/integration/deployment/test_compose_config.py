@@ -37,7 +37,11 @@ def test_compose_packages_api_ui_and_postgres_without_embedded_secrets():
     assert "artifact-data:/var/lib/deepresearch/artifacts" in api["volumes"]
 
     assert environment["LANGGRAPH_STRICT_MSGPACK"] == "true"
-    assert environment["DEPLOYMENT_ACCESS_PROFILE"] == "showcase"
+    assert environment["DEPLOYMENT_ACCESS_PROFILE"] == "local"
+    assert environment["PROVIDER_PROFILE_CATALOG_PATH"] == (
+        "/app/deploy/replay/profiles.json"
+    )
+    assert environment["PRICING_CATALOG_PATH"] == "/app/deploy/replay/pricing.json"
     assert json.loads(environment["ALLOWED_EXECUTION_MODES"]) == ["replay"]
     assert json.loads(environment["ALLOWED_PROVIDER_PROFILE_IDS"]) == ["replay-default"]
     assert environment["SESSION_SIGNING_KEY"].startswith("${SESSION_SIGNING_KEY:?")
@@ -77,6 +81,8 @@ def test_dockerfile_uses_the_locked_dependencies_as_a_non_root_user():
     assert "FROM python:3.12-slim" in dockerfile
     assert "COPY pyproject.toml uv.lock ./" in dockerfile
     assert "uv sync --frozen --no-dev" in dockerfile
+    assert "COPY deploy ./deploy" in dockerfile
+    assert "COPY tests/fixtures/replay/baseline ./tests/fixtures/replay/baseline" in dockerfile
     assert "USER deepresearch" in dockerfile
     assert "SESSION_SIGNING_KEY" not in dockerfile
     assert "POSTGRES_PASSWORD" not in dockerfile

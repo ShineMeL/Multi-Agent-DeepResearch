@@ -1,0 +1,64 @@
+{
+  "profiles": {
+    "replay-default": {
+      "execution_mode": "replay",
+      "routes": [
+        {
+          "operation": "model",
+          "provider_id": "baseline-model",
+          "endpoint_type": "chat.completions",
+          "model_id": "baseline-model-v1",
+          "model_revision": "cccccccccccccccccccccccccccccccccccccccc",
+          "base_url": null,
+          "credential_ref": null,
+          "fallback_rank": 0,
+          "parameters": {"bundle_path": "tests/fixtures/replay/baseline"}
+        },
+        {
+          "operation": "search",
+          "provider_id": "baseline-search",
+          "endpoint_type": "search",
+          "model_id": null,
+          "model_revision": null,
+          "base_url": null,
+          "credential_ref": null,
+          "fallback_rank": 0,
+          "parameters": {"bundle_path": "tests/fixtures/replay/baseline"}
+        },
+        {
+          "operation": "fetch",
+          "provider_id": "baseline-fetch",
+          "endpoint_type": "fetch",
+          "model_id": null,
+          "model_revision": null,
+          "base_url": null,
+          "credential_ref": null,
+          "fallback_rank": 0,
+          "parameters": {"bundle_path": "tests/fixtures/replay/baseline"}
+        },
+        {
+          "operation": "parse",
+          "provider_id": "baseline-parser-router",
+          "endpoint_type": "parse",
+          "model_id": null,
+          "model_revision": null,
+          "base_url": null,
+          "credential_ref": null,
+          "fallback_rank": 0,
+          "parameters": {}
+        },
+        {
+          "operation": "embed",
+          "provider_id": "baseline-embed",
+          "endpoint_type": "embed",
+          "model_id": "baseline-embed-v1",
+          "model_revision": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "base_url": null,
+          "credential_ref": null,
+          "fallback_rank": 0,
+          "parameters": {"bundle_path": "tests/fixtures/replay/baseline"}
+        }
+      ]
+    }
+  }
+}

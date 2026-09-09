@@ -1,0 +1,12 @@
+{
+  "profiles": {
+    "replay-default": [
+      {"snapshot_id":"baseline-model-complete","provider_id":"baseline-model","endpoint_type":"complete","model_id":"baseline-model-v1","effective_at":"2026-08-29T00:00:00Z","currency":"USD","input_tokens_per_million_usd":"0","output_tokens_per_million_usd":"0","cached_tokens_per_million_usd":"0","reasoning_tokens_per_million_usd":"0"},
+      {"snapshot_id":"baseline-model-structured","provider_id":"baseline-model","endpoint_type":"structured","model_id":"baseline-model-v1","effective_at":"2026-08-29T00:00:00Z","currency":"USD","input_tokens_per_million_usd":"0","output_tokens_per_million_usd":"0","cached_tokens_per_million_usd":"0","reasoning_tokens_per_million_usd":"0"},
+      {"snapshot_id":"baseline-search-search","provider_id":"baseline-search","endpoint_type":"search","model_id":"search","effective_at":"2026-08-29T00:00:00Z","currency":"USD","input_tokens_per_million_usd":"0","output_tokens_per_million_usd":"0","cached_tokens_per_million_usd":"0","reasoning_tokens_per_million_usd":"0"},
+      {"snapshot_id":"baseline-fetch-fetch","provider_id":"baseline-fetch","endpoint_type":"fetch","model_id":"fetch","effective_at":"2026-08-29T00:00:00Z","currency":"USD","input_tokens_per_million_usd":"0","output_tokens_per_million_usd":"0","cached_tokens_per_million_usd":"0","reasoning_tokens_per_million_usd":"0"},
+      {"snapshot_id":"baseline-parser-router-parse","provider_id":"baseline-parser-router","endpoint_type":"parse","model_id":"parse","effective_at":"2026-08-29T00:00:00Z","currency":"USD","input_tokens_per_million_usd":"0","output_tokens_per_million_usd":"0","cached_tokens_per_million_usd":"0","reasoning_tokens_per_million_usd":"0"},
+      {"snapshot_id":"baseline-embed-embed","provider_id":"baseline-embed","endpoint_type":"embed","model_id":"baseline-embed-v1","effective_at":"2026-08-29T00:00:00Z","currency":"USD","input_tokens_per_million_usd":"0","output_tokens_per_million_usd":"0","cached_tokens_per_million_usd":"0","reasoning_tokens_per_million_usd":"0"}
+    ]
+  }
+}
