@@ -9,6 +9,7 @@ import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Never, cast
 
 from pydantic import ValidationError
 
@@ -26,6 +27,11 @@ class ReadinessFailure(RuntimeError):
         self.code = code
 
 
+class _SanitizedArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> Never:
+        raise ReadinessFailure("cli_arguments")
+
+
 @dataclass(frozen=True)
 class ReadinessSummary:
     profile_count: int
@@ -34,37 +40,71 @@ class ReadinessSummary:
     bundle_sha256: str
 
 
+def _has_release_profile(payload: object) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    profiles = cast("dict[str, object]", payload).get("profiles")
+    if not isinstance(profiles, dict):
+        return False
+    return set(cast("dict[str, object]", profiles)) == {"replay-default"}
+
+
 def assess(repository: Path) -> ReadinessSummary:
     profile_path = repository / "deploy" / "replay" / "profiles.json"
     pricing_path = repository / "deploy" / "replay" / "pricing.json"
     bundle_root = repository / "tests" / "fixtures" / "replay" / "baseline"
-    profile_payload = json.loads(profile_path.read_text(encoding="utf-8"))
-    pricing_payload = json.loads(pricing_path.read_text(encoding="utf-8"))
-    if not isinstance(profile_payload, dict) or set(
-        profile_payload.get("profiles", {})
-    ) != {"replay-default"}:
+    profile_payload: object = json.loads(profile_path.read_text(encoding="utf-8"))
+    pricing_payload: object = json.loads(pricing_path.read_text(encoding="utf-8"))
+    if not _has_release_profile(profile_payload):
         raise ReadinessFailure("profile_shape")
-    if not isinstance(pricing_payload, dict) or set(
-        pricing_payload.get("profiles", {})
-    ) != {"replay-default"}:
+    if not _has_release_profile(pricing_payload):
         raise ReadinessFailure("pricing_profile_shape")
     routes = FileProviderRouteCatalog.load(profile_path).resolve("replay-default")
     prices = FilePricingCatalog.load(pricing_path).resolve("replay-default")
     try:
-        verification = ReplayBundle.load(bundle_root).verify()
+        bundle = ReplayBundle.load(bundle_root)
+        verification = bundle.verify()
     except ProviderError as error:
         raise ReadinessFailure("bundle_verification") from error
     if not verification.valid:
         raise ReadinessFailure("bundle_verification")
     if routes.execution_mode != "replay" or len(routes.routes) != 5:
         raise ReadinessFailure("route_shape")
+    route_by_operation = {route.operation: route for route in routes.routes}
+    if set(route_by_operation) != {"model", "search", "fetch", "parse", "embed"}:
+        raise ReadinessFailure("route_topology")
+    endpoint_by_operation = {
+        "model": "chat.completions",
+        "search": "search",
+        "fetch": "fetch",
+        "parse": "parse",
+        "embed": "embed",
+    }
+    for operation, endpoint_type in endpoint_by_operation.items():
+        route = route_by_operation[operation]
+        if route.endpoint_type != endpoint_type or route.fallback_rank != 0:
+            raise ReadinessFailure("route_topology")
+        if operation == "parse":
+            if route.parameters:
+                raise ReadinessFailure("route_topology")
+            expected_identity = ("baseline-parser-router", None, None)
+        else:
+            if route.parameters.get("bundle_path") != "tests/fixtures/replay/baseline":
+                raise ReadinessFailure("bundle_path")
+            if set(route.parameters) != {"bundle_path"}:
+                raise ReadinessFailure("route_topology")
+            snapshot = bundle.snapshot.providers.get(operation)
+            if snapshot is None:
+                raise ReadinessFailure("route_identity")
+            expected_identity = (
+                snapshot.provider_id,
+                snapshot.model_id,
+                snapshot.model_revision,
+            )
+        if (route.provider_id, route.model_id, route.model_revision) != expected_identity:
+            raise ReadinessFailure("route_identity")
     if len(prices) != 6:
         raise ReadinessFailure("pricing_shape")
-    for route in routes.routes:
-        if route.operation == "parse":
-            continue
-        if route.parameters.get("bundle_path") != "tests/fixtures/replay/baseline":
-            raise ReadinessFailure("bundle_path")
     required = {
         (route.provider_id, endpoint, route.model_id or route.operation)
         for route in routes.routes
@@ -75,7 +115,7 @@ def assess(repository: Path) -> ReadinessSummary:
         )
     }
     available = {(item.provider_id, item.endpoint_type, item.model_id) for item in prices}
-    if not required <= available:
+    if required != available:
         raise ReadinessFailure("pricing_coverage")
     digest_input = json.dumps(
         {name: verification.file_sha256[name] for name in REPLAY_FILES},
@@ -99,14 +139,14 @@ def _line(*, status: str, summary: ReadinessSummary) -> str:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser()
+    parser = _SanitizedArgumentParser()
     parser.add_argument(
         "--repository",
         type=Path,
         default=Path(__file__).resolve().parents[1],
     )
-    arguments = parser.parse_args(argv)
     try:
+        arguments = parser.parse_args(argv)
         summary = assess(arguments.repository)
     except ReadinessFailure as error:
         failure_code = error.code
