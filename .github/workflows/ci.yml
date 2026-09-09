@@ -21,6 +21,10 @@ jobs:
           enable-cache: true
       - run: uv python install 3.12
       - run: uv sync --all-extras --locked
+      - name: Release A readiness
+        run: |
+          uv run python scripts/release_readiness.py
+          uv run pytest -q tests/integration/deployment/test_release_package.py tests/integration/replay/test_full_service.py::test_full_service_strict_replay_completes_against_verified_baseline_bundle
       - run: uv run ruff check .
       # The plan's completion checklist permits a production/application type
       # gate. Keep research tooling strict too; legacy fixture typing is separate.
