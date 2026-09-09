@@ -5,7 +5,11 @@ import subprocess
 from pathlib import Path
 
 from deepresearch.providers.replay import ReplayBundle
-from deepresearch.runtime.runner_factory import FilePricingCatalog, FileProviderRouteCatalog
+from deepresearch.runtime.runner_factory import (
+    FilePricingCatalog,
+    FileProviderRouteCatalog,
+    default_provider_constructors,
+)
 
 
 def _lf_copy(source: Path, destination: Path) -> Path:
@@ -83,6 +87,27 @@ def test_operator_documentation_describes_release_boundaries() -> None:
     assert "research-v1" in readme and "RESEARCH_GRAPH_UNAVAILABLE" in deployment
     assert "not sealed" in results
     assert "MODEL_API_KEY" in deployment and "KIMI" in deployment
+
+
+def test_live_search_documentation_matches_registered_provider() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+    deployment = Path("docs/deployment.md").read_text(encoding="utf-8")
+    constructors = default_provider_constructors()
+
+    assert "Tavily search route" in readme
+    assert "Tavily search route" in deployment
+    assert "Serper" not in readme and "Serper" not in deployment
+    assert "tavily" in constructors and "serper" not in constructors
+
+
+def test_readme_distinguishes_shipped_service_from_follow_on_work() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+
+    assert (
+        "Creating new recordings and resumable Core checkpoints remain follow-on work"
+        in readme
+    )
+    assert "richer service composition" not in readme
 
 
 def test_checked_in_files_do_not_contain_synthetic_secret() -> None:

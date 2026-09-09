@@ -195,9 +195,9 @@ profile, use the `openai-compatible` model route with a server-side
 region (for example, `https://api.moonshot.cn/v1` for a CN account) and set the
 model ID to one enabled for that account, such as `kimi-k3`. Keep the key out of
 the catalog and inject it only as `MODEL_API_KEY`. The profile still needs a
-separately configured Tavily or Serper search route and all required pricing
-snapshots before a public/live run is admitted. Kimi is therefore a model-only
-Live opt-in, not part of the credential-free Replay showcase.
+separately configured Tavily search route and all required pricing snapshots
+before a public/live run is admitted. Kimi is therefore a model-only Live
+opt-in, not part of the credential-free Replay showcase.
 
 Kimi's official built-in `$web_search` tool is a different tool-call protocol;
 this service does not treat it as a `SearchProvider` or silently convert its

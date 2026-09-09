@@ -141,8 +141,8 @@ rejected with `RESEARCH_GRAPH_UNAVAILABLE`, and interrupted runs whose real Core
 checkpoint is not resumable are rejected with `CHECKPOINT_RESUME_UNAVAILABLE`.
 
 Kimi Live is a separate, model-only opt-in. Configure its key server-side as
-`MODEL_API_KEY`, provide an independent Tavily or Serper search route and a
-complete pricing catalog, and use a Live-specific provider profile. Native Kimi
+`MODEL_API_KEY`, provide a separate Tavily search route and a complete pricing
+catalog, and use a Live-specific provider profile. Native Kimi
 `$web_search` is not supported by this service.
 
 For public deployment, inject database and session secrets from the platform's
@@ -171,8 +171,10 @@ deployment.
   output files without overwriting an existing target.
 
 Strict Replay rejects unknown request keys and never falls back to Live. The
-recording/resume surface and richer service composition are documented follow-on
-work; this baseline quickstart only claims the tested offline path above.
+shipped service composition supports the packaged baseline Replay path.
+Creating new recordings and resumable Core checkpoints remain follow-on work;
+interrupted service runs can therefore return `CHECKPOINT_RESUME_UNAVAILABLE`,
+as documented above.
 
 ## Why Planner and Ranker matter
 
