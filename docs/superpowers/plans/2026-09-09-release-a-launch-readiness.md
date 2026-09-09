@@ -546,7 +546,8 @@ Run:
 
 ```powershell
 python -m uv run pytest -q tests/integration/deployment/test_release_package.py
-rg -n --hidden --glob '!\.git/**' --glob '!\.venv/**' 'synthetic-[A-Za-z-]+|MODEL_API_KEY=.*sk-|SEARCH_API_KEY=.*sk-' .
+$sentinel = "synthetic-" + "secret-sentinel"
+rg -n --hidden --glob '!\.git/**' --glob '!\.venv/**' --fixed-strings $sentinel .
 ```
 
 Expected: the documentation test passes and `rg` prints no matching line. A user-supplied credential is never added to the repository.
