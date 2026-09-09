@@ -80,6 +80,13 @@ $env:LANGGRAPH_STRICT_MSGPACK = 'true'
 $env:DATABASE_URL = 'sqlite+aiosqlite:///./deepresearch.db'
 $env:ARTIFACT_ROOT = './artifacts'
 $env:CHECKPOINT_SQLITE_PATH = './artifacts/checkpoints.sqlite'
+$env:PROVIDER_PROFILE_CATALOG_PATH = './deploy/replay/profiles.json'
+$env:PRICING_CATALOG_PATH = './deploy/replay/pricing.json'
+$env:DEPLOYMENT_ACCESS_PROFILE = 'local'
+$env:ALLOWED_EXECUTION_MODES = '["replay"]'
+$env:ALLOWED_PROVIDER_PROFILE_IDS = '["replay-default"]'
+$env:ALLOWED_RUN_PURPOSES = '["demo","test"]'
+$env:ALLOWED_BUDGET_PRESETS = '["low","medium"]'
 uv run uvicorn apps.api.main:create_app --factory --host 127.0.0.1 --port 8000 --no-proxy-headers
 ```
 
@@ -128,7 +135,7 @@ rotate the password in an initialized Postgres database. Do not print expanded
 Compose configuration to shared logs: it contains injected credentials.
 
 The API serves port 8000 and UI port 8501. Compose uses local HTTP with
-`COOKIE_SECURE=false`, publishes ports on the host, and applies Showcase policy.
+`COOKIE_SECURE=false`, publishes ports on the host, and applies the `local` replay policy.
 Restrict host network access for this local configuration. Postgres is reachable
 only inside the Compose network by default. API and UI run as the image's
 unprivileged user; Postgres uses the official image's `postgres` account,

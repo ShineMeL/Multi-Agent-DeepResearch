@@ -10,6 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 FAILURE_STDOUT = (
     "release_a version=0.1.0 status=fail profile_count=0 route_count=0 "
     f"pricing_count=0 bundle_sha256={'0' * 64}\n"
@@ -36,9 +38,7 @@ def _release_repository(tmp_path: Path) -> Path:
     return repository
 
 
-def _run_readiness(
-    repository: Path, *extra_arguments: str
-) -> subprocess.CompletedProcess[str]:
+def _run_readiness(repository: Path, *extra_arguments: str) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment["MODEL_API_KEY"] = "MODEL-SECRET"
     return subprocess.run(
@@ -137,9 +137,7 @@ def test_release_readiness_rejects_coordinated_route_topology_change(
     pricing_path = repository / "deploy" / "replay" / "pricing.json"
     pricing = json.loads(pricing_path.read_text(encoding="utf-8"))
     parse_price = next(
-        item
-        for item in pricing["profiles"]["replay-default"]
-        if item["endpoint_type"] == "parse"
+        item for item in pricing["profiles"]["replay-default"] if item["endpoint_type"] == "parse"
     )
     parse_price.update(
         snapshot_id="synthetic-search",
@@ -256,3 +254,24 @@ def test_release_readiness_rejects_missing_pricing_key(tmp_path: Path) -> None:
     result = _run_readiness(repository)
 
     _assert_sanitized_failure(result, repository, "pricing_shape")
+
+
+@pytest.mark.parametrize(
+    "endpoint", ["complete", "structured", "search", "fetch", "parse", "embed"]
+)
+@pytest.mark.parametrize("rate", ["input", "output", "cached", "reasoning"])
+def test_release_readiness_rejects_nonzero_and_divergent_model_prices(
+    tmp_path: Path, endpoint: str, rate: str
+) -> None:
+    repository = _release_repository(tmp_path)
+    pricing_path = repository / "deploy" / "replay" / "pricing.json"
+    pricing = json.loads(pricing_path.read_text(encoding="utf-8"))
+    item = next(
+        item for item in pricing["profiles"]["replay-default"] if item["endpoint_type"] == endpoint
+    )
+    item[f"{rate}_tokens_per_million_usd"] = "1"
+    pricing_path.write_text(json.dumps(pricing), encoding="utf-8")
+
+    result = _run_readiness(repository)
+
+    _assert_sanitized_failure(result, repository, "pricing_rates")

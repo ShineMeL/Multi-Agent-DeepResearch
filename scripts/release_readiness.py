@@ -109,14 +109,25 @@ def assess(repository: Path) -> ReadinessSummary:
         (route.provider_id, endpoint, route.model_id or route.operation)
         for route in routes.routes
         for endpoint in (
-            ("complete", "structured")
-            if route.operation == "model"
-            else (route.operation,)
+            ("complete", "structured") if route.operation == "model" else (route.operation,)
         )
     }
     available = {(item.provider_id, item.endpoint_type, item.model_id) for item in prices}
     if required != available:
         raise ReadinessFailure("pricing_coverage")
+    # Release A is entirely zero-cost. This also enforces the runtime's
+    # complete/structured equality and zero-cost non-model pricing contracts.
+    if any(
+        rate != 0
+        for item in prices
+        for rate in (
+            item.input_tokens_per_million_usd,
+            item.output_tokens_per_million_usd,
+            item.cached_tokens_per_million_usd,
+            item.reasoning_tokens_per_million_usd,
+        )
+    ):
+        raise ReadinessFailure("pricing_rates")
     digest_input = json.dumps(
         {name: verification.file_sha256[name] for name in REPLAY_FILES},
         sort_keys=True,

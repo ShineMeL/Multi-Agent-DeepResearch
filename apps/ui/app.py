@@ -259,9 +259,10 @@ def main() -> None:
         "Production research-v1 is unavailable. This showcase submits baseline-v1 replay runs."
     )
     st.info(
-        "A complete replay profile and matching verified bundle must be configured on the API "
-        "server. The default replay-default catalog entry is empty; replay inputs must match "
-        "the bundle exactly."
+        "The packaged Compose baseline includes the replay-default profile and verified bundle. "
+        "Try Compare planner strategies with English and the medium budget. "
+        "Custom API deployments need a matching server-side replay catalog; inputs must match "
+        "their bundle exactly."
     )
     if "showcase" not in st.session_state or st.session_state["showcase"].closed:
         st.session_state["showcase"] = _session_resource(
