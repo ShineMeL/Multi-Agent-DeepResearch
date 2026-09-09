@@ -8,7 +8,8 @@ and exports a citation-backed Markdown report.
 The current checkout keeps the Core foundation / P1+R1 strict Replay path
 reproducible. Benchmark publication wiring is present, but formal A/B/C/D
 quality, cost, confidence-interval, external, and human results remain
-unsealed unless a hash-verified public summary is supplied.
+unsealed unless a hash-verified public summary is supplied. This checkout does
+not claim formal A/B/C/D results or a hosted Live endpoint.
 
 ## Navigation
 
@@ -36,6 +37,15 @@ lock before running a clean checkout:
 
 ```powershell
 uv lock --check
+```
+
+Hash-addressed Replay fixtures require their checked-in LF bytes. Use a clean LF
+checkout (`core.autocrlf=false` before checkout) and do not update recorded
+hashes to accommodate CRLF conversion. Before starting either local Replay
+path, verify the packaged catalog, pricing, and public baseline bundle:
+
+```powershell
+uv run python scripts/release_readiness.py
 ```
 
 Live runs read credentials from `.env`, never from a request or command-line
@@ -110,18 +120,30 @@ $env:POSTGRES_PASSWORD = "replace-with-a-local-password"
 $encodedPassword = [uri]::EscapeDataString($env:POSTGRES_PASSWORD)
 $env:DATABASE_URL = "postgresql+asyncpg://deepresearch:${encodedPassword}@postgres:5432/deepresearch"
 $env:SESSION_SIGNING_KEY = "replace-with-a-local-signing-key-at-least-32-bytes"
-docker compose up --build
+docker compose config --quiet
+docker compose up --build -d
+docker compose ps
 ```
 
 The Compose service uses the official image's named `postgres` account rather
 than a brittle numeric UID, so its entrypoint can initialize the named data
 volume while the database remains non-root.
 
-This local Showcase forces only the `replay` execution mode and the
-`replay-default` provider profile. That default catalog entry is deliberately
-empty: configure the API with a complete, non-secret replay route catalog and
-its matching verified replay bundle, and submit only inputs recorded by that
-bundle. The UI cannot supply or override server policy or provider routes.
+This is a local replay showcase with `DEPLOYMENT_ACCESS_PROFILE=local`. It
+forces only the `replay` execution mode and the packaged `replay-default`
+provider profile, so it needs no model or search credential. The image contains
+`deploy/replay/profiles.json`, `deploy/replay/pricing.json`, and the public
+baseline bundle at `tests/fixtures/replay/baseline`. Submit the recorded input
+`Compare planner strategies`; arbitrary questions produce a Replay miss, never
+a Live fallback. The UI cannot supply or override server policy or provider
+routes. Only `baseline-v1` is available in this release; `research-v1` is
+rejected with `RESEARCH_GRAPH_UNAVAILABLE`, and interrupted runs whose real Core
+checkpoint is not resumable are rejected with `CHECKPOINT_RESUME_UNAVAILABLE`.
+
+Kimi Live is a separate, model-only opt-in. Configure its key server-side as
+`MODEL_API_KEY`, provide an independent Tavily or Serper search route and a
+complete pricing catalog, and use a Live-specific provider profile. Native Kimi
+`$web_search` is not supported by this service.
 
 For public deployment, inject database and session secrets from the platform's
 secret store; do not add them to an image or Compose file. Set the server

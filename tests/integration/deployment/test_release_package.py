@@ -1,6 +1,7 @@
 """Contract for the packaged Replay catalog and public baseline fixture."""
 
 import json
+import subprocess
 from pathlib import Path
 
 from deepresearch.providers.replay import ReplayBundle
@@ -70,3 +71,31 @@ def test_packaged_replay_catalog_is_complete(tmp_path: Path) -> None:
         route["parameters"]["bundle_path"] == "tests/fixtures/replay/baseline"
         for route in non_parse_routes
     )
+
+
+def test_operator_documentation_describes_release_boundaries() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+    deployment = Path("docs/deployment.md").read_text(encoding="utf-8")
+    results = Path("docs/results.md").read_text(encoding="utf-8")
+
+    assert "uv run python scripts/release_readiness.py" in readme
+    assert "/app/deploy/replay/profiles.json" in deployment
+    assert "research-v1" in readme and "RESEARCH_GRAPH_UNAVAILABLE" in deployment
+    assert "not sealed" in results
+    assert "MODEL_API_KEY" in deployment and "KIMI" in deployment
+
+
+def test_checked_in_files_do_not_contain_synthetic_secret() -> None:
+    sentinel = "synthetic-" + "secret-sentinel"
+    tracked = subprocess.run(
+        ["git", "ls-files", "-z"],
+        check=True,
+        capture_output=True,
+    ).stdout.split(b"\0")
+
+    offenders = [
+        path.decode("utf-8")
+        for path in tracked
+        if path and sentinel.encode() in Path(path.decode("utf-8")).read_bytes()
+    ]
+    assert offenders == []

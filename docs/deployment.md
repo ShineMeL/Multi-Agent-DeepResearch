@@ -1,20 +1,29 @@
 # Service deployment and operator runbook
 
 The API and Streamlit client can start with SQLite or the supplied Compose
-Postgres deployment. A healthy server is not proof of a runnable research demo:
-the default `replay-default` profile has **empty routes and no bundled recording**.
-Configure a complete server-side route catalog and matching verified replay
-bundle before submitting work. Strict replay now derives Core's `replay_parent`
-from the verified bundle snapshot and uses the built-in parser router for mixed
-HTML/PDF recordings. The local-only replay composition preserves the shipped
-baseline request identity; live/public compositions retain the untrusted-content
-boundary. Arbitrary questions cannot replay recordings for different inputs, and
-there is no automatic live fallback on `REPLAY_MISS`.
+Postgres deployment. The image packages the Replay catalog at
+`/app/deploy/replay/profiles.json`, pricing at
+`/app/deploy/replay/pricing.json`, and the verified public baseline bundle at
+`/app/tests/fixtures/replay/baseline`. From a clean LF checkout, verify those
+release inputs before startup:
+
+```powershell
+uv lock --check
+uv run python scripts/release_readiness.py
+```
+
+Strict replay derives Core's `replay_parent` from the verified bundle snapshot
+and uses the built-in parser router for mixed HTML/PDF recordings. The
+local-only replay composition preserves the shipped baseline request identity;
+live/public compositions retain the untrusted-content boundary. The packaged
+input is `Compare planner strategies`. Arbitrary questions cannot replay
+recordings for different inputs, and there is no automatic live fallback on
+`REPLAY_MISS`.
 
 The implemented production composition supports `baseline-v1` with `P1` / `R1`.
 Explicitly choose these in API requests and the UI. The API's default
 `research-v1` remains unavailable (`RESEARCH_GRAPH_UNAVAILABLE`); this runbook
-does not claim that graph or an out-of-box Showcase bundle exists.
+claims only the packaged `baseline-v1` Showcase path.
 
 ## Build provenance
 
@@ -171,12 +180,14 @@ and, for redaction only, `SESSION_SIGNING_KEY`.
 Replay requires recorded provider identities and `parameters.bundle_path`
 pointing at the matching verified bundle. The catalog's provider identity must
 match its adapter; simply renaming every provider to `replay` is not a valid
-recording. Mount catalogs and replay data read-only through a Compose override
-and add their container paths to the API environment. The supplied Compose
-file does not mount catalogs or replay bundles for you. Use paths within the
-container, not host paths embedded in route parameters.
+recording. Operators substituting a different verified bundle must mount its
+catalogs and replay data read-only through a Compose override, then set
+`PROVIDER_PROFILE_CATALOG_PATH` and `PRICING_CATALOG_PATH` to those container
+paths. Use container paths in route parameters, never host paths. The default
+Compose configuration instead uses the release inputs already packaged in the
+image.
 
-### Optional Kimi model route
+### Optional KIMI model route
 
 Kimi exposes an OpenAI-compatible chat-completions API. For a live baseline
 profile, use the `openai-compatible` model route with a server-side
@@ -184,8 +195,9 @@ profile, use the `openai-compatible` model route with a server-side
 region (for example, `https://api.moonshot.cn/v1` for a CN account) and set the
 model ID to one enabled for that account, such as `kimi-k3`. Keep the key out of
 the catalog and inject it only as `MODEL_API_KEY`. The profile still needs a
-separately configured search route (currently Tavily) and all required pricing
-snapshots before a public/live run is admitted.
+separately configured Tavily or Serper search route and all required pricing
+snapshots before a public/live run is admitted. Kimi is therefore a model-only
+Live opt-in, not part of the credential-free Replay showcase.
 
 Kimi's official built-in `$web_search` tool is a different tool-call protocol;
 this service does not treat it as a `SearchProvider` or silently convert its
@@ -330,3 +342,9 @@ uv run pytest -q tests/integration/deployment/test_smoke.py -m online
 The online smoke uses temporary SQLite state and checks health, real artifact
 completion and response redaction. It is not a live Postgres or deployed-proxy
 test. No live smoke was run during local implementation without configuration.
+
+## Publication stop conditions
+
+Any secret leak, owner isolation failure, hash/manifest mismatch,
+Replay-to-Live fallback, policy bypass, unknown-cost reservation loss, missing
+research node, or unsealed Benchmark input stops publication.
