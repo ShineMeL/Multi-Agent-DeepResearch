@@ -524,7 +524,7 @@ assert "not sealed" in results
 assert "MODEL_API_KEY" in deployment and "KIMI" in deployment
 ```
 
-The test must also assert a synthetic secret sentinel such as `sk-DO-NOT-COMMIT` is absent from every checked-in text file; never copy a real credential into the test or documentation.
+The test must also construct a synthetic secret sentinel as `"synthetic-" + "secret-sentinel"` and assert that its resulting value is absent from every checked-in text file; never copy a real credential into the test or documentation.
 
 - [ ] **Step 2: Update the README Replay/Compose quickstart**
 
@@ -546,7 +546,7 @@ Run:
 
 ```powershell
 python -m uv run pytest -q tests/integration/deployment/test_release_package.py
-rg -n --hidden --glob '!\.git/**' --glob '!\.venv/**' 'sk-DO-NOT-COMMIT|MODEL_API_KEY=.*sk-|SEARCH_API_KEY=.*sk-' .
+rg -n --hidden --glob '!\.git/**' --glob '!\.venv/**' 'synthetic-[A-Za-z-]+|MODEL_API_KEY=.*sk-|SEARCH_API_KEY=.*sk-' .
 ```
 
 Expected: the documentation test passes and `rg` prints no matching line. A user-supplied credential is never added to the repository.
