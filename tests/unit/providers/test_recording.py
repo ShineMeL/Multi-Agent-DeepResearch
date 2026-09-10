@@ -8,7 +8,6 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, NoReturn, TypeVar
 
 import pytest
@@ -578,7 +577,7 @@ async def test_recorded_stream_replays_ordered_chunks_and_terminal_usage(
 
 @pytest.mark.asyncio
 async def test_replay_stream_rechecks_deadline_before_each_yield(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     root = tmp_path / "stream-deadline"
     writer = ReplayBundleWriter.create(root, run_id="stream-deadline")
@@ -590,11 +589,9 @@ async def test_replay_stream_rechecks_deadline_before_each_yield(
     await writer.finalize()
 
     clock = iter((1.0, 1.0, 1.0, 1.0, 11.0))
-    monkeypatch.setattr(
-        "deepresearch.providers.replay.time",
-        SimpleNamespace(monotonic=lambda: next(clock)),
-    )
-    replayed = ReplayModelProvider(ReplayBundle.load(root)).stream(
+    replayed = ReplayModelProvider(
+        ReplayBundle.load(root), clock=lambda: next(clock)
+    ).stream(
         _request(), deadline=10.0, cancellation_token=token
     )
 

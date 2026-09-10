@@ -1,0 +1,6 @@
+{
+  "initial_url": "https://public.example/article",
+  "location": "https://redirect.example/latest",
+  "initial_ips": ["93.184.216.34"],
+  "redirect_ips": ["169.254.169.254"]
+}

@@ -53,7 +53,7 @@ External 10/20/10 benchmark results: not sealed/present.
 
 ## Failure analysis
 
-主假设未判定；失败分析：公开摘要没有足够的失败标量可供归因。
+Failure analysis: no public aggregate is sealed, so no failure-rate attribution is reported.
 
 ## Limitations and disclosure
 

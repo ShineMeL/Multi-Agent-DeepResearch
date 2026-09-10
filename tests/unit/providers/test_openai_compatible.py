@@ -115,6 +115,41 @@ async def test_complete_validates_response_usage_and_sends_secret_only_as_header
 
 
 @pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize(
+    "base_url",
+    ("https://api.moonshot.cn/v1", "https://api.moonshot.ai/v1"),
+)
+async def test_kimi_regional_compatible_urls_use_chat_completions_and_header_auth(
+    base_url: str,
+) -> None:
+    route = respx.post(f"{base_url}/chat/completions").respond(
+        200, json=_response("answer")
+    )
+    provider = OpenAICompatibleModelProvider(
+        base_url=base_url,
+        api_key=SecretStr("KIMI-TEST-SECRET"),
+        provider_id="fixture-kimi-compatible",
+        model_revision="revision-1",
+        executor=_executor(),
+    )
+
+    try:
+        result = await provider.complete(
+            _request(), deadline=_deadline(), cancellation_token=CancellationToken()
+        )
+    finally:
+        await provider.aclose()
+
+    assert result.output == "answer"
+    assert route.calls.last.request.headers["authorization"] == (
+        "Bearer KIMI-TEST-SECRET"
+    )
+    assert "KIMI-TEST-SECRET" not in route.calls.last.request.content.decode()
+    assert "KIMI-TEST-SECRET" not in repr(provider)
+
+
+@pytest.mark.asyncio
 async def test_overlapping_model_calls_measure_only_their_own_retry_attempts() -> None:
     retry_second_entered = asyncio.Event()
     retry_attempts = 0
@@ -240,6 +275,65 @@ async def test_openai_maps_authentication_without_leaking_response_or_key() -> N
 
     assert error.value.code == "AUTHENTICATION"
     assert "TOP-SECRET" not in str(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_kimi_authentication_error_is_public_safe() -> None:
+    respx.post("https://api.moonshot.cn/v1/chat/completions").respond(
+        401, text="KIMI-TEST-SECRET upstream diagnostic"
+    )
+    provider = OpenAICompatibleModelProvider(
+        base_url="https://api.moonshot.cn/v1",
+        api_key=SecretStr("KIMI-TEST-SECRET"),
+        provider_id="fixture-kimi-compatible",
+        model_revision="revision-1",
+        executor=_executor(),
+    )
+
+    try:
+        with pytest.raises(ProviderError) as error:
+            await provider.complete(
+                _request(), deadline=_deadline(), cancellation_token=CancellationToken()
+            )
+    finally:
+        await provider.aclose()
+
+    assert error.value.code == "AUTHENTICATION"
+    assert "KIMI-TEST-SECRET" not in str(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+
+
+@pytest.mark.asyncio
+async def test_kimi_timeout_is_typed_and_public_safe() -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("fixture timeout")
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), trust_env=False
+    )
+    provider = OpenAICompatibleModelProvider(
+        base_url="https://api.moonshot.ai/v1",
+        api_key=SecretStr("KIMI-TEST-SECRET"),
+        provider_id="fixture-kimi-compatible",
+        model_revision="revision-1",
+        executor=_executor(),
+        client=client,
+    )
+
+    try:
+        with pytest.raises(ProviderError) as error:
+            await provider.complete(
+                _request(), deadline=_deadline(), cancellation_token=CancellationToken()
+            )
+    finally:
+        await client.aclose()
+
+    assert error.value.code == "TIMEOUT"
+    assert "KIMI-TEST-SECRET" not in str(error.value)
     assert error.value.__cause__ is None
     assert error.value.__context__ is None
 

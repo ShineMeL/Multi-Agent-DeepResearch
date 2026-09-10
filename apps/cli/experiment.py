@@ -257,6 +257,7 @@ def freeze(
         if any(external_pair) and not all(external_pair):
             raise ValueError("external config and lock must be supplied together")
         if external_config is not None:
+            assert external_lock is not None  # The paired-input check above guarantees this.
             external_config = _require_regular_file(external_config, label="external config")
             external_lock = _require_regular_file(external_lock, label="external lock")
         config = freeze_config(

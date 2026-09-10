@@ -1,0 +1,16 @@
+benchmarks/datasets/frozen_ai_cs_60/public_manifest.json text eol=lf
+benchmarks/datasets/frozen_ai_cs_60/runtime/**/*.jsonl text eol=lf
+benchmarks/snapshots/frozen_ai_cs_60/**/snapshot.json text eol=lf
+benchmarks/snapshots/frozen_ai_cs_60/**/manifest.sha256 text eol=lf
+tests/fixtures/frozen_corpus/**/documents.jsonl text eol=lf
+tests/fixtures/frozen_corpus/**/index.json text eol=lf
+tests/fixtures/frozen_corpus/**/snapshot.json text eol=lf
+tests/fixtures/frozen_corpus/**/manifest.sha256 text eol=lf
+tests/fixtures/replay/**/documents.jsonl text eol=lf
+tests/fixtures/replay/**/embeddings.jsonl text eol=lf
+tests/fixtures/replay/**/expected-evidence.json text eol=lf
+tests/fixtures/replay/**/expected-report.md text eol=lf
+tests/fixtures/replay/**/model_responses.jsonl text eol=lf
+tests/fixtures/replay/**/search.jsonl text eol=lf
+tests/fixtures/replay/**/snapshot.json text eol=lf
+tests/fixtures/replay/**/manifest.sha256 text eol=lf

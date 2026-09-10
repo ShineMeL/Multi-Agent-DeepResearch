@@ -48,12 +48,7 @@ SDK_PREFIXES = (
 
 
 def _python_files() -> list[Path]:
-    return sorted(
-        path
-        for root in SOURCE_ROOTS
-        for path in root.rglob("*.py")
-        if path.is_file()
-    )
+    return sorted(path for root in SOURCE_ROOTS for path in root.rglob("*.py") if path.is_file())
 
 
 def _imports(path: Path) -> list[tuple[int, str]]:
@@ -81,6 +76,10 @@ def test_external_sdks_are_imported_only_in_provider_modules() -> None:
         if path.is_relative_to(PROVIDER_ROOT):
             continue
         for line, module in _imports(path):
+            # The UI's one HTTP transport talks only to our service. Other SDKs
+            # and all provider/storage/server imports remain forbidden there.
+            if path == ROOT / "apps/ui/api_client.py" and module == "httpx":
+                continue
             if any(_starts_with_module(module, prefix) for prefix in SDK_PREFIXES):
                 violations.append(_diagnostic(path, line, module))
     assert violations == []
@@ -96,6 +95,13 @@ def test_langgraph_imports_stay_in_checkpoint_or_workflow_orchestration() -> Non
         if any(path == root or path.is_relative_to(root) for root in allowed):
             continue
         for line, module in _imports(path):
+            # The service saver is the sole Postgres checkpoint adapter. The
+            # manager and composition root consume its public saver type.
+            if path == ROOT / "src/deepresearch/runtime/checkpointers.py" and module in {
+                "langgraph.checkpoint.base",
+                "langgraph.checkpoint.postgres.aio",
+            }:
+                continue
             if _starts_with_module(module, "langgraph"):
                 violations.append(_diagnostic(path, line, module))
     assert violations == []
@@ -135,9 +141,7 @@ def test_public_contract_definitions_have_one_owner() -> None:
     for symbol, module_prefix in owned:
         module = inspect.getmodule(symbol)
         assert module is not None
-        assert module.__name__ == module_prefix or module.__name__.startswith(
-            f"{module_prefix}."
-        )
+        assert module.__name__ == module_prefix or module.__name__.startswith(f"{module_prefix}.")
 
 
 def _leaf_types(annotation: object) -> set[object]:

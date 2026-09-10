@@ -8,7 +8,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -62,6 +62,40 @@ class BaselineRuntimeHooks:
     monotonic: Callable[[], float] = time.monotonic
     utc_now: Callable[[], datetime] = lambda: datetime.now(UTC)
     new_id: Callable[[str], str] = _new_id
+
+
+def paired_runtime_hooks() -> BaselineRuntimeHooks:
+    """Pair wall timestamps with one monotonic source for audit envelopes.
+
+    Manifest validation compares elapsed monotonic usage with the UTC run
+    envelope.  Sampling the platform clocks independently can differ by a
+    few milliseconds on Windows and make an otherwise valid run fail strict
+    reconciliation.  Deriving UTC from the same monotonic origin preserves
+    that invariant without changing the externally visible clock origin.
+    """
+    origin_monotonic = time.monotonic()
+    origin_utc = datetime.now(UTC)
+    utc_calls = 0
+    last_elapsed = -1.0
+
+    def monotonic() -> float:
+        return time.monotonic()
+
+    def utc_now() -> datetime:
+        nonlocal last_elapsed, utc_calls
+        utc_calls += 1
+        elapsed = max(0.0, time.monotonic() - origin_monotonic)
+        # The elapsed state is sampled immediately before most wall samples.
+        # Keep the envelope a small amount ahead of that measurement so
+        # sub-millisecond clock ordering cannot reject a valid manifest.
+        slack = 0.001 if utc_calls > 1 else 0.0
+        elapsed = elapsed + slack
+        if elapsed <= last_elapsed:
+            elapsed = last_elapsed + 0.000001
+        last_elapsed = elapsed
+        return origin_utc + timedelta(seconds=elapsed)
+
+    return BaselineRuntimeHooks(monotonic=monotonic, utc_now=utc_now)
 
 
 def _config_sha256(config: RunConfig) -> str:
@@ -376,15 +410,11 @@ class LangGraphResearchRunner:
                     raise CheckpointIdentityError()
                 try:
                     state_values: dict[str, object] = {
-                        name: channel_values[name]
-                        for name in BaselineState.__annotations__
+                        name: channel_values[name] for name in BaselineState.__annotations__
                     }
                     if is_research:
                         for name in ResearchState.__annotations__:
-                            if (
-                                name not in BaselineState.__annotations__
-                                and name in channel_values
-                            ):
+                            if name not in BaselineState.__annotations__ and name in channel_values:
                                 state_values[name] = channel_values[name]
                 except KeyError:
                     raise CheckpointIdentityError() from None
@@ -415,17 +445,10 @@ class LangGraphResearchRunner:
                     )
                     stored_start = header.get("started_at")
                     if type(stored_start) is not str:
-                        raise ArtifactIntegrityError(
-                            "run audit header is missing or corrupt"
-                        )
+                        raise ArtifactIntegrityError("run audit header is missing or corrupt")
                     run_started_at = datetime.fromisoformat(stored_start)
-                    if (
-                        run_started_at.tzinfo is None
-                        or run_started_at.utcoffset() is None
-                    ):
-                        raise ArtifactIntegrityError(
-                            "run audit header is missing or corrupt"
-                        )
+                    if run_started_at.tzinfo is None or run_started_at.utcoffset() is None:
+                        raise ArtifactIntegrityError("run audit header is missing or corrupt")
                     try:
                         existing_event = await emit.get_event(
                             run_id=run_id,
@@ -439,9 +462,7 @@ class LangGraphResearchRunner:
                     ):
                         raise
                     except Exception:  # noqa: BLE001 - durable sink integrity boundary
-                        raise ArtifactIntegrityError(
-                            "durable event lookup failed"
-                        ) from None
+                        raise ArtifactIntegrityError("durable event lookup failed") from None
                     if existing_event is not None:
                         audit_composition.validate_durable_event_state(
                             restored,
@@ -516,4 +537,4 @@ class LangGraphResearchRunner:
             )
 
 
-__all__ = ["BaselineRuntimeHooks", "LangGraphResearchRunner"]
+__all__ = ["BaselineRuntimeHooks", "LangGraphResearchRunner", "paired_runtime_hooks"]

@@ -1,0 +1,74 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.28"
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv sync --all-extras --locked
+      - name: Release A readiness
+        run: |
+          uv run python scripts/release_readiness.py
+          uv run pytest -q tests/integration/deployment/test_release_package.py tests/integration/replay/test_full_service.py::test_full_service_strict_replay_completes_against_verified_baseline_bundle
+      - run: uv run ruff check .
+      # The plan's completion checklist permits a production/application type
+      # gate. Keep research tooling strict too; legacy fixture typing is separate.
+      - run: uv run pyright src apps benchmarks experiments
+      - run: uv run pyright tests/integration/api/test_accounting_recovery.py tests/unit/runtime/test_build_provenance.py tests/integration/deployment/test_proxy_identity.py tests/integration/replay/test_full_service.py tests/integration/deployment/test_smoke.py
+      - run: uv run pytest -q tests/unit tests/contracts tests/integration/replay tests/integration/api tests/integration/deployment -m "not online"
+      - name: Validate Compose with disposable CI-only values
+        env:
+          DATABASE_URL: postgresql+asyncpg://deepresearch:ci-only@postgres:5432/deepresearch
+          POSTGRES_PASSWORD: ci-only
+          SESSION_SIGNING_KEY: ci-only-signing-key-at-least-32-bytes
+        run: docker compose config --quiet
+      - run: docker build --build-arg DEEPRESEARCH_CODE_COMMIT=${{ github.sha }} -t multi-agent-deep-research .
+
+  online-smoke:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+      SEARCH_API_KEY: ${{ secrets.SEARCH_API_KEY }}
+      PRICING_CATALOG_JSON: ${{ secrets.PRICING_CATALOG_JSON }}
+      PROVIDER_PROFILE_CATALOG_JSON: ${{ secrets.PROVIDER_PROFILE_CATALOG_JSON }}
+      SESSION_SIGNING_KEY: ${{ secrets.SESSION_SIGNING_KEY }}
+      LANGGRAPH_STRICT_MSGPACK: "true"
+      DEPLOYMENT_ACCESS_PROFILE: public_live
+      COOKIE_SECURE: "true"
+      ALLOWED_EXECUTION_MODES: '["live"]'
+      ALLOWED_PROVIDER_PROFILE_IDS: '["online-smoke"]'
+      ALLOWED_RUN_PURPOSES: '["test"]'
+      ALLOWED_BUDGET_PRESETS: '["medium"]'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.28"
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv sync --all-extras --locked
+      - name: Run authorized online smoke
+        if: env.MODEL_API_KEY != '' && env.SEARCH_API_KEY != '' && env.PRICING_CATALOG_JSON != '' && env.PROVIDER_PROFILE_CATALOG_JSON != '' && env.SESSION_SIGNING_KEY != ''
+        shell: bash
+        run: |
+          umask 077
+          printf '%s' "$PRICING_CATALOG_JSON" > "$RUNNER_TEMP/pricing.json"
+          printf '%s' "$PROVIDER_PROFILE_CATALOG_JSON" > "$RUNNER_TEMP/providers.json"
+          PRICING_CATALOG_PATH="$RUNNER_TEMP/pricing.json" PROVIDER_PROFILE_CATALOG_PATH="$RUNNER_TEMP/providers.json" uv run pytest -q tests/integration/deployment/test_smoke.py -m online
