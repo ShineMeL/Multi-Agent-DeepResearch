@@ -14,3 +14,6 @@ tests/fixtures/replay/**/model_responses.jsonl text eol=lf
 tests/fixtures/replay/**/search.jsonl text eol=lf
 tests/fixtures/replay/**/snapshot.json text eol=lf
 tests/fixtures/replay/**/manifest.sha256 text eol=lf
+# All replay/corpus scenario and metadata files stay LF on Windows too.
+tests/fixtures/replay/** text eol=lf
+tests/fixtures/frozen_corpus/** text eol=lf
