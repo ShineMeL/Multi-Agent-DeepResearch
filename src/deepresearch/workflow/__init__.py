@@ -20,11 +20,14 @@ from .research_graph import (
     ClaimResolutionRecord,
     InitialPlanNode,
     NodeHandler,
+    ResearchAuditComposition,
     ResearchGraphDependencies,
+    ResearchNodeWrapper,
     build_research_graph,
     result_status_for,
     route_after_verify,
 )
+from .research_handlers import ResearchNodeHandlers
 from .runner import BaselineRuntimeHooks, LangGraphResearchRunner
 from .state import (
     BaselineBlockedNeed,
@@ -51,7 +54,10 @@ __all__ = [
     "InvocationUsageObserver",
     "LangGraphResearchRunner",
     "NodeHandler",
+    "ResearchAuditComposition",
     "ResearchGraphDependencies",
+    "ResearchNodeHandlers",
+    "ResearchNodeWrapper",
     "ResearchState",
     "StateUpdate",
     "StateValidationError",

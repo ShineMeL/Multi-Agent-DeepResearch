@@ -54,9 +54,12 @@ class ClaimResolutionRecord:
             raise ValueError("rewrite replacement must be non-empty")
 
 
-type NodeHandler = Callable[
-    [ResearchState], Awaitable[Mapping[str, object]]
-]
+type NodeHandler = Callable[[ResearchState], Awaitable[Mapping[str, object]]]
+type ResearchNodeWrapper = Callable[[str, NodeHandler], NodeHandler]
+
+
+class ResearchAuditComposition(Protocol):
+    """Opaque handle for the Core audit composition used by the runner."""
 
 
 def result_status_for(
@@ -98,6 +101,11 @@ class ResearchGraphDependencies:
     finalize_citations: NodeHandler
     persist_results: NodeHandler
     checkpointer: BaseCheckpointSaver[str]
+    # Production composition can install the Core audit envelope around each
+    # research node.  Keeping the hook optional preserves the small, direct
+    # dependency contract used by the graph unit tests.
+    node_wrapper: ResearchNodeWrapper | None = None
+    audit_composition: ResearchAuditComposition | None = None
 
 
 def route_after_decide(state: ResearchState) -> Literal["SEARCH", "STOP"]:
@@ -147,21 +155,38 @@ def build_research_graph(
     # nodes during strict replay; nodes remain state-only callables and the
     # public dependency contract is unchanged.
     graph = cast("Any", StateGraph(ResearchState, context_schema=BaselineRuntimeContext))
-    graph.add_node("ValidateRequest", dependencies.validate_request)
-    graph.add_node("Plan", dependencies.plan)
-    graph.add_node("DecideNext", dependencies.decide_next)
-    graph.add_node("Search", dependencies.search)
-    graph.add_node("Fetch", dependencies.fetch)
-    graph.add_node("ParseAndNormalize", dependencies.parse_and_normalize)
-    graph.add_node("StoreEvidence", dependencies.store_evidence)
-    graph.add_node("RankEvidence", dependencies.rank_evidence)
-    graph.add_node("DraftReport", dependencies.draft_report)
-    graph.add_node("ExtractClaims", dependencies.extract_claims)
-    graph.add_node("VerifyClaims", dependencies.verify_claims)
-    graph.add_node("TargetedResearch", dependencies.targeted_research)
-    graph.add_node("ResolveUnsupportedClaims", dependencies.resolve_unsupported_claims)
-    graph.add_node("FinalizeCitations", dependencies.finalize_citations)
-    graph.add_node("PersistResults", dependencies.persist_results)
+
+    def node(name: str, handler: NodeHandler) -> NodeHandler:
+        wrapper = dependencies.node_wrapper
+        return handler if wrapper is None else wrapper(name, handler)
+
+    graph.add_node("ValidateRequest", node("ValidateRequest", dependencies.validate_request))
+    graph.add_node("Plan", node("Plan", cast("NodeHandler", dependencies.plan)))
+    graph.add_node("DecideNext", node("DecideNext", dependencies.decide_next))
+    graph.add_node("Search", node("Search", dependencies.search))
+    graph.add_node("Fetch", node("Fetch", dependencies.fetch))
+    graph.add_node(
+        "ParseAndNormalize",
+        node("ParseAndNormalize", dependencies.parse_and_normalize),
+    )
+    graph.add_node("StoreEvidence", node("StoreEvidence", dependencies.store_evidence))
+    graph.add_node("RankEvidence", node("RankEvidence", dependencies.rank_evidence))
+    graph.add_node("DraftReport", node("DraftReport", dependencies.draft_report))
+    graph.add_node("ExtractClaims", node("ExtractClaims", dependencies.extract_claims))
+    graph.add_node("VerifyClaims", node("VerifyClaims", dependencies.verify_claims))
+    graph.add_node(
+        "TargetedResearch",
+        node("TargetedResearch", dependencies.targeted_research),
+    )
+    graph.add_node(
+        "ResolveUnsupportedClaims",
+        node("ResolveUnsupportedClaims", dependencies.resolve_unsupported_claims),
+    )
+    graph.add_node(
+        "FinalizeCitations",
+        node("FinalizeCitations", dependencies.finalize_citations),
+    )
+    graph.add_node("PersistResults", node("PersistResults", dependencies.persist_results))
 
     graph.set_entry_point("ValidateRequest")
     graph.add_edge("ValidateRequest", "Plan")
@@ -191,17 +216,25 @@ def build_research_graph(
     graph.add_edge("ResolveUnsupportedClaims", "FinalizeCitations")
     graph.add_edge("FinalizeCitations", "PersistResults")
     graph.add_edge("PersistResults", END)
-    return cast(
+    compiled = cast(
         "CompiledStateGraph[ResearchState, None, ResearchState, ResearchState]",
         graph.compile(checkpointer=dependencies.checkpointer),
     )
+    # LangGraph's runner already knows how to consume the baseline audit
+    # composition.  Reusing that attribute keeps research-v1 on the same
+    # durable event/manifest protocol without introducing a second stream.
+    if dependencies.audit_composition is not None:
+        cast("Any", compiled)._baseline_audit_composition = dependencies.audit_composition
+    return compiled
 
 
 __all__ = [
     "ClaimResolutionRecord",
     "InitialPlanNode",
     "NodeHandler",
+    "ResearchAuditComposition",
     "ResearchGraphDependencies",
+    "ResearchNodeWrapper",
     "blocked_need_from_checkpoint",
     "blocked_need_to_checkpoint",
     "build_research_graph",
