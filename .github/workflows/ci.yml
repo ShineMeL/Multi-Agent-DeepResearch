@@ -21,6 +21,8 @@ jobs:
           enable-cache: true
       - run: uv python install 3.12
       - run: uv sync --all-extras --locked
+      - name: Release B/C capability preflight
+        run: uv run python scripts/release_preflight.py --gate c1 --format json || test $? -eq 1
       - name: Release A readiness
         run: |
           uv run python scripts/release_readiness.py

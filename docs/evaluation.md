@@ -83,3 +83,60 @@ The checked-in SVGs are deterministic, accessible placeholders until a public
 formal summary is available.  Human ratings and external 10/20/10 results are
 optional aggregate inputs.  File-based human/external aggregates require a
 sidecar hash manifest; no score is imputed when those inputs are absent.
+
+## Release C execution gates
+
+The formal benchmark is released only through the ordered C1–C4 gates. Each
+gate is fail-closed and leaves the repository unchanged when an input is
+missing or a hash does not verify:
+
+```powershell
+uv run python scripts/release_preflight.py --gate c1 --format text
+uv run python scripts/release_c_gate.py --stage c1
+uv run python scripts/release_c_gate.py --stage c2 --experiment-dir experiments/<group-id>
+uv run python scripts/release_c_gate.py --stage c3 `
+  --external-experiment-dir experiments/<portfolio-group-id>/external `
+  --human-summary experiments/<portfolio-group-id>/human-summary.json
+uv run python scripts/release_c_gate.py --stage c4 `
+  --experiment-dir experiments/<group-id> `
+  --external-experiment-dir experiments/<portfolio-group-id>/external `
+  --human-summary experiments/<portfolio-group-id>/human-summary.json
+```
+
+C1 checks the pinned model, inference-environment, embedding, private-manifest,
+public-snapshot, and formal-template inputs, as well as a clean Git tree and
+LF-only hash-addressed bytes. It does not create `formal.yaml`; generate that
+file only with the existing freeze command after all locks are supplied. C2
+then runs the fixed ranker, planner, A/B/C/D, stability, cost-subset and
+P0/ORACLE protocols and summarizes with exactly 10,000 deterministic bootstrap
+resamples before verifying the resulting manifest.
+
+C3 is an isolated portfolio gate. It requires a licensed, immutable external
+lock and exactly 10/20/10 snapshots, plus a separate human aggregate with 20
+tasks and three distinct pseudonymous raters per task. External and human
+metrics never enter the primary confidence intervals. Pending licenses,
+`example.invalid` sources, duplicate raters, missing sidecars, or mismatched
+hashes stop with `PORTFOLIO_INPUT_MISSING` or
+`HUMAN_AGGREGATE_INCOMPLETE`.
+
+C4 renders the verified primary (and any separately verified optional inputs)
+twice in temporary directories, compares every Markdown/SVG hash, and promotes
+the output only after the byte comparison succeeds. If `docs/results.md` still
+contains “primary result is not yet sealed”, or any summary/manifest/sidecar is
+missing or invalid, it returns `PUBLICATION_UNSEALED` and does not edit the
+page. A blocked or skipped C gate is never converted into a score or a sealed
+publication.
+
+For canonical replay and formal verification on Windows, use a fresh LF
+checkout and never rewrite expected hashes:
+
+```powershell
+git -c core.autocrlf=false clone --branch main https://github.com/ShineMeL/Multi-Agent-DeepResearch.git "$env:TEMP\deepresearch-lf"
+Set-Location "$env:TEMP\deepresearch-lf"
+uv run python scripts/release_preflight.py --gate c1 --format json
+```
+
+Do not regenerate expected hashes to bless CRLF conversion. The current
+checkout intentionally lacks the private model/data locks, formal outputs,
+licensed external corpus, and human ratings, so C1–C4 remain blocked until an
+authorized operator supplies them.

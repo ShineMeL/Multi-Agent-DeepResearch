@@ -350,6 +350,45 @@ The online smoke uses temporary SQLite state and checks health, real artifact
 completion and response redaction. It is not a live Postgres or deployed-proxy
 test. No live smoke was run during local implementation without configuration.
 
+## Release B deployment gates
+
+Release B is a capability- and evidence-gated deployment check. Run the
+secret-free preflight first; it never starts Docker or a provider:
+
+```powershell
+uv run python scripts/release_preflight.py --gate b1 --format text
+uv run python scripts/release_b_gate.py --profile replay
+```
+
+The replay profile validates Compose, builds the image with the validated
+`DEEPRESEARCH_CODE_COMMIT`, starts the API/Postgres/UI stack, checks
+`/health/live` and `/health/ready`, and then runs `docker compose down`. Named
+volumes are retained by that cleanup. Only an explicitly chosen `down -v`
+operation removes persisted volumes. Use `--keep-up` when an operator needs
+to inspect a running stack, and `--dry-run` to print the redacted command plan
+without invoking Docker. A missing Docker/Compose binary, Compose file, or
+Postgres configuration stops before any external command with
+`DEPLOYMENT_PREREQUISITE_MISSING`.
+
+The online smoke profile is a separate, authorized operation and can incur
+provider charges:
+
+```powershell
+uv run python scripts/release_preflight.py --gate b2 --format text
+uv run python scripts/release_b_gate.py --profile online-smoke
+```
+
+Supply a newly rotated `MODEL_API_KEY`, `SEARCH_API_KEY`, and a
+32-byte-or-longer `SESSION_SIGNING_KEY` through the secret store, together
+with complete `online-smoke` provider/pricing catalogs. The gate accepts
+catalog paths (`PROVIDER_PROFILE_CATALOG_PATH` and
+`PRICING_CATALOG_PATH`) or CI-provided JSON values; secret values are passed
+only to the child test process and never appear in command arguments, reports,
+or logs. Missing credentials return `ONLINE_SMOKE_NOT_AUTHORIZED`; an
+incomplete or invalid catalog returns `ONLINE_SMOKE_INCOMPLETE` before the
+service or provider is started. The previously exposed Kimi key is
+compromised and must not be used.
+
 ## Publication stop conditions
 
 Any secret leak, owner isolation failure, hash/manifest mismatch,
