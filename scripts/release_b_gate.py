@@ -13,6 +13,7 @@ import json
 import os
 import secrets
 import subprocess
+import sys
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -20,6 +21,11 @@ from pathlib import Path
 from typing import Literal, cast
 from urllib.error import URLError
 from urllib.request import urlopen
+
+# ``python scripts/release_b_gate.py`` is a documented invocation.  Python
+# otherwise puts only ``scripts/`` on ``sys.path`` for a direct file launch.
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.release_preflight import GateReport, assess_gate
 

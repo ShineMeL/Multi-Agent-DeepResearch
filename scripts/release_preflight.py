@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
@@ -120,7 +121,9 @@ def _catalog_check(repository: Path, environ: Mapping[str, str], variable: str) 
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, TypeError, ValueError):
         return CheckResult(variable, False, "invalid_json")
-    valid = isinstance(payload, dict) and isinstance(payload.get("profiles"), dict)
+    valid = isinstance(payload, dict) and isinstance(
+        cast(dict[object, object], payload).get("profiles"), dict
+    )
     return CheckResult(variable, valid, "valid" if valid else "profile_missing")
 
 
@@ -223,6 +226,8 @@ def _assess_b1(
         _command_check("docker compose", command_exists),
         _file_check(repository, "docker-compose.yml"),
         _database_check(environ),
+        _secret_presence(environ, "POSTGRES_PASSWORD"),
+        _secret_presence(environ, "SESSION_SIGNING_KEY"),
     )
     return _report("b1", checks, blocked_reason="DEPLOYMENT_PREREQUISITE_MISSING")
 
@@ -268,11 +273,10 @@ def _assess_c1(
 
 
 def _assess_c2(repository: Path, experiment_dir: Path | None) -> GateReport:
-    checks = [
-        _file_check(repository, "benchmarks/configs/formal.yaml"),
-        _directory_check(repository, "experiments"),
-    ]
-    if experiment_dir is not None:
+    checks = [_file_check(repository, "benchmarks/configs/formal.yaml")]
+    if experiment_dir is None:
+        checks.append(_directory_check(repository, "experiments"))
+    else:
         try:
             present = experiment_dir.is_dir() and not experiment_dir.is_symlink()
         except OSError:
@@ -307,9 +311,23 @@ def _assess_c3(
             for name in ("human_summary", "human_summary.manifest.sha256")
         )
     else:
-        checks.append(CheckResult("human_summary", human_summary.is_file(), "present" if human_summary.is_file() else "missing"))
-        sidecar = human_summary.with_name(human_summary.name + ".sha256")
-        checks.append(CheckResult("human_summary.manifest.sha256", sidecar.is_file(), "present" if sidecar.is_file() else "missing"))
+        checks.append(
+            CheckResult(
+                "human_summary",
+                human_summary.is_file(),
+                "present" if human_summary.is_file() else "missing",
+            )
+        )
+        sidecar = human_summary.parent / "manifest.sha256"
+        sibling_sidecar = human_summary.with_name(human_summary.name + ".sha256")
+        sidecar_present = sidecar.is_file() or sibling_sidecar.is_file()
+        checks.append(
+            CheckResult(
+                "human_summary.manifest.sha256",
+                sidecar_present,
+                "present" if sidecar_present else "missing",
+            )
+        )
     return _report("c3", checks, blocked_reason="PORTFOLIO_INPUT_MISSING")
 
 
@@ -354,7 +372,7 @@ def assess_gate(
     """Assess one gate without invoking Docker, providers, or benchmark runs."""
 
     root = repository.resolve()
-    current_env = environ if environ is not None else dict(__import__("os").environ)
+    current_env = environ if environ is not None else dict(os.environ)
     if gate == "b1":
         return _assess_b1(root, current_env, command_exists)
     if gate == "b2":
