@@ -191,29 +191,33 @@ def _run_b1(
                     _DOCKER_IMAGE,
                     ".",
                 ),
-            ) and run_command("stack_up", ("docker", "compose", "up", "-d")):
+            ):
+                # Compose can partially create services before returning a
+                # non-zero status, so cleanup is attempted after every up
+                # attempt unless the operator explicitly keeps the stack up.
                 stack_started = True
-                for name, path in (
-                    ("health_live", "/health/live"),
-                    ("health_ready", "/health/ready"),
-                ):
-                    try:
-                        response = health_getter(
-                            f"http://127.0.0.1:8000{path}", timeout=10.0
-                        )
-                        status = getattr(response, "status", 200)
-                        if isinstance(status, int) and 200 <= status < 300:
-                            steps.append(BStep(name, "ready", "http_2xx"))
-                            continue
-                        steps.append(BStep(name, "failed", "http_not_ready"))
-                        final_status = "failed"
-                        reason = "DEPLOYMENT_HEALTH_FAILED"
-                        break
-                    except (OSError, URLError, TimeoutError, ValueError):
-                        steps.append(BStep(name, "failed", "unavailable"))
-                        final_status = "failed"
-                        reason = "DEPLOYMENT_HEALTH_FAILED"
-                        break
+                if run_command("stack_up", ("docker", "compose", "up", "-d")):
+                    for name, path in (
+                        ("health_live", "/health/live"),
+                        ("health_ready", "/health/ready"),
+                    ):
+                        try:
+                            response = health_getter(
+                                f"http://127.0.0.1:8000{path}", timeout=10.0
+                            )
+                            status = getattr(response, "status", 200)
+                            if isinstance(status, int) and 200 <= status < 300:
+                                steps.append(BStep(name, "ready", "http_2xx"))
+                                continue
+                            steps.append(BStep(name, "failed", "http_not_ready"))
+                            final_status = "failed"
+                            reason = "DEPLOYMENT_HEALTH_FAILED"
+                            break
+                        except (OSError, URLError, TimeoutError, ValueError):
+                            steps.append(BStep(name, "failed", "unavailable"))
+                            final_status = "failed"
+                            reason = "DEPLOYMENT_HEALTH_FAILED"
+                            break
     finally:
         if stack_started and not keep_up:
             result = _invoke(runner, ("docker", "compose", "down"), repository)
@@ -232,10 +236,6 @@ def _health_get(url: str, *, timeout: float) -> object:
         return response
 
 
-def _secret_value_present(environ: Mapping[str, str], name: str) -> bool:
-    return bool(environ.get(name, "").strip())
-
-
 def _write_catalog_json(directory: Path, variable: str, payload: str) -> Path:
     token = secrets.token_hex(8)
     path = directory / f"{variable.casefold()}-{token}.json"
@@ -251,18 +251,6 @@ def _run_b2(
     environ: Mapping[str, str],
     dry_run: bool,
 ) -> BRunResult:
-    if dry_run:
-        return BRunResult(
-            "blocked",
-            "DRY_RUN_NOT_EXECUTED",
-            (
-                BStep(
-                    "online_smoke_plan",
-                    "blocked",
-                    "uv run pytest -q tests/integration/deployment/test_smoke.py -m online",
-                ),
-            ),
-        )
     with tempfile.TemporaryDirectory(prefix="deepresearch-online-") as temporary:
         prepared = dict(environ)
         temporary_root = Path(temporary)
@@ -274,6 +262,18 @@ def _run_b2(
         report = assess_gate(repository, "b2", environ=prepared)
         if report.status != "ready":
             return _blocked(report)
+        if dry_run:
+            return BRunResult(
+                "blocked",
+                "DRY_RUN_NOT_EXECUTED",
+                (
+                    BStep(
+                        "online_smoke_plan",
+                        "blocked",
+                        "uv run pytest -q tests/integration/deployment/test_smoke.py -m online",
+                    ),
+                ),
+            )
         result = _invoke(
             runner,
             ("uv", "run", "pytest", "-q", "tests/integration/deployment/test_smoke.py", "-m", "online"),
@@ -314,13 +314,6 @@ def run_b_gate(
             health_getter=health_getter,
             dry_run=dry_run,
         )
-    for name in ("MODEL_API_KEY", "SEARCH_API_KEY", "SESSION_SIGNING_KEY"):
-        if not _secret_value_present(current_env, name):
-            return BRunResult(
-                "blocked",
-                "ONLINE_SMOKE_NOT_AUTHORIZED",
-                (BStep(name, "blocked", "missing"),),
-            )
     return _run_b2(root, runner=runner, environ=current_env, dry_run=dry_run)
 
 

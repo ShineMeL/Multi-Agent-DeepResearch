@@ -54,6 +54,7 @@ _C1_REQUIRED_FILES = (
     "benchmarks/datasets/frozen_ai_cs_60/public_manifest.json",
     "benchmarks/configs/formal.template.yaml",
 )
+_C1_REQUIRED_DIRECTORIES = ("benchmarks/snapshots/frozen_ai_cs_60",)
 
 
 def _default_command_exists(name: str) -> bool:
@@ -260,7 +261,10 @@ def _assess_c1(
     repository: Path,
     command_exists: Callable[[str], object],
 ) -> GateReport:
-    checks = tuple(_file_check(repository, relative) for relative in _C1_REQUIRED_FILES)
+    checks = (
+        *tuple(_file_check(repository, relative) for relative in _C1_REQUIRED_FILES),
+        *tuple(_directory_check(repository, relative) for relative in _C1_REQUIRED_DIRECTORIES),
+    )
     if not all(check.present for check in checks):
         return GateReport("c1", "blocked", "FORMAL_INPUT_MISSING", checks)
     tree_check = _git_clean_check(repository)

@@ -108,3 +108,28 @@ def test_result_is_immutable() -> None:
         assert type(error).__name__ == "FrozenInstanceError"
     else:
         raise AssertionError("BRunResult must be immutable")
+
+
+def test_b1_attempts_cleanup_after_partial_stack_start(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "scripts.release_b_gate.assess_gate",
+        lambda *args, **kwargs: GateReport("b1", "ready", None, ()),
+    )
+    commands: list[list[str]] = []
+
+    def fake_runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        command = list(args[0])
+        commands.append(command)
+        failed = command[:3] == ["docker", "compose", "up"]
+        return subprocess.CompletedProcess(
+            args=args, returncode=1 if failed else 0, stdout="", stderr=""
+        )
+
+    result = run_b_gate(tmp_path, profile="replay", runner=fake_runner)
+
+    assert result.status == "failed"
+    assert commands[-1] == ["docker", "compose", "down"]
+    assert result.steps[-1].name == "stack_down"
