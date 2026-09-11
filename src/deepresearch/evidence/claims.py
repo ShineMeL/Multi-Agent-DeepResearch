@@ -26,6 +26,43 @@ class _LinksOutput(BaseModel):
     links: tuple[ClaimEvidenceLink, ...] = Field(default_factory=tuple)
 
 
+_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "for",
+        "from",
+        "in",
+        "is",
+        "it",
+        "of",
+        "on",
+        "or",
+        "that",
+        "the",
+        "this",
+        "to",
+        "was",
+        "were",
+        "with",
+    }
+)
+
+
+def _meaningful_terms(value: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"\w+", value.casefold())
+        if len(token) >= 3 and token not in _STOPWORDS
+    }
+
+
 def _hash_payload(value: object) -> str:
     text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -38,14 +75,18 @@ def _request(
     prompt_version: str,
     output_schema: type[BaseModel],
 ) -> ModelRequest:
-    system = "Return only public atomic claims or claim-evidence links; do not include hidden reasoning."
+    system = (
+        "Return only public atomic claims or claim-evidence links; do not include hidden reasoning."
+    )
     return ModelRequest(
         model_id=getattr(provider, "model_id", provider.provider_id),
         messages=(
             ModelMessage(role="system", content=system),
             ModelMessage(
                 role="user",
-                content=json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                content=json.dumps(
+                    payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                ),
             ),
         ),
         temperature=Decimal(0),
@@ -209,14 +250,25 @@ class EvidenceJudge:
             return list(output.links)
 
         links: list[ClaimEvidenceLink] = []
-        claim_terms = set(re.findall(r"\w+", claim.text.casefold()))
+        claim_terms = _meaningful_terms(claim.text)
         for item in evidence:
-            evidence_terms = set(re.findall(r"\w+", item.excerpt.casefold()))
-            overlap = len(claim_terms & evidence_terms)
-            relation: Literal["support", "contradict", "context", "insufficient"] = (
-                "support" if overlap else "insufficient"
+            evidence_terms = _meaningful_terms(item.excerpt)
+            overlap_terms = claim_terms & evidence_terms
+            overlap = len(overlap_terms)
+            # One shared stop-word is never enough.  Require at least one
+            # meaningful term and a conservative 20% claim-term coverage so
+            # the short, deterministic showcase claims remain useful while a
+            # long claim cannot pass on a single accidental token.
+            minimum_overlap = max(1, (len(claim_terms) + 4) // 5)
+            supported = (
+                bool(claim_terms)
+                and overlap >= minimum_overlap
+                and (overlap / len(claim_terms) >= 0.2)
             )
-            score = 1.0 if overlap else 0.0
+            relation: Literal["support", "contradict", "context", "insufficient"] = (
+                "support" if supported else "insufficient"
+            )
+            score = overlap / len(claim_terms) if claim_terms else 0.0
             links.append(
                 ClaimEvidenceLink(
                     claim_id=claim.claim_id,

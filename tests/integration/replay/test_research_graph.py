@@ -177,7 +177,10 @@ def test_research_state_blocked_need_strictly_roundtrips_with_core_serializer() 
         "max_retries": 2,
     }
     state = _state()
-    state = cast("ResearchState", {**state, "blocked_needs": (record,), "recent_marginal_gains": (0.04, 0.03)})
+    state = cast(
+        "ResearchState",
+        {**state, "blocked_needs": (record,), "recent_marginal_gains": (0.04, 0.03)},
+    )
     restored = checkpoint_serializer().loads_typed(checkpoint_serializer().dumps_typed(state))
     assert restored["blocked_needs"] == (record,)
     assert type(restored["blocked_needs"][0]) is dict
@@ -195,17 +198,24 @@ def test_research_state_rejects_unknown_route_values() -> None:
 def test_research_routes_require_validated_public_labels() -> None:
     candidate = {**_state(), "decision_route": "STOP"}
     assert route_after_decide(cast("ResearchState", candidate)) == "STOP"
+    failed = {**_state(), "error_code": "INTERNAL_ERROR"}
+    assert route_after_decide(cast("ResearchState", failed)) == "PERSIST"
     candidate = {**_state(), "verification_route": "FINALIZE"}
     assert route_after_verify(cast("ResearchState", candidate)) == "FINALIZE"
+    failed = {**_state(), "error_code": "INTERNAL_ERROR"}
+    assert route_after_verify(cast("ResearchState", failed)) == "PERSIST"
 
 
 def test_claim_resolution_record_requires_public_replacement_rules() -> None:
-    assert ClaimResolutionRecord(
-        claim_id="c-1",
-        action="DELETE",
-        reason_code="UNSUPPORTED_FACT",
-        replacement_text=None,
-    ).replacement_text is None
+    assert (
+        ClaimResolutionRecord(
+            claim_id="c-1",
+            action="DELETE",
+            reason_code="UNSUPPORTED_FACT",
+            replacement_text=None,
+        ).replacement_text
+        is None
+    )
     with pytest.raises(ValueError, match="replacement"):
         ClaimResolutionRecord(
             claim_id="c-1",

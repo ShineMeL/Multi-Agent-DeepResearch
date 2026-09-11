@@ -20,10 +20,13 @@ input is `Compare planner strategies`. Arbitrary questions cannot replay
 recordings for different inputs, and there is no automatic live fallback on
 `REPLAY_MISS`.
 
-The implemented production composition supports `baseline-v1` with `P1` / `R1`.
-Explicitly choose these in API requests and the UI. The API's default
-`research-v1` remains unavailable (`RESEARCH_GRAPH_UNAVAILABLE`); this runbook
-claims only the packaged `baseline-v1` Showcase path.
+The implemented production composition supports `baseline-v1` with `P1` / `R1`
+and the deterministic `research-v1` P1/R1 research showcase. The latter adds
+claim extraction, evidence verification, and conservative unsupported-claim
+resolution while reusing the audited retrieval/report pipeline. Explicitly
+choose P1/R1 for this composition. The API's default research settings
+(`research-v1` with P2/R2) remain unavailable and fail closed with
+`RESEARCH_GRAPH_UNAVAILABLE`; there is no silent baseline fallback.
 
 ## Build provenance
 

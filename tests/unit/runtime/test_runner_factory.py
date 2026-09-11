@@ -186,7 +186,10 @@ def test_research_capability_is_rejected_before_adapter_construction(tmp_path):
     from deepresearch.storage import LocalArtifactStore, LocalEvidenceStore
     from tests.integration.replay.test_baseline_graph import config
 
-    conf = config(workflow_id="research-v1")
+    # The first production research composition is deliberately bounded to
+    # deterministic P1/R1.  Unsupported P2/R2 remains fail-closed until its
+    # model-backed planner/ranker wiring is implemented and audited.
+    conf = config(workflow_id="research-v1", planner_id="P2", ranker_id="R2")
     routes = FrozenProviderRoutes.model_validate(
         frozen_payload(profile_id=conf.request.provider_profile_id)
     )

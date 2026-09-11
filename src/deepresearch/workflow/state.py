@@ -52,11 +52,12 @@ class BaselineState(TypedDict):
 
 class ResearchState(BaselineState, total=False):
     planner_round_index: int
-    decision_route: Literal["SEARCH", "STOP"]
+    decision_route: Literal["SEARCH", "STOP", "PERSIST"]
     verification_route: Literal[
         "TARGETED_RESEARCH",
         "RESOLVE_UNSUPPORTED",
         "FINALIZE",
+        "PERSIST",
     ]
     rank_artifact_id: str | None
     claim_ids: tuple[str, ...]
@@ -109,9 +110,9 @@ _RESEARCH_FIELDS = frozenset(
         "directional_research_rounds",
     }
 )
-_DECISION_ROUTES = frozenset({"SEARCH", "STOP"})
+_DECISION_ROUTES = frozenset({"SEARCH", "STOP", "PERSIST"})
 _VERIFICATION_ROUTES = frozenset(
-    {"TARGETED_RESEARCH", "RESOLVE_UNSUPPORTED", "FINALIZE"}
+    {"TARGETED_RESEARCH", "RESOLVE_UNSUPPORTED", "FINALIZE", "PERSIST"}
 )
 
 
@@ -207,9 +208,7 @@ def validate_baseline_state(value: Mapping[str, object]) -> BaselineState:
     if not isinstance(blocked, tuple):
         raise _invalid()
     blocked_items = cast("tuple[object, ...]", blocked)
-    copied["blocked_needs"] = tuple(
-        _validate_blocked_need(item) for item in blocked_items
-    )
+    copied["blocked_needs"] = tuple(_validate_blocked_need(item) for item in blocked_items)
 
     gains = value["recent_marginal_gains"]
     if not isinstance(gains, tuple):
@@ -223,13 +222,9 @@ def validate_baseline_state(value: Mapping[str, object]) -> BaselineState:
         for item in gain_items
     ):
         raise _invalid()
-    copied["recent_marginal_gains"] = tuple(
-        float(cast("int | float", item)) for item in gain_items
-    )
+    copied["recent_marginal_gains"] = tuple(float(cast("int | float", item)) for item in gain_items)
 
-    copied["budget_snapshot"] = _revalidate_model(
-        value["budget_snapshot"], BudgetSnapshot
-    )
+    copied["budget_snapshot"] = _revalidate_model(value["budget_snapshot"], BudgetSnapshot)
     stop_reason = value["stop_reason"]
     if stop_reason is not None and (
         type(stop_reason) is not str or stop_reason not in _STOP_REASONS

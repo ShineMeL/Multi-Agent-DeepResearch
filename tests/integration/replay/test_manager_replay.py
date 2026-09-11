@@ -144,9 +144,11 @@ async def test_public_missing_audited_pricing_refuses_before_core_or_admission(t
     await manager.shutdown(0)
 
 
-async def test_missing_production_research_graph_refuses_before_admission(tmp_path):
+async def test_unsupported_research_composition_refuses_before_admission(tmp_path):
     manager, conf, calls, _, admission = setup(tmp_path)
-    research = conf.model_copy(update={"workflow_id": "research-v1"})
+    research = conf.model_copy(
+        update={"workflow_id": "research-v1", "planner_id": "P2", "ranker_id": "R2"}
+    )
     with pytest.raises(ResearchGraphUnavailable) as error:
         await manager.create(research, client_ip="local", session_id="local")
     assert error.value.code == "RESEARCH_GRAPH_UNAVAILABLE"

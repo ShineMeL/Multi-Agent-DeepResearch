@@ -136,9 +136,13 @@ provider profile, so it needs no model or search credential. The image contains
 baseline bundle at `tests/fixtures/replay/baseline`. Submit the recorded input
 `Compare planner strategies`; arbitrary questions produce a Replay miss, never
 a Live fallback. The UI cannot supply or override server policy or provider
-routes. Only `baseline-v1` is available in this release; `research-v1` is
-rejected with `RESEARCH_GRAPH_UNAVAILABLE`, and interrupted runs whose real Core
-checkpoint is not resumable are rejected with `CHECKPOINT_RESUME_UNAVAILABLE`.
+routes. The showcase uses the supported deterministic `research-v1` P1/R1
+composition, which adds claim extraction and evidence verification to the
+audited retrieval/report pipeline; the `baseline-v1` payload remains available
+for compatibility. Research-v1 P2/R2 (the API defaults) is still rejected with
+`RESEARCH_GRAPH_UNAVAILABLE` rather than silently falling back, and interrupted
+runs whose real Core checkpoint is not resumable are rejected with
+`CHECKPOINT_RESUME_UNAVAILABLE`.
 
 Kimi Live is a separate, model-only opt-in. Configure its key server-side as
 `MODEL_API_KEY`, provide a separate Tavily search route and a complete pricing

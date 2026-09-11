@@ -108,33 +108,38 @@ class ResearchGraphDependencies:
     audit_composition: ResearchAuditComposition | None = None
 
 
-def route_after_decide(state: ResearchState) -> Literal["SEARCH", "STOP"]:
+def route_after_decide(state: ResearchState) -> Literal["SEARCH", "STOP", "PERSIST"]:
     restored = validate_research_state(cast("Mapping[str, object]", state))
+    if restored["error_code"] is not None:
+        return "PERSIST"
     route = restored.get("decision_route")
-    if type(route) is not str or route not in {"SEARCH", "STOP"}:
-        raise ValueError("decision_route must be SEARCH or STOP")
-    return cast("Literal['SEARCH', 'STOP']", route)
+    if type(route) is not str or route not in {"SEARCH", "STOP", "PERSIST"}:
+        raise ValueError("decision_route must be SEARCH, STOP, or PERSIST")
+    return cast("Literal['SEARCH', 'STOP', 'PERSIST']", route)
 
 
 def route_after_verify(
     state: ResearchState,
-) -> Literal["TARGETED_RESEARCH", "RESOLVE_UNSUPPORTED", "FINALIZE"]:
+) -> Literal["TARGETED_RESEARCH", "RESOLVE_UNSUPPORTED", "FINALIZE", "PERSIST"]:
     restored = validate_research_state(cast("Mapping[str, object]", state))
+    if restored["error_code"] is not None:
+        return "PERSIST"
     route = restored.get("verification_route")
     if type(route) is not str or route not in {
         "TARGETED_RESEARCH",
         "RESOLVE_UNSUPPORTED",
         "FINALIZE",
+        "PERSIST",
     }:
         raise ValueError(
-            "verification_route must be TARGETED_RESEARCH, RESOLVE_UNSUPPORTED, or FINALIZE"
+            "verification_route must be TARGETED_RESEARCH, RESOLVE_UNSUPPORTED, FINALIZE, or PERSIST"
         )
     research_rounds = restored.get("directional_research_rounds", 0)
     unsupported_claim_ids = restored.get("unsupported_claim_ids", ())
     if research_rounds > 0:
         return "RESOLVE_UNSUPPORTED" if unsupported_claim_ids else "FINALIZE"
     return cast(
-        "Literal['TARGETED_RESEARCH', 'RESOLVE_UNSUPPORTED', 'FINALIZE']",
+        "Literal['TARGETED_RESEARCH', 'RESOLVE_UNSUPPORTED', 'FINALIZE', 'PERSIST']",
         route,
     )
 
@@ -189,20 +194,45 @@ def build_research_graph(
     graph.add_node("PersistResults", node("PersistResults", dependencies.persist_results))
 
     graph.set_entry_point("ValidateRequest")
-    graph.add_edge("ValidateRequest", "Plan")
-    graph.add_edge("Plan", "DecideNext")
+
+    def route_on_success(next_node: str) -> Callable[[ResearchState], str]:
+        def route(state: ResearchState) -> str:
+            restored = validate_research_state(cast("Mapping[str, object]", state))
+            return "PersistResults" if restored["error_code"] is not None else next_node
+
+        return route
+
+    graph.add_conditional_edges(
+        "ValidateRequest",
+        route_on_success("Plan"),
+        {"Plan": "Plan", "PersistResults": "PersistResults"},
+    )
+    graph.add_conditional_edges(
+        "Plan",
+        route_on_success("DecideNext"),
+        {"DecideNext": "DecideNext", "PersistResults": "PersistResults"},
+    )
     graph.add_conditional_edges(
         "DecideNext",
         route_after_decide,
-        {"SEARCH": "Search", "STOP": "DraftReport"},
+        {"SEARCH": "Search", "STOP": "DraftReport", "PERSIST": "PersistResults"},
     )
-    graph.add_edge("Search", "Fetch")
-    graph.add_edge("Fetch", "ParseAndNormalize")
-    graph.add_edge("ParseAndNormalize", "StoreEvidence")
-    graph.add_edge("StoreEvidence", "RankEvidence")
-    graph.add_edge("RankEvidence", "DecideNext")
-    graph.add_edge("DraftReport", "ExtractClaims")
-    graph.add_edge("ExtractClaims", "VerifyClaims")
+    for current, next_node in (
+        ("Search", "Fetch"),
+        ("Fetch", "ParseAndNormalize"),
+        ("ParseAndNormalize", "StoreEvidence"),
+        ("StoreEvidence", "RankEvidence"),
+        ("RankEvidence", "DecideNext"),
+        ("DraftReport", "ExtractClaims"),
+        ("ExtractClaims", "VerifyClaims"),
+        ("TargetedResearch", "Search"),
+        ("ResolveUnsupportedClaims", "FinalizeCitations"),
+    ):
+        graph.add_conditional_edges(
+            current,
+            route_on_success(next_node),
+            {next_node: next_node, "PersistResults": "PersistResults"},
+        )
     graph.add_conditional_edges(
         "VerifyClaims",
         route_after_verify,
@@ -210,10 +240,9 @@ def build_research_graph(
             "TARGETED_RESEARCH": "TargetedResearch",
             "RESOLVE_UNSUPPORTED": "ResolveUnsupportedClaims",
             "FINALIZE": "FinalizeCitations",
+            "PERSIST": "PersistResults",
         },
     )
-    graph.add_edge("TargetedResearch", "Search")
-    graph.add_edge("ResolveUnsupportedClaims", "FinalizeCitations")
     graph.add_edge("FinalizeCitations", "PersistResults")
     graph.add_edge("PersistResults", END)
     compiled = cast(

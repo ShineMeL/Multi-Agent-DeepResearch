@@ -7,11 +7,17 @@ from typing import Any, cast
 
 import pytest
 
-from deepresearch.domain import EvidenceSpan, HtmlLocator
+from deepresearch.domain import Claim, EvidenceSpan, HtmlLocator
+from deepresearch.evidence.claims import EvidenceJudge
 from deepresearch.runtime import CancellationToken
-from deepresearch.storage import LocalArtifactStore
+from deepresearch.storage import ArtifactIntegrityError, LocalArtifactStore
 from deepresearch.workflow.baseline_graph import BaselineNodeHandlers
-from deepresearch.workflow.research_handlers import ResearchNodeHandlers
+from deepresearch.workflow.research_handlers import (
+    _CLAIM_GRAPH_MEDIA_TYPE,
+    ResearchNodeHandlers,
+    _load_graph,
+    _remove_unsupported_claims,
+)
 from deepresearch.workflow.state import ResearchState
 from tests.integration.replay.test_research_graph import _state
 
@@ -139,3 +145,107 @@ async def test_unsupported_claims_route_to_conservative_resolution(tmp_path, mon
         handlers.artifact_store.get_bytes(cast("str", resolved["draft_artifact_id"]))
         == b"## Limitations"
     )
+
+
+def test_claim_graph_loader_rejects_duplicate_noncanonical_or_wrong_media(tmp_path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    duplicate = store.put_bytes(
+        b'{"claims":[],"claims":[],"evidence":[],"links":[]}',
+        media_type=_CLAIM_GRAPH_MEDIA_TYPE,
+    )
+    with pytest.raises(ArtifactIntegrityError):
+        _load_graph(store, duplicate.artifact_id)
+
+    noncanonical = store.put_bytes(
+        b'{ "claims": [], "evidence": [], "links": [] }',
+        media_type=_CLAIM_GRAPH_MEDIA_TYPE,
+    )
+    with pytest.raises(ArtifactIntegrityError):
+        _load_graph(store, noncanonical.artifact_id)
+
+    wrong_media = store.put_bytes(
+        b'{"claims":[],"evidence":[],"links":[]}',
+        media_type="application/json",
+    )
+    with pytest.raises(ArtifactIntegrityError):
+        _load_graph(store, wrong_media.artifact_id)
+
+
+@pytest.mark.asyncio
+async def test_deterministic_judge_does_not_support_claim_on_stopword_overlap() -> None:
+    claim = Claim(
+        claim_id="claim-moon",
+        text="The moon is made of cheese.",
+        claim_type="fact",
+        entities=(),
+        numbers=(),
+        qualifiers=(),
+        report_section="findings",
+        verification_status="uncertain",
+    )
+    evidence = _evidence("The planner improves retrieval quality.")
+    links = await EvidenceJudge().judge(
+        claim,
+        (evidence,),
+        deadline=100.0,
+        cancellation_token=CancellationToken(),
+    )
+    assert links[0].relation == "insufficient"
+    assert links[0].entailment_score == 0.0
+
+
+@pytest.mark.asyncio
+async def test_deterministic_judge_supports_meaningful_showcase_overlap() -> None:
+    claim = Claim(
+        claim_id="claim-comparison",
+        text="The collected sources support this comparison.",
+        claim_type="fact",
+        entities=(),
+        numbers=(),
+        qualifiers=(),
+        report_section="findings",
+        verification_status="uncertain",
+    )
+    evidence = _evidence("Gamma planner evidence provides an independent comparison.")
+    links = await EvidenceJudge().judge(
+        claim,
+        (evidence,),
+        deadline=100.0,
+        cancellation_token=CancellationToken(),
+    )
+    assert links[0].relation == "support"
+    assert links[0].entailment_score == 0.25
+
+
+def test_unsupported_resolution_preserves_citation_after_previous_supported_sentence() -> None:
+    unsupported = Claim(
+        claim_id="claim-unsupported",
+        text="Bananas orbit purple galaxies.",
+        claim_type="fact",
+        entities=(),
+        numbers=(),
+        qualifiers=(),
+        report_section="findings",
+        verification_status="unsupported",
+    )
+    draft, records = _remove_unsupported_claims(
+        "Supported planner result. [e-supported]\nBananas orbit purple galaxies. [e-bad]",
+        (unsupported,),
+    )
+    assert draft == "Supported planner result. [e-supported]"
+    assert [record.claim_id for record in records] == ["claim-unsupported"]
+
+
+def test_unsupported_resolution_fails_closed_for_unknown_or_absent_claim() -> None:
+    unsupported = Claim(
+        claim_id="claim-absent",
+        text="Absent claim.",
+        claim_type="fact",
+        entities=(),
+        numbers=(),
+        qualifiers=(),
+        report_section="findings",
+        verification_status="unsupported",
+    )
+    with pytest.raises(ArtifactIntegrityError):
+        _remove_unsupported_claims("Only supported text. [e-supported]", (unsupported,))

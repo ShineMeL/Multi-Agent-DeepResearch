@@ -11,7 +11,7 @@ from streamlit.testing.v1 import AppTest
 from apps.api.main import create_app
 from apps.api.settings import ServiceSettings
 from apps.ui.api_client import ResearchApiClient, StreamReconnectExhausted
-from apps.ui.replay import ShowcaseSession, replay_payload
+from apps.ui.replay import ShowcaseSession, replay_payload, research_replay_payload
 from deepresearch.domain import RunEvent
 from tests.contracts.ui.test_api_client import frame, view
 from tests.unit.runtime.test_manager import ControlledRunner
@@ -121,6 +121,15 @@ def test_replay_payload_uses_the_baseline_fixture_output_shape():
     assert payload["request"]["budget_preset"] == "medium"
 
 
+def test_research_replay_payload_selects_supported_production_composition():
+    payload = research_replay_payload("Compare planner strategies")
+
+    assert payload["workflow_id"] == "research-v1"
+    assert payload["planner_id"] == "P1"
+    assert payload["ranker_id"] == "R1"
+    assert payload["request"]["execution_mode"] == "replay"
+
+
 def test_app_submits_replay_shows_downloads_metrics_and_preserves_session():
     seen, keys = [], []
     manifest = {
@@ -173,7 +182,7 @@ def test_app_submits_replay_shows_downloads_metrics_and_preserves_session():
         app.session_state["showcase"] = session
         app.run()
         assert not app.exception
-        assert any("research-v1" in warning.value for warning in app.warning)
+        assert any("research-v1" in info.value for info in app.info)
         assert next(item for item in app.selectbox if item.label == "Budget").value == "medium"
         app.text_area(key="question").input("Showcase question")
         app.button(key="FormSubmitter:replay_request-Start replay").click().run()

@@ -35,6 +35,8 @@ from deepresearch.runtime.provenance import resolve_build_provenance
 from deepresearch.security import redact, wrap_untrusted_content
 from deepresearch.storage import FileCache, LocalArtifactStore, LocalEvidenceStore
 from deepresearch.workflow.baseline_graph import BaselineNodeHandlers, build_baseline_graph
+from deepresearch.workflow.research_graph import build_research_graph
+from deepresearch.workflow.research_handlers import ResearchNodeHandlers
 from deepresearch.workflow.runner import (
     BaselineRuntimeHooks,
     LangGraphResearchRunner,
@@ -709,7 +711,10 @@ class DefaultCoreRunnerBuilder:
     ) -> ResearchRunner:
         validate_provider_route_binding(config, provider_routes)
         provenance = resolve_build_provenance()
-        if config.workflow_id == "research-v1":
+        if config.workflow_id == "research-v1" and (
+            config.planner_id,
+            config.ranker_id,
+        ) != ("P1", "R1"):
             raise ResearchGraphUnavailable()
         routes = {route.operation: route for route in provider_routes.routes}
         if set(routes) != {"model", "search", "fetch", "parse", "embed"}:
@@ -877,6 +882,14 @@ class DefaultCoreRunnerBuilder:
             writer_prompt_version=config.prompt_versions.get("writer", "baseline-writer-v1"),
         )
         baseline = build_baseline_graph(handlers.as_dependencies(checkpointer))
+        if config.workflow_id == "research-v1":
+            research_handlers = ResearchNodeHandlers(handlers)
+            research = build_research_graph(research_handlers.as_dependencies(checkpointer))
+            return LangGraphResearchRunner(
+                baseline_graph=baseline,
+                research_graph=research,
+                runtime_hooks=self.runtime_hooks or paired_runtime_hooks(),
+            )
         return LangGraphResearchRunner(
             baseline_graph=baseline,
             runtime_hooks=self.runtime_hooks or paired_runtime_hooks(),

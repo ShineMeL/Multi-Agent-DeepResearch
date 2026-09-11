@@ -110,6 +110,12 @@ StateUpdate: TypeAlias = Mapping[str, object]  # noqa: UP040 - approved public c
 BaselineNode: TypeAlias = Callable[  # noqa: UP040 - approved public contract
     [BaselineState], Awaitable[StateUpdate]
 ]
+type ReceiptStateBuilder = Callable[
+    [BaselineState, Mapping[str, object]], Mapping[str, object]
+]
+type ReceiptStateRecovery = Callable[
+    [BaselineState, object], Mapping[str, object]
+]
 BaselineRoute: TypeAlias = Literal[  # noqa: UP040 - stable route labels
     "Search", "DraftReport", "PersistResults"
 ]
@@ -352,7 +358,14 @@ class _AuditReceiptEnvelope(BaseModel):
                 "terminal_event_seq",
             },
         }[self.kind]
-        if set(self.payload) != expected:
+        allowed = expected
+        if self.kind == "node-execution":
+            # Research-v1 stores a separately validated extension alongside
+            # the exact Core baseline state.  Baseline receipts retain their
+            # original shape; only the research composition may opt in.
+            allowed = expected | {"research_state"}
+        payload_keys = set(self.payload)
+        if payload_keys != expected and payload_keys != allowed:
             raise ValueError("audit receipt payload shape is invalid")
         return self
 
@@ -5081,6 +5094,7 @@ async def _recover_durable_node_event(
     restored: BaselineState,
     node: str,
     event: RunEvent,
+    receipt_state_recovery: ReceiptStateRecovery | None = None,
 ) -> StateUpdate:
     exact_event = _strict_run_event(event)
     if (
@@ -5168,11 +5182,17 @@ async def _recover_durable_node_event(
     verified = await sink.get_event(run_id=event.run_id, seq=event.seq)
     if not _run_events_match_exact(verified, event):
         raise ArtifactIntegrityError("durable event sink failed exact verification")
+    recovered_extension = (
+        dict(receipt_state_recovery(recovered, payload.get("research_state")))
+        if receipt_state_recovery is not None
+        else {}
+    )
     work_ids = tuple(
         dict.fromkeys((*recovered["baseline_work_artifact_ids"], node_receipt_id))
     )
     return {
         **recovered,
+        **recovered_extension,
         "baseline_work_artifact_ids": work_ids,
         "next_event_seq": restored["next_event_seq"] + 1,
     }
@@ -5336,6 +5356,7 @@ async def _publish_missing_event_failure_transition(
     audit: _AuditBuffer,
     execution: NodeExecutionRecord,
     base_event: RunEvent,
+    receipt_state_builder: ReceiptStateBuilder | None = None,
 ) -> StateUpdate:
     failure_monotonic = context.monotonic()
     failure_finished_at = context.utc_now()
@@ -5422,6 +5443,11 @@ async def _publish_missing_event_failure_transition(
             "child_receipt_ids": child_receipt_ids,
             "record": failure_execution.model_dump(mode="json"),
             "state": _state_payload(failure_state),
+            **(
+                {"research_state": receipt_state_builder(failure_state, failure_update)}
+                if receipt_state_builder is not None
+                else {}
+            ),
         },
     )
     failure_event = failure_base_event.model_copy(
@@ -5455,6 +5481,8 @@ def _safe_node(
     handler: BaselineNode,
     *,
     audit_composition: _AuditComposition | None,
+    receipt_state_builder: ReceiptStateBuilder | None = None,
+    receipt_state_recovery: ReceiptStateRecovery | None = None,
 ) -> BaselineNode:
     async def invoke(state: BaselineState) -> StateUpdate:
         restored = validate_baseline_state(state)
@@ -5486,6 +5514,7 @@ def _safe_node(
                         restored=restored,
                         node=node,
                         event=existing_event,
+                        receipt_state_recovery=receipt_state_recovery,
                     )
                 except (asyncio.CancelledError, KeyboardInterrupt, MemoryError, SystemExit):
                     raise
@@ -5679,6 +5708,11 @@ def _safe_node(
                     "child_receipt_ids": child_receipt_ids,
                     "record": execution.model_dump(mode="json"),
                     "state": _state_payload(merged),
+                    **(
+                        {"research_state": receipt_state_builder(merged, update)}
+                        if receipt_state_builder is not None
+                        else {}
+                    ),
                 },
             )
             event = base_event.model_copy(
@@ -5736,6 +5770,7 @@ def _safe_node(
                     audit=audit,
                     execution=execution,
                     base_event=base_event,
+                    receipt_state_builder=receipt_state_builder,
                 )
             retry_publication = await _publish_event_with_bounded_recovery(
                 sink=sink,
@@ -5846,6 +5881,11 @@ def _safe_node(
                     "child_receipt_ids": [terminal_receipt_id],
                     "record": failure_execution.model_dump(mode="json"),
                     "state": _state_payload(failure_state),
+                    **(
+                        {"research_state": receipt_state_builder(failure_state, update)}
+                        if receipt_state_builder is not None
+                        else {}
+                    ),
                 },
             )
             failure_event = failure_base_event.model_copy(

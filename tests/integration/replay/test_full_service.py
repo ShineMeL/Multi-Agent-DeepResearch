@@ -333,9 +333,11 @@ async def test_full_service_has_artifacts_terminal_event_and_owned_reconnect(
             assert not calls
 
 
+@pytest.mark.parametrize("workflow_id", ["baseline-v1", "research-v1"])
 async def test_full_service_strict_replay_completes_against_verified_baseline_bundle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    workflow_id: str,
 ):
     source = Path("tests/fixtures/replay/baseline").resolve()
     bundle_root = tmp_path / "bundle"
@@ -435,7 +437,7 @@ async def test_full_service_strict_replay_completes_against_verified_baseline_bu
                 "run_purpose": "demo",
                 "budget_preset": "medium",
             },
-            "workflow_id": "baseline-v1",
+            "workflow_id": workflow_id,
             "planner_id": "P1",
             "ranker_id": "R1",
             "seed": 0,
@@ -455,9 +457,18 @@ async def test_full_service_strict_replay_completes_against_verified_baseline_bu
             manifest_response = await client.get(f"/runs/{run_id}/artifacts/manifest")
             assert manifest_response.status_code == 200
             manifest = RunManifest.model_validate_json(manifest_response.content)
+            assert manifest.workflow_id == workflow_id
+            assert manifest.graph_version == (
+                "research-graph-v1" if workflow_id == "research-v1" else "baseline-graph-v1"
+            )
             assert manifest.replay_parent == snapshot["run_id"]
             assert manifest.provider_profiles[0].execution_mode == "replay"
             assert "baseline-parser-router" in manifest.provider_profiles[0].provider_ids
+            if workflow_id == "research-v1":
+                assert {item.node for item in manifest.node_executions} >= {
+                    "ExtractClaims",
+                    "VerifyClaims",
+                }
             events_response = await client.get(f"/runs/{run_id}/events")
             assert events_response.status_code == 200
             assert "run_completed" in events_response.text

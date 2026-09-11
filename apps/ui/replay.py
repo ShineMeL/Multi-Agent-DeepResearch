@@ -21,9 +21,12 @@ def replay_payload(
     budget_preset: Literal["low", "medium"] = "medium",
     provider_profile_id: str = "replay-default",
     seed: int = 0,
+    workflow_id: Literal["baseline-v1", "research-v1"] = "baseline-v1",
 ) -> dict[str, object]:
     if not question.strip() or not provider_profile_id.strip():
         raise ValueError("Question and replay profile are required")
+    if workflow_id not in {"baseline-v1", "research-v1"}:
+        raise ValueError("Unsupported replay workflow")
     request = ResearchRequest(
         question=question.strip(),
         # Keep the Showcase request identity aligned with the shipped baseline
@@ -41,11 +44,37 @@ def replay_payload(
     )
     return {
         "request": request.model_dump(mode="json"),
-        "workflow_id": "baseline-v1",
+        "workflow_id": workflow_id,
         "planner_id": "P1",
         "ranker_id": "R1",
         "seed": seed,
     }
+
+
+def research_replay_payload(
+    question: str,
+    *,
+    report_language: str = "en",
+    source_languages: tuple[str, ...] = ("en",),
+    budget_preset: Literal["low", "medium"] = "medium",
+    provider_profile_id: str = "replay-default",
+    seed: int = 0,
+) -> dict[str, object]:
+    """Build the supported deterministic research-v1 showcase request.
+
+    The production research graph currently exposes the audited P1/R1
+    composition only.  Keeping this helper separate from ``replay_payload``
+    preserves the baseline fixture contract used by existing clients/tests.
+    """
+    return replay_payload(
+        question,
+        report_language=report_language,
+        source_languages=source_languages,
+        budget_preset=budget_preset,
+        provider_profile_id=provider_profile_id,
+        seed=seed,
+        workflow_id="research-v1",
+    )
 
 
 @dataclass

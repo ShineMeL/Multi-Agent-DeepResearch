@@ -22,7 +22,7 @@ from apps.ui.api_client import (
     StreamReconnectExhausted,
     TransportError,
 )
-from apps.ui.replay import ShowcaseSession, replay_payload
+from apps.ui.replay import ShowcaseSession, research_replay_payload
 
 
 def _release_session(session: ShowcaseSession) -> None:
@@ -51,7 +51,7 @@ def _error_message(error: Exception) -> str:
         messages = {
             "PROVIDER_PROFILE_DRIFT": "The API replay profile is unavailable or incomplete. "
             "Configure a complete replay catalog and matching bundle on the API server.",
-            "RESEARCH_GRAPH_UNAVAILABLE": "Production research-v1 is unavailable.",
+            "RESEARCH_GRAPH_UNAVAILABLE": "This research-v1 composition is unavailable on the API server.",
             "CHECKPOINT_RESUME_UNAVAILABLE": "Checkpoint continuation is unavailable in this "
             "service version. The interrupted run and its artifacts remain available.",
             "RUN_NOT_FOUND": "Run unavailable in this browser session.",
@@ -254,9 +254,11 @@ def _run_panel(
 def main() -> None:
     st.set_page_config(page_title="Research Replay Showcase", layout="wide")
     st.title("Research Replay Showcase")
-    st.caption("Baseline replay · P1 fixed planner · R1 similarity ranking")
-    st.warning(
-        "Production research-v1 is unavailable. This showcase submits baseline-v1 replay runs."
+    st.caption("Research-v1 replay · deterministic P1 planner · R1 evidence ranking")
+    st.info(
+        "This showcase runs the supported research-v1 P1/R1 composition over the verified, "
+        "credential-free replay bundle. P2/R2 model optimization and Live providers are not "
+        "enabled in this release."
     )
     st.info(
         "The packaged Compose baseline includes the replay-default profile and verified bundle. "
@@ -286,7 +288,7 @@ def main() -> None:
         submitted = st.form_submit_button("Start replay", disabled=session.watching)
     if submitted:
         try:
-            payload = replay_payload(
+            payload = research_replay_payload(
                 question,
                 report_language=language,
                 source_languages=(source_language,),

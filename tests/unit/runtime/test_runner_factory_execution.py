@@ -15,7 +15,7 @@ from pydantic import ValidationError
 from deepresearch.domain import RunConfig
 from deepresearch.providers.httpx_fetcher import no_op_host_slot
 from deepresearch.runtime import CancellationToken
-from deepresearch.runtime.checkpoints import checkpoint_serializer
+from deepresearch.runtime.checkpoints import checkpoint_ref_from_tuple, checkpoint_serializer
 from deepresearch.runtime.manifest import CostCalculator, PricingSnapshot, RunManifest
 from deepresearch.runtime.runner_factory import (
     DefaultCoreRunnerBuilder,
@@ -27,6 +27,7 @@ from deepresearch.runtime.runner_factory import (
     default_provider_constructors,
 )
 from deepresearch.storage import LocalArtifactStore, LocalEvidenceStore
+from deepresearch.workflow.runner import BaselineRuntimeHooks
 from tests.integration.replay.test_baseline_graph import (
     ControlledSegmentClock,
     CountingOfflineEmbedder,
@@ -34,6 +35,7 @@ from tests.integration.replay.test_baseline_graph import (
     CountingOfflineModel,
     CountingOfflineParser,
     CountingOfflineSearch,
+    CrashAfterDurableEventSink,
     MemoryEventSink,
     _offline_plan,
     config,
@@ -154,8 +156,6 @@ async def test_priced_baseline_executes_both_model_endpoints_and_parse_with_audi
         checkpointer=InMemorySaver(serde=checkpoint_serializer()),
         cost_calculator=CostCalculator,
     )
-    from deepresearch.workflow.runner import BaselineRuntimeHooks
-
     clock = ControlledSegmentClock(monotonic_start=time.monotonic(), utc_offset_seconds=0)
     runner._runtime_hooks = BaselineRuntimeHooks(monotonic=clock.monotonic, utc_now=clock.utc_now)
     result = await runner.run(
@@ -180,6 +180,86 @@ async def test_priced_baseline_executes_both_model_endpoints_and_parse_with_audi
     assert parsed and all(call.usage.cost_usd == Decimal(0) for call in parsed)
     assert result.final_usage.cost_usd == Decimal("0.000020") * len(model_calls)
     assert any(key.startswith("parse:") for key in calls)
+
+
+async def test_research_v1_p1_r1_replay_composes_and_completes(tmp_path):
+    """The supported research showcase must execute the real graph, not baseline fallback."""
+    builder, conf, routes, snapshots, calls, artifacts = composition(tmp_path)
+    research_config = conf.model_copy(update={"workflow_id": "research-v1"})
+    runner = builder.build(
+        config=research_config,
+        provider_routes=routes,
+        pricing_snapshots=snapshots,
+        checkpointer=InMemorySaver(serde=checkpoint_serializer()),
+        cost_calculator=CostCalculator,
+    )
+    assert getattr(runner, "_research_graph", None) is not None
+
+    from deepresearch.runtime import CancellationToken
+    from tests.integration.replay.test_baseline_graph import MemoryEventSink
+
+    result = await runner.run(
+        run_id="research-v1-run",
+        thread_id="research-v1-thread",
+        config=research_config,
+        checkpoint=None,
+        emit=MemoryEventSink(),
+        cancellation_token=CancellationToken(),
+    )
+
+    assert result.status == "completed", result.error_code
+    assert result.report_artifact_id is not None
+    assert result.evidence_graph_artifact_id is not None
+    assert result.manifest_artifact_id is not None
+    report = artifacts.get_bytes(result.report_artifact_id).decode("utf-8")
+    assert report.strip()
+    # Deterministic claim verification is an internal research stage; no
+    # additional model/provider calls are allowed beyond the shared baseline.
+    assert not any(key.startswith(("claims:", "judge:")) for key in calls)
+
+
+async def test_research_v1_durable_event_recovery_preserves_research_state(tmp_path):
+    builder, conf, routes, snapshots, _calls, _artifacts = composition(tmp_path)
+    research_config = conf.model_copy(update={"workflow_id": "research-v1"})
+    saver = InMemorySaver(serde=checkpoint_serializer())
+    runner = builder.build(
+        config=research_config,
+        provider_routes=routes,
+        pricing_snapshots=snapshots,
+        checkpointer=saver,
+        cost_calculator=CostCalculator,
+    )
+    clock = ControlledSegmentClock(monotonic_start=time.monotonic(), utc_offset_seconds=0)
+    runner._runtime_hooks = BaselineRuntimeHooks(monotonic=clock.monotonic, utc_now=clock.utc_now)
+    sink = CrashAfterDurableEventSink(crash_seq=11)
+    with pytest.raises(MemoryError):
+        await runner.run(
+            run_id="research-recovery-run",
+            thread_id="research-recovery-thread",
+            config=research_config,
+            checkpoint=None,
+            emit=sink,
+            cancellation_token=CancellationToken(),
+        )
+    saved = await saver.aget_tuple(
+        {"configurable": {"thread_id": "research-recovery-thread", "checkpoint_ns": ""}}
+    )
+    assert saved is not None
+    result = await runner.run(
+        run_id="research-recovery-run",
+        thread_id="research-recovery-thread",
+        config=research_config,
+        checkpoint=checkpoint_ref_from_tuple(saved),
+        emit=sink,
+        cancellation_token=CancellationToken(),
+    )
+    assert result.status == "completed", result.error_code
+    assert [event.node for event in sink.calls].count("ExtractClaims") == 2
+    assert {event.node for event in sink.calls[-4:]} >= {
+        "VerifyClaims",
+        "FinalizeCitations",
+        "PersistResults",
+    }
 
 
 @pytest.mark.parametrize("missing", ["complete", "structured", "parse"])
