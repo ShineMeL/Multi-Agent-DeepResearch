@@ -82,11 +82,14 @@ Files:
 
 - Research/UI/runtime focused suite: **69 passed**.
 - Cross-module offline regression suite (`tests/unit`, `tests/contracts`,
-  replay/API/deployment integration, excluding `online`): **1,752 passed, 5
+  replay/API/deployment integration, excluding `online`): **1,753 passed, 5
   skipped, 1 deselected**. The only output warning is the existing Starlette/
-  HTTPX deprecation notice.
-- `pyright src apps`: **0 errors, 0 warnings, 0 informations**; `ruff check .`
-  and `git diff --check` pass.
+  HTTPX deprecation notice. All tracked Replay and frozen-corpus fixtures were
+  verified from LF working-tree bytes, so their manifest hashes validate on
+  Windows with `core.autocrlf=false`.
+- `pyright src apps`: **0 errors, 0 warnings, 0 informations**; Ruff passes for
+  the repository sources (the pre-existing user-owned dirty experiment test is
+  excluded from the gate), and `git diff --check` passes.
 - The public showcase now selects the deterministic P1/R1 `research-v1` graph.
   Strict replay executes `ExtractClaims` and `VerifyClaims`, preserves the
   research state through durable-event recovery, and emits a Core-valid
