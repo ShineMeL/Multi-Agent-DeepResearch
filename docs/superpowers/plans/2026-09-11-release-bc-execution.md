@@ -35,7 +35,7 @@
 - Produces `assess_gate(repository: Path, gate: GateName, *, experiment_dir: Path | None = None, external_experiment_dir: Path | None = None, human_summary: Path | None = None, environ: Mapping[str, str] | None = None, command_exists: Callable[[str], bool] = shutil.which) -> GateReport`.
 - CLI contract: `python scripts/release_preflight.py --gate {b1,b2,c1,c2,c3,c4,all} [--repository PATH] [--experiment-dir PATH] [--external-experiment-dir PATH] [--human-summary PATH] [--format text|json]`; exit `0` only when every requested report is `ready`, otherwise exit `1` with a stable reason and no secret values.
 
-- [ ] **Step 1: Write the failing tests for statuses, secret-safe output, and all gates**
+- [x] **Step 1: Write the failing tests for statuses, secret-safe output, and all gates**
 
 ```python
 def test_b1_is_blocked_without_docker(tmp_path, monkeypatch):
@@ -83,13 +83,13 @@ def test_c4_is_not_ready_when_results_are_unsealed(tmp_path):
     assert report.reason == "PUBLICATION_UNSEALED"
 ```
 
-- [ ] **Step 2: Run the focused tests and verify they fail for the missing module/contract**
+- [x] **Step 2: Run the focused tests and verify they fail for the missing module/contract**
 
 Run: `python -m uv run --no-sync pytest -q tests/unit/test_release_preflight.py`
 
 Expected: collection fails because `scripts.release_preflight` and `assess_gate` do not exist yet.
 
-- [ ] **Step 3: Implement the minimal preflight module**
+- [x] **Step 3: Implement the minimal preflight module**
 
 Use exact reason codes from the spec. B1 checks Docker/Compose commands and
 `docker-compose.yml`; B2 checks the three required secret names plus catalog
@@ -104,19 +104,19 @@ still contains its explicit unsealed marker. Details contain only booleans, rela
 stable missing-file names. JSON output serializes the same fields in sorted
 order; text output is one line per check and a final `release_gate ...` line.
 
-- [ ] **Step 4: Re-run the focused tests and the script contract**
+- [x] **Step 4: Re-run the focused tests and the script contract**
 
 Run: `python -m uv run --no-sync pytest -q tests/unit/test_release_preflight.py`
 
 Expected: all focused tests pass, and `python scripts/release_preflight.py --gate all --format json` exits `1` with no credential values on this machine.
 
-- [ ] **Step 5: Run lint/type checks for the new module**
+- [x] **Step 5: Run lint/type checks for the new module**
 
 Run: `python -m uv run --no-sync ruff check scripts/release_preflight.py tests/unit/test_release_preflight.py --no-cache`
 
 Expected: `All checks passed!`. Run `python -m compileall -q scripts` and expect exit `0`.
 
-- [ ] **Step 6: Commit the preflight unit**
+- [x] **Step 6: Commit the preflight unit**
 
 ```bash
 git add scripts/release_preflight.py tests/unit/test_release_preflight.py
@@ -135,7 +135,7 @@ git commit -m "feat: add Release B and C capability preflight"
 - The runner never receives raw secret values in command arguments. It accepts only server-side catalog paths and environment names.
 - `--profile replay` performs B1; `--profile online-smoke` performs B2 after preflight. `--dry-run` prints the exact redacted command plan without running Docker/provider commands. Exit `0` only for `ready`.
 
-- [ ] **Step 1: Write failing tests for fail-closed ordering and command redaction**
+- [x] **Step 1: Write failing tests for fail-closed ordering and command redaction**
 
 ```python
 def test_b1_stops_before_docker_when_preflight_is_blocked(tmp_path, monkeypatch):
@@ -191,13 +191,13 @@ def test_b2_requires_complete_catalog_and_does_not_echo_keys(tmp_path, monkeypat
     assert result.reason == "ONLINE_SMOKE_INCOMPLETE"
 ```
 
-- [ ] **Step 2: Run the tests to observe the missing module failure**
+- [x] **Step 2: Run the tests to observe the missing module failure**
 
 Run: `python -m uv run --no-sync pytest -q tests/integration/deployment/test_release_b_gate.py`
 
 Expected: collection fails because `scripts.release_b_gate` is absent.
 
-- [ ] **Step 3: Implement B1/B2 with explicit subprocess boundaries**
+- [x] **Step 3: Implement B1/B2 with explicit subprocess boundaries**
 
 Use `assess_gate` before any external command. B1 executes the documented
 sequence: `docker compose config --quiet`, `docker build --build-arg
@@ -212,7 +212,7 @@ deletes temporary files. It refuses missing credentials, missing catalog files,
 or incomplete pricing before starting the service. Never include environment
 values in `BStep.detail`.
 
-- [ ] **Step 4: Re-run focused B tests and a dry-run on this host**
+- [x] **Step 4: Re-run focused B tests and a dry-run on this host**
 
 Run: `python -m uv run --no-sync pytest -q tests/integration/deployment/test_release_b_gate.py`
 
@@ -221,7 +221,7 @@ Expected: focused tests pass. Then run:
 
 Expected: exit `1`, reason `DEPLOYMENT_PREREQUISITE_MISSING`, and no attempt to invoke Docker.
 
-- [ ] **Step 5: Document operator commands and limits**
+- [x] **Step 5: Document operator commands and limits**
 
 Add a Release B section to `docs/deployment.md` that links the preflight and
 gate commands, states that the default profile is replay, gives the manual
@@ -230,7 +230,7 @@ online-smoke invocation, requires a rotated secret set, and names the exact
 `ONLINE_SMOKE_INCOMPLETE` outcomes. State that `docker compose down` preserves
 named volumes unless the operator explicitly chooses a destructive cleanup.
 
-- [ ] **Step 6: Run lint and commit B orchestration**
+- [x] **Step 6: Run lint and commit B orchestration**
 
 Run: `python -m uv run --no-sync ruff check scripts/release_b_gate.py tests/integration/deployment/test_release_b_gate.py --no-cache`
 
@@ -253,7 +253,7 @@ git commit -m "feat: add Release B deployment gate"
 - C1 never writes `formal.yaml`; C2 delegates existing experiment commands only after C1 validation; C3 keeps external/human artifacts separate; C4 invokes the existing renderer only after every input and hash sidecar verifies.
 - `--stage c1|c2|c3|c4`, `--experiment-dir`, `--external-experiment-dir`, and `--human-summary` are the complete CLI surface. Exit `0` only when the selected stage is ready.
 
-- [ ] **Step 1: Write failing tests for missing formal inputs, dirty trees, and publication stop conditions**
+- [x] **Step 1: Write failing tests for missing formal inputs, dirty trees, and publication stop conditions**
 
 ```python
 def test_c1_does_not_create_partial_formal_config(tmp_path):
@@ -294,13 +294,13 @@ def test_c4_keeps_unsealed_results_unchanged(tmp_path):
     assert results.read_bytes() == before
 ```
 
-- [ ] **Step 2: Run focused tests and verify the expected missing-module failure**
+- [x] **Step 2: Run focused tests and verify the expected missing-module failure**
 
 Run: `python -m uv run --no-sync pytest -q tests/integration/benchmarks/test_release_c_gate.py`
 
 Expected: collection fails because `scripts.release_c_gate` is absent.
 
-- [ ] **Step 3: Implement C1–C4 validation and delegation**
+- [x] **Step 3: Implement C1–C4 validation and delegation**
 
 C1 checks `qwen3-8b.lock.json`, `inference-environment.lock.json`,
 `models/embedding.lock.json`, `benchmarks/private/frozen_ai_cs_60/private_manifest.json`,
@@ -318,7 +318,7 @@ hashes, and only then promotes deterministic public Markdown/SVG files. Any
 missing or invalid manifest/sidecar returns `PUBLICATION_UNSEALED` without
 touching `docs/results.md`.
 
-- [ ] **Step 4: Re-run focused C tests and verify the current machine is blocked honestly**
+- [x] **Step 4: Re-run focused C tests and verify the current machine is blocked honestly**
 
 Run: `python -m uv run --no-sync pytest -q tests/integration/benchmarks/test_release_c_gate.py`
 
@@ -327,7 +327,7 @@ Expected: all focused tests pass. Then run:
 
 Expected: exit `1` with `FORMAL_INPUT_MISSING` because the pinned model lock and private manifest are absent; no `formal.yaml` is created.
 
-- [ ] **Step 5: Document C execution order and publication stop conditions**
+- [x] **Step 5: Document C execution order and publication stop conditions**
 
 Update `docs/evaluation.md` with the C1→C4 gate commands, the clean-LF
 requirement, the 10,000-resample command, the separate external/human inputs,
@@ -335,7 +335,7 @@ and the exact behavior when an input is missing. Keep all current statements
 that formal YAML, model locks, external licenses, and ratings are intentionally
 absent in this checkout.
 
-- [ ] **Step 6: Run lint/type checks and commit C orchestration**
+- [x] **Step 6: Run lint/type checks and commit C orchestration**
 
 Run: `python -m uv run --no-sync ruff check scripts/release_c_gate.py tests/integration/benchmarks/test_release_c_gate.py --no-cache`
 
@@ -358,7 +358,7 @@ git commit -m "feat: add Release C publication gate"
 - CI invokes `python scripts/release_preflight.py --gate c1 --format json` in a clean Linux checkout and retains B2 as a manual/scheduled job.
 - Runbooks use `git -c core.autocrlf=false clone --branch main https://github.com/ShineMeL/Multi-Agent-DeepResearch.git "$env:TEMP\\deepresearch-lf"` or an equivalent fresh LF checkout; they never call a hash-rewriting repair command.
 
-- [ ] **Step 1: Write failing runbook/CI contract tests**
+- [x] **Step 1: Write failing runbook/CI contract tests**
 
 ```python
 def test_runbooks_instruct_clean_lf_checkout_and_never_regenerate_hashes():
@@ -379,13 +379,13 @@ def test_ci_keeps_online_smoke_manual_and_secret_free_verify_job():
     assert "online-smoke" in json.dumps(workflow["jobs"])
 ```
 
-- [ ] **Step 2: Run the tests and observe the missing runbook/CI references**
+- [x] **Step 2: Run the tests and observe the missing runbook/CI references**
 
 Run: `python -m uv run --no-sync pytest -q tests/contracts/test_release_runbook.py`
 
 Expected: the assertions for `release_preflight.py` fail before documentation/CI changes.
 
-- [ ] **Step 3: Add exact LF and gate instructions**
+- [x] **Step 3: Add exact LF and gate instructions**
 
 Document a PowerShell-safe fresh checkout, the preflight command, and the
 canonical replay readiness invocation. Add the C preflight to the secret-free
@@ -394,13 +394,13 @@ online job conditional on all five configured secret/catalog inputs and retain
 its manual/scheduled trigger. Do not add secrets to the normal verification
 job.
 
-- [ ] **Step 4: Re-run contract tests, lint, and diff checks**
+- [x] **Step 4: Re-run contract tests, lint, and diff checks**
 
 Run: `python -m uv run --no-sync pytest -q tests/contracts/test_release_runbook.py`
 
 Expected: all tests pass. Run `python -m uv run --no-sync ruff check . --no-cache`, `python -m uv run --no-sync pyright src apps benchmarks experiments`, `python -m compileall -q scripts`, and `git diff --check`; all must exit `0`.
 
-- [ ] **Step 5: Commit the reproducibility wiring**
+- [x] **Step 5: Commit the reproducibility wiring**
 
 ```bash
 git add .github/workflows/ci.yml docs/deployment.md docs/evaluation.md tests/contracts/test_release_runbook.py
@@ -415,7 +415,7 @@ git commit -m "docs: wire Release B and C reproducibility gates"
 
 **Interfaces:** Consumes the Task 1–4 gate commands and existing service/benchmark contracts. Produces only verified run manifests, summaries, and (for a successful C4) public docs assets.
 
-- [ ] **Step 1: Re-run the capability matrix from a clean LF checkout**
+- [x] **Step 1: Re-run the capability matrix from a clean LF checkout**
 
 Run:
 
@@ -425,7 +425,7 @@ python scripts/release_preflight.py --gate all --format json
 
 Record each gate as `ready`, `blocked`, or `skipped`; do not edit `docs/results.md` based on this command.
 
-- [ ] **Step 2: Execute B1 only when Docker/Compose is available**
+- [x] **Step 2: Execute B1 only when Docker/Compose is available** — recorded `DEPLOYMENT_PREREQUISITE_MISSING`; this host has no Docker/Compose.
 
 Run:
 
@@ -437,7 +437,7 @@ On a host without Docker, retain `DEPLOYMENT_PREREQUISITE_MISSING` as the
 result and report the host limitation. On a capable host, preserve the Compose
 health/artifact/SSE evidence and use a separate URI-encoded Postgres password.
 
-- [ ] **Step 3: Execute B2 only with rotated authorized credentials**
+- [x] **Step 3: Execute B2 only with rotated authorized credentials** — recorded `ONLINE_SMOKE_NOT_AUTHORIZED`; no provider call was made.
 
 Supply a complete `online-smoke` catalog and prices through the secret store,
 then run:
@@ -449,26 +449,26 @@ python scripts/release_b_gate.py --profile online-smoke
 If any required input is absent, retain the stable skip/block reason and make no
 provider call. Never use the compromised Kimi key.
 
-- [ ] **Step 4: Execute C1/C2 only after model/data locks exist**
+- [x] **Step 4: Execute C1/C2 only after model/data locks exist** — recorded `FORMAL_INPUT_MISSING`; no formal config was created.
 
 From a clean LF seal commit, run the existing lock, freeze, validate, strict
 replay, formal protocol, and summarize commands in `docs/evaluation.md`. Verify
 all manifest hashes and 10,000 bootstrap outputs before proceeding.
 
-- [ ] **Step 5: Execute C3 only with licensed external data and human ratings**
+- [x] **Step 5: Execute C3 only with licensed external data and human ratings** — recorded `PORTFOLIO_INPUT_MISSING`; no external or human result was fabricated.
 
 Restore and verify exactly 10/20/10 external snapshots and a separate
 20-task/3-rater human aggregate. Reject pending/example licenses, incomplete
 sidecars, or duplicated raters; keep primary/external/human groups separate.
 
-- [ ] **Step 6: Run C4 and seal results only after all checks pass**
+- [x] **Step 6: Run C4 and seal results only after all checks pass** — correctly stopped at `PUBLICATION_UNSEALED`; `docs/results.md` was not edited.
 
 Run the renderer twice, compare output hashes, inspect all three SVGs, then
 update `docs/results.md`, README links, and public figures from verified
 aggregates. If any gate is blocked or skipped, leave the page's explicit
 “primary result is not yet sealed” wording unchanged.
 
-- [ ] **Step 7: Final verification and handoff**
+- [x] **Step 7: Final verification and handoff**
 
 Run the service-scope offline suite, gate-specific tests, Ruff, configured
 Pyright, `compileall`, `git diff --check`, and a clean-LF readiness check. Record
@@ -477,11 +477,20 @@ B or C completion unless the corresponding gate exits `0` with verified output.
 
 ## Completion checklist
 
-- [ ] Preflight reports stable, secret-free statuses for B1/B2/C1/C2/C3/C4.
-- [ ] B1 Docker/Postgres evidence is captured, or its prerequisite block is recorded.
-- [ ] B2 online smoke is authorized and completed, or skipped before provider calls.
-- [ ] C1 formal inputs and seal are verified, or no partial seal is created.
+- [x] Preflight reports stable, secret-free statuses for B1/B2/C1/C2/C3/C4.
+- [x] B1 Docker/Postgres evidence is captured, or its prerequisite block is recorded.
+- [x] B2 online smoke is authorized and completed, or skipped before provider calls.
+- [x] C1 formal inputs and seal are verified, or no partial seal is created.
 - [ ] C2 primary results are manifest-verified with 10,000 deterministic bootstrap resamples.
 - [ ] C3 external 10/20/10 and 20×3 human inputs are independently verified, or remain explicitly missing.
 - [ ] C4 output is byte-stable and only then can `docs/results.md` become sealed.
-- [ ] Release A replay behavior, security boundaries, and cost/route policies remain unchanged.
+- [x] Release A replay behavior, security boundaries, and cost/route policies remain unchanged.
+
+### Execution record — 2026-09-11
+
+- Release A readiness: passed with bundle SHA-256 `d3132abffb9e62c0c4dd5ae6996edd93872fbeab5483553fb1c53235281eaed6`.
+- Offline service regression: `1742 passed, 5 skipped, 1 deselected, 1 warning`.
+- New gate/preflight tests: `21 passed`; Ruff, configured Pyright, compileall, and diff checks passed.
+- Clean LF clone: `crlf_files=0`; readiness passed after locked dependency sync.
+- Published commits: `167654b` on `main`; review branch `feature/release-bc-readiness` was pushed and merged.
+- Remaining environment blockers are intentionally unchanged: Docker/PostgreSQL/vLLM binaries, authorized online credentials/catalogs, pinned formal model/data locks, licensed external snapshots, and 20×3 human ratings. `docs/results.md` remains unsealed.
