@@ -80,7 +80,11 @@ def _safe_revision(repository: Path) -> str:
     """
 
     candidate = os.environ.get("GITHUB_SHA", "").strip()
-    if len(candidate) == 40 and all(character in "0123456789abcdefABCDEF" for character in candidate):
+    if (
+        len(candidate) == 40
+        and candidate != _ZERO_REVISION
+        and all(character in "0123456789abcdefABCDEF" for character in candidate)
+    ):
         return candidate.lower()
     git_marker = repository / ".git"
     if not git_marker.exists():
@@ -96,8 +100,11 @@ def _safe_revision(repository: Path) -> str:
     except (OSError, subprocess.SubprocessError):
         return _ZERO_REVISION
     revision = result.stdout.strip()
-    if result.returncode == 0 and len(revision) == 40 and all(
-        character in "0123456789abcdefABCDEF" for character in revision
+    if (
+        result.returncode == 0
+        and len(revision) == 40
+        and revision != _ZERO_REVISION
+        and all(character in "0123456789abcdefABCDEF" for character in revision)
     ):
         return revision.lower()
     return _ZERO_REVISION

@@ -59,7 +59,6 @@ _EXTERNAL_COUNTS = {"livedrbench": 10, "frames": 20, "deepresearchbench": 10}
 _HASH_RE = frozenset("0123456789abcdef")
 _PUBLICATION_FILES = (
     Path("results.md"),
-    Path("evaluation.md"),
     Path("assets/results/abcd-metrics.svg"),
     Path("assets/results/citation-support-vs-usd.svg"),
     Path("assets/results/completeness-vs-search.svg"),
