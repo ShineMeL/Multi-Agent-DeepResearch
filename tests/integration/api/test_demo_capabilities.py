@@ -116,6 +116,27 @@ def test_capabilities_do_not_infer_the_builtin_example_from_a_custom_model_id(tm
     assert data["replay_example"] is None
 
 
+def test_capabilities_reject_a_shipped_bundle_with_mismatched_frozen_routes(tmp_path):
+    payload = json.loads(Path("deploy/replay/profiles.json").read_text(encoding="utf-8"))
+    model_route = next(
+        route
+        for route in payload["profiles"]["replay-default"]["routes"]
+        if route["operation"] == "model"
+    )
+    model_route["provider_id"] = "route-does-not-match-bundle"
+    catalog = tmp_path / "mismatched-profiles.json"
+    catalog.write_text(json.dumps(payload), encoding="utf-8")
+    current = settings(tmp_path, provider_profile_catalog_path=catalog)
+
+    with TestClient(create_app(current), client=("127.0.0.1", 1234)) as client:
+        response = client.get("/capabilities")
+
+    assert response.status_code == 200
+    assert response.json()["profiles"][0]["available"] is False
+    assert response.json()["profiles"][0]["reason"] == "PROVIDER_PROFILE_DRIFT"
+    assert response.json()["replay_example"] is None
+
+
 def test_local_unpriced_live_policy_keeps_replay_budget_identity(tmp_path):
     current = settings(
         tmp_path, local_unpriced_live=True, allowed_execution_modes=("replay", "live")

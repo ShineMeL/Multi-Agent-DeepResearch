@@ -10,7 +10,7 @@ from collections.abc import AsyncGenerator, Callable, Collection, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Literal, Never, Protocol, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, Literal, Never, Protocol, TypeAlias, cast
 
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, JsonValue, SecretStr, model_validator
 
@@ -44,6 +44,9 @@ from deepresearch.workflow.runner import (
     LangGraphResearchRunner,
     paired_runtime_hooks,
 )
+
+if TYPE_CHECKING:
+    from deepresearch.providers.replay_schema import ReplayBundle
 
 _SECRET = re.compile(r"(?i)(authorization|api.?key|password|secret|bearer|cookie|access.?token)")
 _PARAMETERS = frozenset(
@@ -359,6 +362,67 @@ class FileProviderRouteCatalog:
             raise ProviderProfileDrift() from None
 
 
+_REPLAY_OPERATIONS = {"model", "search", "fetch", "parse", "embed"}
+
+
+def _validate_replay_route_snapshot(route: FrozenProviderRoute, bundle: ReplayBundle) -> None:
+    snapshot = bundle.provider_snapshot(route.operation)
+    if (
+        snapshot.provider_id != route.provider_id
+        or snapshot.model_id != route.model_id
+        or snapshot.model_revision != route.model_revision
+    ):
+        raise ProviderProfileDrift()
+
+
+def validate_replay_route_bundle(provider_routes: FrozenProviderRoutes) -> ReplayBundle:
+    """Return the verified bundle only when frozen routes can execute it."""
+
+    try:
+        provider_routes = FrozenProviderRoutes.model_validate(
+            provider_routes.model_dump(mode="json")
+        )
+    except (TypeError, ValueError):
+        raise ProviderProfileDrift() from None
+    if provider_routes.execution_mode != "replay":
+        raise ProviderProfileDrift()
+    routes = {route.operation: route for route in provider_routes.routes}
+    from deepresearch.providers.parsers import HtmlParser, PdfParser
+
+    replay_parser_ids = {HtmlParser.parser_id, PdfParser.parser_id, _ParserRouter.parser_id}
+    if (
+        len(provider_routes.routes) != len(_REPLAY_OPERATIONS)
+        or set(routes) != _REPLAY_OPERATIONS
+        or any(route.fallback_rank != 0 for route in provider_routes.routes)
+        or routes["parse"].provider_id not in replay_parser_ids
+    ):
+        raise ProviderProfileDrift()
+    bundle_paths: set[str] = set()
+    for operation, route in routes.items():
+        if operation == "parse":
+            continue
+        path = route.parameters.get("bundle_path")
+        if not isinstance(path, str) or not path:
+            raise ProviderProfileDrift()
+        bundle_paths.add(path)
+    if len(bundle_paths) != 1:
+        raise ProviderProfileDrift()
+    from deepresearch.providers.replay_schema import ReplayBundle
+
+    try:
+        bundle = ReplayBundle.load(Path(next(iter(bundle_paths))))
+        if not bundle.verify().valid:
+            raise ProviderProfileDrift()
+        for operation, route in routes.items():
+            if operation != "parse":
+                _validate_replay_route_snapshot(route, bundle)
+        return bundle
+    except ProviderProfileDrift:
+        raise
+    except (OSError, TypeError, ValueError, ProviderError):
+        raise ProviderProfileDrift() from None
+
+
 ProviderAdapter: TypeAlias = ModelProvider | SearchProvider | Fetcher | Parser | TextEmbedder  # noqa: UP040 - public contract
 ProviderConstructor: TypeAlias = Callable[  # noqa: UP040 - public contract
     [FrozenProviderRoute, str | None, HostSlot], ProviderAdapter
@@ -449,13 +513,7 @@ def default_provider_constructors() -> dict[str, ProviderConstructor]:
         }
         if route.operation not in constructors:
             raise ProviderProfileDrift()
-        snapshot = bundle.provider_snapshot(route.operation)
-        if (
-            snapshot.provider_id != route.provider_id
-            or snapshot.model_id != route.model_id
-            or snapshot.model_revision != route.model_revision
-        ):
-            raise ProviderProfileDrift()
+        _validate_replay_route_snapshot(route, bundle)
         return cast(ProviderAdapter, constructors[route.operation](bundle))
 
     def model(route: FrozenProviderRoute, secret: str | None, slot: HostSlot) -> ProviderAdapter:
@@ -754,31 +812,9 @@ class DefaultCoreRunnerBuilder:
             raise ProviderProfileDrift()
         replay_parent: str | None = None
         if provider_routes.execution_mode == "replay":
-            # Core requires the recorded run identity before ValidateRequest.  The
-            # identity is part of the verified bundle snapshot, never a client or
-            # catalog-supplied secret-bearing field.  Require one shared bundle for
-            # all replayed operations so the audit parent cannot be ambiguous.
-            bundle_paths: set[str] = set()
-            for operation, route in routes.items():
-                if operation == "parse":
-                    continue
-                path = route.parameters.get("bundle_path")
-                if not isinstance(path, str) or not path:
-                    raise ProviderProfileDrift()
-                bundle_paths.add(path)
-            if len(bundle_paths) != 1:
-                raise ProviderProfileDrift()
-            from deepresearch.providers.replay_schema import ReplayBundle
-
-            try:
-                bundle = ReplayBundle.load(Path(next(iter(bundle_paths))))
-                if not bundle.verify().valid:
-                    raise ProviderProfileDrift()
-                replay_parent = bundle.snapshot.run_id
-            except ProviderProfileDrift:
-                raise
-            except (OSError, TypeError, ValueError, ProviderError):
-                raise ProviderProfileDrift() from None
+            # Core requires a route-compatible recorded identity before
+            # ValidateRequest so audit parent selection cannot be ambiguous.
+            replay_parent = validate_replay_route_bundle(provider_routes).snapshot.run_id
         # Only single routes are currently supported by the Core composition.
         # Reject an unsupported deployment policy before any adapter construction.
         constructor_keys = {

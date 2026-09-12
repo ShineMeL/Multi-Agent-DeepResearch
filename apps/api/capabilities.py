@@ -1,15 +1,18 @@
 """Server-selected demo modes. This is configuration discovery, not an online probe."""
 
 import os
-from pathlib import Path
 from typing import Literal
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
-from deepresearch.providers import ProviderError
 from deepresearch.providers.replay_schema import ReplayBundle
-from deepresearch.runtime.runner_factory import FileProviderRouteCatalog, FrozenProviderRoutes
+from deepresearch.runtime.runner_factory import (
+    FileProviderRouteCatalog,
+    FrozenProviderRoutes,
+    ProviderProfileDrift,
+    validate_replay_route_bundle,
+)
 
 from .settings import ServiceSettings
 
@@ -50,23 +53,14 @@ class DemoCapabilities(BaseModel):
     unpriced_live: bool
 
 
-def _is_shipped_replay(routes: FrozenProviderRoutes) -> bool:
-    bundle_paths = {
-        path
-        for route in routes.routes
-        if route.operation != "parse"
-        for path in (route.parameters.get("bundle_path"),)
-        if isinstance(path, str) and path
-    }
-    if len(bundle_paths) != 1 or any(
-        route.operation != "parse" and "bundle_path" not in route.parameters
-        for route in routes.routes
-    ):
-        return False
+def _verified_replay_bundle(routes: FrozenProviderRoutes) -> ReplayBundle | None:
     try:
-        bundle = ReplayBundle.load(Path(next(iter(bundle_paths))))
-    except (OSError, TypeError, ValueError, ProviderError):
-        return False
+        return validate_replay_route_bundle(routes)
+    except ProviderProfileDrift:
+        return None
+
+
+def _is_shipped_replay(bundle: ReplayBundle) -> bool:
     verification = bundle.verify()
     return verification.valid and verification.file_sha256 == _SHIPPED_REPLAY_FILE_SHA256
 
@@ -98,6 +92,7 @@ async def capabilities(request: Request) -> DemoCapabilities:
             for r in selected.routes
         )
         replay = selected.execution_mode == "replay"
+        replay_bundle = _verified_replay_bundle(selected) if replay else None
         demo_allowed = (
             "demo" in settings.allowed_run_purposes
             and bool(budgets)
@@ -106,7 +101,7 @@ async def capabilities(request: Request) -> DemoCapabilities:
         )
         reason = (
             "PROVIDER_PROFILE_DRIFT"
-            if not complete
+            if not complete or (replay and replay_bundle is None)
             else "DEPLOYMENT_POLICY_VIOLATION"
             if not demo_allowed
             else "PROVIDER_NOT_CONFIGURED"
@@ -124,7 +119,7 @@ async def capabilities(request: Request) -> DemoCapabilities:
         )
         # ReplayBundle.load verifies the bundle manifest before its recorded
         # run identity can select this one shipped, fixed request.
-        if replay and reason is None and _is_shipped_replay(selected):
+        if replay_bundle is not None and reason is None and _is_shipped_replay(replay_bundle):
             example = ReplayExample(provider_profile_id=profile_id)
     return DemoCapabilities(
         profiles=profiles,

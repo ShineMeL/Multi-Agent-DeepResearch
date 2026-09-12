@@ -6,16 +6,17 @@ import asyncio
 import json
 import time
 from pathlib import Path
+from typing import cast
 
 import httpx
 import pytest
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from starlette.types import ASGIApp
 
 from apps.api.main import create_app
 from apps.api.settings import ServiceSettings
+from apps.ui.api_client import RunAccepted, RunView
 from apps.ui.replay import research_replay_payload
 from deepresearch.workflow.runner import BaselineRuntimeHooks
 from scripts.smoke_replay import SmokeError, main, replay_smoke
@@ -103,7 +104,7 @@ async def test_real_service_replay_proves_terminal_artifacts_and_zero_cost(
     assert all(len(value) == 64 for value in result["artifact_sha256"].values())
 
 
-def test_public_create_defaults_to_shipped_replay_and_rejects_unavailable_strategies(
+async def test_public_create_defaults_to_shipped_replay_and_rejects_unavailable_strategies(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     app = _replay_app(tmp_path, monkeypatch)
@@ -113,19 +114,26 @@ def test_public_create_defaults_to_shipped_replay_and_rejects_unavailable_strate
     defaulted.pop("planner_id")
     defaulted.pop("ranker_id")
 
-    with TestClient(app, client=("127.0.0.1", 1234)) as client:
-        rejected = client.post("/runs", json=explicit)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+        ) as client,
+    ):
+        rejected = await client.post("/runs", json=explicit)
         assert rejected.status_code == 422
-        assert rejected.json()["code"] == "RESEARCH_GRAPH_UNAVAILABLE"
+        raw_rejected_body: object = rejected.json()
+        assert isinstance(raw_rejected_body, dict)
+        rejected_body = cast("dict[str, object]", raw_rejected_body)
+        assert rejected_body.get("code") == "RESEARCH_GRAPH_UNAVAILABLE"
 
-        accepted = client.post("/runs", json=defaulted)
+        accepted = await client.post("/runs", json=defaulted)
         assert accepted.status_code == 202, accepted.text
-        run_id = accepted.json()["run_id"]
-        assert client.portal is not None
-        client.portal.call(app.state.manager.wait, run_id)
-        final = client.get(f"/runs/{run_id}")
+        run_id = RunAccepted.model_validate_json(accepted.content).run_id
+        await app.state.manager.wait(run_id)
+        final = await client.get(f"/runs/{run_id}")
 
-    assert final.json()["status"] == "completed", final.text
+    assert RunView.model_validate_json(final.content).status == "completed", final.text
 
 
 @pytest.mark.parametrize(
@@ -161,7 +169,7 @@ async def test_capability_rejection_is_explicit_and_never_creates_a_run(
 
 
 @pytest.mark.parametrize("binding", ["missing-replay", None], ids=["missing", "ambiguous-legacy"])
-async def test_unsafe_replay_example_binding_never_creates_a_run(binding):
+async def test_unsafe_replay_example_binding_never_creates_a_run(binding: str | None):
     requested: list[str] = []
     replay_profile = {
         "profile_id": "replay-default",
