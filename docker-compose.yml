@@ -1,12 +1,12 @@
 services:
   api:
     build: .
-    command: uv run uvicorn apps.api.main:create_app --factory --host 0.0.0.0 --port 8000 --no-proxy-headers
+    command: python -m uvicorn apps.api.main:create_app --factory --host 0.0.0.0 --port 8000 --no-proxy-headers
     depends_on:
       postgres:
         condition: service_healthy
     ports:
-      - "8000:8000"
+      - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
     environment:
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set to a URI-encoded postgresql+asyncpg URL}
       ARTIFACT_ROOT: /var/lib/deepresearch/artifacts
@@ -42,12 +42,12 @@ services:
 
   ui:
     build: .
-    command: uv run streamlit run apps/ui/app.py --server.address 0.0.0.0 --server.port 8501
+    command: python -m streamlit run apps/ui/app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true --browser.gatherUsageStats false
     depends_on:
       api:
         condition: service_healthy
     ports:
-      - "8501:8501"
+      - "127.0.0.1:${UI_HOST_PORT:-8501}:8501"
     environment:
       DEEPRESEARCH_API_URL: http://api:8000
     healthcheck:

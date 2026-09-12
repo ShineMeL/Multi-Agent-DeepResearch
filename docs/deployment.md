@@ -128,7 +128,7 @@ $encodedPassword = [uri]::EscapeDataString($env:POSTGRES_PASSWORD)
 $env:DATABASE_URL = "postgresql+asyncpg://deepresearch:${encodedPassword}@postgres:5432/deepresearch"
 docker compose config --quiet
 docker build -t multi-agent-deep-research .
-docker compose up --build -d
+docker compose up --build --detach --wait --wait-timeout 180
 docker compose ps
 ```
 
@@ -137,12 +137,34 @@ volume, reuse its database credential: changing `POSTGRES_PASSWORD` does not
 rotate the password in an initialized Postgres database. Do not print expanded
 Compose configuration to shared logs: it contains injected credentials.
 
-The API serves port 8000 and UI port 8501. Compose uses local HTTP with
-`COOKIE_SECURE=false`, publishes ports on the host, and applies the `local` replay policy.
-Restrict host network access for this local configuration. Postgres is reachable
-only inside the Compose network by default. API and UI run as the image's
-unprivileged user; Postgres uses the official image's `postgres` account,
-`init: true`, dropped capabilities and no-new-privileges.
+The API is available at `http://127.0.0.1:8000` and the UI at
+`http://127.0.0.1:8501`. Compose keeps the container listeners on `0.0.0.0` so
+the services remain reachable over the private Compose network, but publishes
+both host ports explicitly on IPv4 loopback. To avoid a local port collision,
+set `API_HOST_PORT` or `UI_HOST_PORT` before `docker compose config` and use the
+selected port in host-side health or smoke commands; for example:
+
+```powershell
+$env:API_HOST_PORT = '18000'
+$env:UI_HOST_PORT = '18501'
+```
+
+Compose uses local HTTP with `COOKIE_SECURE=false`
+and applies the `local` replay policy. It allows only Replay execution.
+Loopback binding limits ordinary remote access; it does not make this
+configuration suitable for public hosting, and Docker Engine releases before
+28.0.0 have a documented local-network reachability caveat for published
+localhost ports. Postgres has no published host port and is reachable only
+inside the Compose network by default.
+
+API and UI startup invokes the Python modules already installed in the locked
+image environment, so container startup performs no dependency resolution. The
+UI is explicitly headless with usage telemetry disabled. Both run as the image's
+unprivileged UID/GID 10001 account; Postgres uses the official image's
+`postgres` account. All three retain `init: true`, dropped capabilities and
+`no-new-privileges`. Uvicorn keeps proxy-header processing disabled; configure
+trusted proxy CIDRs only through the application's policy when building a
+separate TLS-terminating public deployment.
 
 The API service store uses SQLAlchemy/asyncpg. The checkpoint adapter converts
 that URL to a psycopg DSN and opens `AsyncPostgresSaver`, calls `setup()` before

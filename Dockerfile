@@ -38,4 +38,4 @@ RUN uv sync --frozen --no-dev \
 
 USER deepresearch
 
-CMD ["uv", "run", "uvicorn", "apps.api.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--no-proxy-headers"]
+CMD ["python", "-m", "uvicorn", "apps.api.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--no-proxy-headers"]

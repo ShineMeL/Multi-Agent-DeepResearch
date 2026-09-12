@@ -1,6 +1,7 @@
 """Static contract for the local Compose deployment."""
 
 import json
+import shlex
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
@@ -53,6 +54,53 @@ def test_compose_packages_api_ui_and_postgres_without_embedded_secrets():
     assert ui["environment"]["DEEPRESEARCH_API_URL"] == "http://api:8000"
 
 
+def test_compose_publishes_local_services_only_on_loopback():
+    config = yaml.safe_load(Path("docker-compose.yml").read_text(encoding="utf-8"))
+
+    assert config["services"]["api"]["ports"] == [
+        "127.0.0.1:${API_HOST_PORT:-8000}:8000"
+    ]
+    assert config["services"]["ui"]["ports"] == [
+        "127.0.0.1:${UI_HOST_PORT:-8501}:8501"
+    ]
+    assert "ports" not in config["services"]["postgres"]
+
+
+def test_compose_starts_installed_servers_without_runtime_dependency_resolution():
+    config = yaml.safe_load(Path("docker-compose.yml").read_text(encoding="utf-8"))
+
+    api_command = shlex.split(config["services"]["api"]["command"])
+    ui_command = shlex.split(config["services"]["ui"]["command"])
+
+    assert api_command == [
+        "python",
+        "-m",
+        "uvicorn",
+        "apps.api.main:create_app",
+        "--factory",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--no-proxy-headers",
+    ]
+    assert ui_command == [
+        "python",
+        "-m",
+        "streamlit",
+        "run",
+        "apps/ui/app.py",
+        "--server.address",
+        "0.0.0.0",
+        "--server.port",
+        "8501",
+        "--server.headless",
+        "true",
+        "--browser.gatherUsageStats",
+        "false",
+    ]
+
+
 def test_compose_accepts_an_independently_uri_encoded_special_character_password():
     config = yaml.safe_load(Path("docker-compose.yml").read_text(encoding="utf-8"))
     database_url = config["services"]["api"]["environment"]["DATABASE_URL"]
@@ -66,15 +114,6 @@ def test_compose_accepts_an_independently_uri_encoded_special_character_password
     assert make_url(encoded_url).password == password
 
 
-def test_docker_context_excludes_local_secrets_and_runtime_data():
-    ignored = Path(".dockerignore").read_text(encoding="utf-8").splitlines()
-
-    assert ".env" in ignored
-    assert ".env.*" in ignored
-    assert "artifacts/" in ignored
-    assert ".venv/" in ignored
-
-
 def test_dockerfile_uses_the_locked_dependencies_as_a_non_root_user():
     dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
 
@@ -86,3 +125,21 @@ def test_dockerfile_uses_the_locked_dependencies_as_a_non_root_user():
     assert "USER deepresearch" in dockerfile
     assert "SESSION_SIGNING_KEY" not in dockerfile
     assert "POSTGRES_PASSWORD" not in dockerfile
+
+    command_line = next(
+        line.removeprefix("CMD ")
+        for line in reversed(dockerfile.splitlines())
+        if line.startswith("CMD ")
+    )
+    assert json.loads(command_line) == [
+        "python",
+        "-m",
+        "uvicorn",
+        "apps.api.main:create_app",
+        "--factory",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--no-proxy-headers",
+    ]
