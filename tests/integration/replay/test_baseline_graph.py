@@ -653,6 +653,54 @@ async def test_runner_has_frozen_constructor_and_builds_isolated_new_run_context
     assert runtime_context.run_started_monotonic == 10.0
 
 
+@pytest.mark.parametrize(
+    ("finished", "expected_wall"),
+    [
+        (378.3725700669999, 179.99999999999991),
+        (378.37257006699997, 180.0),
+    ],
+)
+async def test_runner_failure_preserves_recovered_wall_at_fractional_deadline(
+    finished: float,
+    expected_wall: float,
+) -> None:
+    clock = MutableMonotonic(205.372570067)
+
+    class FailingGraph(FakeGraph):
+        async def ainvoke(
+            self,
+            value: object,
+            graph_config: object,
+            *,
+            context: object,
+        ) -> dict[str, object]:
+            del value, graph_config
+            runtime_context = cast("BaselineRuntimeContext", context)
+            runtime_context.elapsed_tracker.recover(
+                elapsed_wall_seconds=7.0,
+                elapsed_base_seconds=0.0,
+            )
+            clock.value = finished
+            raise RuntimeError("graph failed before checkpoint publication")
+
+    runner = LangGraphResearchRunner(
+        baseline_graph=cast("Any", FailingGraph()),
+        runtime_hooks=BaselineRuntimeHooks(monotonic=clock),
+    )
+    result = await runner.run(
+        run_id="run-fractional-failure",
+        thread_id="thread-fractional-failure",
+        config=config(),
+        checkpoint=None,
+        emit=MemoryEventSink(),
+        cancellation_token=CancellationToken(),
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "INTERNAL_ERROR"
+    assert result.final_usage.wall_seconds == expected_wall
+
+
 async def test_runner_rejects_invalid_baseline_configuration_before_graph_work() -> None:
     graph = FakeGraph()
     runner = LangGraphResearchRunner(baseline_graph=cast("Any", graph))
@@ -2461,15 +2509,30 @@ async def test_safe_node_prefers_cancellation_when_deadline_is_also_expired(
     assert context.audit.result_artifact_ids == []
 
 
-async def test_provider_gate_uses_recovered_offset_at_exact_effective_deadline() -> None:
+@pytest.mark.parametrize(
+    ("start", "deadline", "now", "recovered_wall", "expired"),
+    [
+        (0.0, 273.0, 253.0, 20.0, True),
+        (250.1, 430.1, 250.1, 180.0, True),
+        (250.25, 430.25, 250.25, 179.99999999999997, False),
+    ],
+)
+async def test_provider_gate_preserves_exact_recovered_deadline_and_positive_time(
+    start: float,
+    deadline: float,
+    now: float,
+    recovered_wall: float,
+    expired: bool,
+) -> None:
     handlers = _bare_handlers()
     context = replace(
         _runtime_context(ticks=iter(())),
-        deadline=273.0,
-        monotonic=MutableMonotonic(253.0),
+        deadline=deadline,
+        run_started_monotonic=start,
+        monotonic=MutableMonotonic(now),
     )
     context.elapsed_tracker.recover(
-        elapsed_wall_seconds=20.0,
+        elapsed_wall_seconds=recovered_wall,
         elapsed_base_seconds=0.0,
     )
     context.audit.begin(graph_node="ParseAndNormalize", node_attempt=1)
@@ -2479,24 +2542,29 @@ async def test_provider_gate_uses_recovered_offset_at_exact_effective_deadline()
     async def invoke() -> str:
         nonlocal provider_calls
         provider_calls += 1
-        return "unexpected"
+        return "provider result"
 
-    with pytest.raises(ProviderError) as caught:
-        await cast("Any", handlers)._invoke_metered(
-            context=context,
-            provider=object(),
-            provider_id="recovered-offset-provider",
-            model_id=None,
-            operation="parse",
-            node="Tool",
-            operation_id="recovered-offset-timeout",
-            invoke=invoke,
-            result_usage=lambda _result: ResourceUsage.zero(cost_known=True),
-            fallback_usage=ResourceUsage.zero(cost_known=True),
-        )
+    operation = cast("Any", handlers)._invoke_metered(
+        context=context,
+        provider=object(),
+        provider_id="recovered-offset-provider",
+        model_id=None,
+        operation="parse",
+        node="Tool",
+        operation_id="recovered-offset-timeout",
+        invoke=invoke,
+        result_usage=lambda _result: ResourceUsage.zero(cost_known=True),
+        fallback_usage=ResourceUsage.zero(cost_known=True),
+    )
+    if expired:
+        with pytest.raises(ProviderError) as caught:
+            await operation
+        assert caught.value.code == "TIMEOUT"
+    else:
+        result, _ = await operation
+        assert result == "provider result"
 
-    assert caught.value.code == "TIMEOUT"
-    assert provider_calls == 0
+    assert provider_calls == (0 if expired else 1)
     assert context.budget_accountant.snapshot() == before
     assert context.audit.provider_calls == []
     assert context.audit.provider_receipt_ids == []
@@ -7284,12 +7352,30 @@ async def test_real_sqlite_filesystem_recovery_reuses_operation_and_event(
     ("second_segment_seconds", "expect_completed"),
     [(20.0, True), (173.0, False)],
 )
+@pytest.mark.parametrize(
+    ("segment_monotonic_start", "resume_monotonic_start"),
+    [
+        (200.25, 250.25),
+        (205.372570067, 250.25),
+        (200.25, 250.1),
+    ],
+)
 async def test_recovered_durable_wall_shortens_every_provider_deadline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     second_segment_seconds: float,
     expect_completed: bool,
+    segment_monotonic_start: float,
+    resume_monotonic_start: float,
 ) -> None:
+    from deepresearch.evidence import similarity as similarity_module
+    from deepresearch.planning import fixed as fixed_planner_module
+
+    # Keep provider boundaries in the synthetic epoch. Only the graph's clock
+    # advances so the planner can publish its result at the wall-time boundary.
+    provider_time = SimpleNamespace(monotonic=lambda: 100.25)
+    monkeypatch.setattr(fixed_planner_module, "time", provider_time)
+    monkeypatch.setattr(similarity_module, "time", provider_time)
     root = (tmp_path / f"wall-{second_segment_seconds}").resolve()
     event_root = (root / "events").resolve()
     checkpoint_path = (root / "checkpoints.sqlite3").resolve()
@@ -7330,7 +7416,7 @@ async def test_recovered_durable_wall_shortens_every_provider_deadline(
     current_config = _recovery_config(handlers_a)
     assert float(current_config.budget.max_wall_time_seconds) == max_wall_seconds
     clock_a = ControlledSegmentClock(
-        monotonic_start=time.monotonic(),
+        monotonic_start=100.25,
         utc_offset_seconds=0.0,
     )
     original_validate = handlers_a.validate_request
@@ -7388,7 +7474,7 @@ async def test_recovered_durable_wall_shortens_every_provider_deadline(
     )
     assert _recovery_config(handlers_b) == current_config
     clock_b = ControlledSegmentClock(
-        monotonic_start=time.monotonic(),
+        monotonic_start=segment_monotonic_start,
         utc_offset_seconds=first_segment_seconds + 50.0,
     )
     planner_model_b = cast(
@@ -7543,7 +7629,7 @@ async def test_recovered_durable_wall_shortens_every_provider_deadline(
         observed_put_bytes_c,
     )
     clock_c = ControlledSegmentClock(
-        monotonic_start=time.monotonic(),
+        monotonic_start=resume_monotonic_start,
         utc_offset_seconds=recovered_active_wall + 100.0,
     )
     planner_model_c = cast(
@@ -7586,6 +7672,9 @@ async def test_recovered_durable_wall_shortens_every_provider_deadline(
 
     assert await sink_c.get_event(run_id=run_id, seq=1) == validate_event_a
     assert await sink_c.get_event(run_id=run_id, seq=2) == plan_event_b
+    if not expect_completed:
+        assert invocations == calls_before_c
+        assert set(observed_deadlines) == {"plan-model"}
     expected_plan_deadline = (
         clock_b.monotonic_start
         + max_wall_seconds
@@ -7633,8 +7722,6 @@ async def test_recovered_durable_wall_shortens_every_provider_deadline(
         assert recovered_active_wall == max_wall_seconds
         assert result.status == "failed"
         assert result.error_code == "TIMEOUT"
-        assert invocations == calls_before_c
-        assert set(observed_deadlines) == {"plan-model"}
         cache_files_after_c = tuple(
             sorted(
                 path.relative_to(root).as_posix()

@@ -1212,7 +1212,30 @@ async def test_cleanup_root_rmdir_failure_keeps_owned_tombstone_and_frees_stagin
     assert not list(tmp_path.glob(".cleanup-root-failure.staging.*"))
     tombstones = list(tmp_path.glob(".cleanup-root-failure.cleanup.*"))
     assert len(tombstones) == 1
-    assert (tombstones[0] / ".replay-writer-owner.json").is_file()
+    proof = writer._repaired_marker_proof
+    assert proof is not None
+    assert not proof.marker_removed
+    assert json.loads(proof.payload) == {
+        "final_name": "cleanup-root-failure",
+        "run_id": "same-run",
+        "schema_version": "replay-bundle-v1",
+    }
+    proof.validate_directory_object(tombstones[0])
+    proof.validate_creation_object()
+    if os.name == "nt":
+        marker = tombstones[0] / ".replay-writer-owner.json"
+        assert marker.is_file()
+        assert proof.marker_path == marker
+        assert proof.windows_handle is not None
+        assert proof.windows_directory_handle is not None
+    else:
+        # POSIX retains an anonymous creation object so a substituted marker
+        # pathname can never become deletion authority during a retry.
+        assert proof.marker_path is None
+        assert proof.posix_file is not None
+        assert not proof.posix_file.closed
+        assert proof.directory_descriptor is not None
+        assert tuple(tombstones[0].iterdir()) == ()
 
     monkeypatch.undo()
     replacement = ReplayBundleWriter.create(final_root, run_id="same-run")
@@ -1220,6 +1243,11 @@ async def test_cleanup_root_rmdir_failure_keeps_owned_tombstone_and_frees_stagin
     await writer.abort()
     await writer.abort()
     assert not tombstones[0].exists()
+    assert proof.marker_removed
+    assert proof.posix_file is None
+    assert proof.directory_descriptor is None
+    assert proof.windows_handle is None
+    assert proof.windows_directory_handle is None
 
 
 async def _leave_owned_tombstone_without_marker(

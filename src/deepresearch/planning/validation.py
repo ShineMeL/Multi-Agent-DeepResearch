@@ -63,11 +63,44 @@ class PlanValidationReport(BaseModel):
     candidate_artifact_id: str | None = None
 
 
+class _JsonDepthLimitError(ValueError):
+    """A candidate exceeded our depth bound, independent of parser limits."""
+
+
 def _ordered(codes: set[PlanValidationCode]) -> tuple[PlanValidationCode, ...]:
     return tuple(code for code in _CODE_ORDER if code in codes)
 
 
+def _check_json_depth(value: str) -> None:
+    # This only bounds nesting; json.loads remains the syntax authority. Scan
+    # the byte-bounded input before parsing or any early snapshot rejection so
+    # parser stack limits and mixed resource failures cannot change the code.
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in value:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+        elif character in "]}":
+            depth -= 1
+        elif character not in " \t\r\n,:":
+            # Root values have depth zero, matching _bounded_json_snapshot.
+            if depth > _MAX_JSON_DEPTH:
+                raise _JsonDepthLimitError("candidate exceeds JSON depth limit")
+            if character == '"':
+                in_string = True
+            elif character in "[{":
+                depth += 1
+
+
 def _strict_json(value: str) -> object:
+    _check_json_depth(value)
+
     def reject_constant(_value: str) -> None:
         raise ValueError("non-finite JSON number")
 
@@ -157,7 +190,9 @@ def _bounded_json_snapshot(value: object) -> tuple[bool, JsonValue | None]:
 
         item = payload
         node_count += 1
-        if node_count > _MAX_JSON_NODES or depth > _MAX_JSON_DEPTH:
+        if depth > _MAX_JSON_DEPTH:
+            raise _JsonDepthLimitError("candidate exceeds JSON depth limit")
+        if node_count > _MAX_JSON_NODES:
             return False, None
 
         if isinstance(item, str):
@@ -656,12 +691,19 @@ class PlanValidator:
             raw = candidate
 
         snapshot: JsonValue | None = None
+        snapshot_error: PlanValidationCode = "INVALID_SCHEMA"
         try:
             structure_is_valid, snapshot = _bounded_json_snapshot(raw)
+        except _JsonDepthLimitError:
+            structure_is_valid = False
+            # Some JSON parsers accept nesting that others reject as a
+            # RecursionError. Serialized inputs must get the same public code.
+            if isinstance(candidate, (str, bytes)):
+                snapshot_error = "MALFORMED_JSON"
         except (LookupError, OverflowError, RecursionError, TypeError, ValueError):
             structure_is_valid = False
         if not structure_is_valid:
-            codes.add("INVALID_SCHEMA")
+            codes.add(snapshot_error)
             return PlanValidationReport(
                 valid=False,
                 error_codes=_ordered(codes),

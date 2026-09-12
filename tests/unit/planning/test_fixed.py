@@ -757,8 +757,12 @@ async def test_boundary_mapping_key_collisions_are_rejected_before_repair_prompt
 
 
 @pytest.mark.asyncio
-async def test_deep_candidate_is_repaired_without_raw_parser_failure(tmp_path: Path) -> None:
-    deep_candidate = "[" * 2_000 + "]" * 2_000
+@pytest.mark.parametrize("depth", [66, 2_000], ids=("structural-limit", "parser-limit"))
+async def test_deep_candidate_is_repaired_without_raw_parser_failure(
+    tmp_path: Path,
+    depth: int,
+) -> None:
+    deep_candidate = "[" * depth + "]" * depth
     model = FakeModel([deep_candidate, plan_json()])
     planner = FixedPlanner(
         model=model,

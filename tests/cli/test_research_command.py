@@ -8,6 +8,7 @@ import re
 import time
 from collections import Counter
 from datetime import UTC, datetime, timedelta
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, cast
 
@@ -24,7 +25,7 @@ from deepresearch.providers.replay_schema import (
     ReplayBundle,
 )
 from deepresearch.runtime.manifest import RunManifest
-from deepresearch.workflow import BaselineRuntimeHooks
+from deepresearch.workflow import BaselineRuntimeHooks, paired_runtime_hooks
 
 runner = CliRunner()
 FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures" / "replay" / "provider_contract"
@@ -34,6 +35,7 @@ app = cli.app
 _build_provider_profile = getattr(cli, "_build_provider_profile")  # noqa: B009
 _build_request_config = getattr(cli, "_build_request_config")  # noqa: B009
 _repository_metadata = getattr(cli, "_repository_metadata")  # noqa: B009
+_runtime_hooks = getattr(cli, "_runtime_hooks")  # noqa: B009
 _safe_absolute_endpoint = getattr(cli, "_safe_absolute_endpoint")  # noqa: B009
 
 
@@ -103,6 +105,31 @@ def _deterministic_runtime_hooks() -> BaselineRuntimeHooks:
         return f"{prefix}-fixture-{state['ids']}"
 
     return BaselineRuntimeHooks(monotonic=monotonic, utc_now=utc_now, new_id=new_id)
+
+
+@pytest.mark.parametrize("factory", ["cli", "shared"])
+@pytest.mark.parametrize("tick_seconds", [0.0, 0.0000001])
+def test_runtime_hooks_order_quantized_timestamps_without_advancing_monotonic(
+    monkeypatch: pytest.MonkeyPatch,
+    factory: str,
+    tick_seconds: float,
+) -> None:
+    monotonic_value = 100.0
+    monkeypatch.setattr(time, "monotonic", lambda: monotonic_value)
+    hooks: BaselineRuntimeHooks = (
+        _runtime_hooks() if factory == "cli" else paired_runtime_hooks()
+    )
+    timestamps = [hooks.utc_now()]
+    for tick in range(1, 4):
+        monotonic_value = 100.0 + tick * tick_seconds
+        assert hooks.monotonic() == monotonic_value
+        timestamps.append(hooks.utc_now())
+
+    assert all(
+        later - earlier >= timedelta(microseconds=1)
+        for earlier, later in pairwise(timestamps)
+    )
+    assert hooks.monotonic() == monotonic_value
 
 
 def test_version_output_is_byte_compatible() -> None:

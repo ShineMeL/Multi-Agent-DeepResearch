@@ -28,7 +28,7 @@ from .research_graph import (
     route_after_verify,
 )
 from .research_handlers import ResearchNodeHandlers
-from .runner import BaselineRuntimeHooks, LangGraphResearchRunner
+from .runner import BaselineRuntimeHooks, LangGraphResearchRunner, paired_runtime_hooks
 from .state import (
     BaselineBlockedNeed,
     BaselineState,
@@ -70,6 +70,7 @@ __all__ = [
     "build_baseline_graph",
     "build_research_graph",
     "decide_baseline_stop",
+    "paired_runtime_hooks",
     "rank_baseline_coverage",
     "result_status_for",
     "route_after_decide",

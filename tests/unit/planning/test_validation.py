@@ -294,11 +294,13 @@ def test_validated_plan_keeps_date_values_and_frozen_models() -> None:
 @pytest.mark.parametrize(
     "candidate",
     [
+        "[" * 66 + "]" * 66,
+        ("[" * 66 + "]" * 66).encode(),
         "[" * 2_000 + "]" * 2_000,
         ("[" * 2_000 + "]" * 2_000).encode(),
         '"' + "x" * 1_100_000 + '"',
     ],
-    ids=("deep-text", "deep-bytes", "oversize-text"),
+    ids=("bounded-text", "bounded-bytes", "deep-text", "deep-bytes", "oversize-text"),
 )
 def test_plan_validator_bounds_untrusted_json_without_leaking_runtime_errors(
     candidate: str | bytes,
@@ -307,6 +309,64 @@ def test_plan_validator_bounds_untrusted_json_without_leaking_runtime_errors(
 
     assert report.valid is False
     assert report.error_codes == ("MALFORMED_JSON",)
+
+
+@pytest.mark.parametrize("as_bytes", [False, True], ids=("text", "bytes"))
+@pytest.mark.parametrize("depth", [64, 65], ids=("at-depth-limit", "past-depth-limit"))
+def test_json_depth_classification_does_not_depend_on_parser_recursion_limit(
+    as_bytes: bool,
+    depth: int,
+) -> None:
+    raw = "[" * depth + "null" + "]" * depth
+    candidate: str | bytes = raw.encode("utf-8") if as_bytes else raw
+    # These documents parse on either platform; our own structural bound must
+    # classify excessive depth, not the interpreter's C/Python stack limit.
+    assert isinstance(json.loads(candidate), list)
+
+    report = PlanValidator().validate_candidate(
+        candidate,
+        request=None,
+        budget=None,
+        candidate_artifact_id="sha256:" + "c" * 64,
+    )
+
+    assert report.valid is False
+    assert report.candidate is None
+    expected = "INVALID_SCHEMA" if depth == 64 else "MALFORMED_JSON"
+    assert report.error_codes == (expected,)
+    assert report.candidate_artifact_id == "sha256:" + "c" * 64
+
+
+@pytest.mark.parametrize("as_bytes", [False, True], ids=("text", "bytes"))
+@pytest.mark.parametrize(
+    "prefix",
+    ["[" + ",".join(["null"] * 20_001) + "]", json.dumps("x" * 250_001), "1e10000"],
+    ids=("node-limit", "string-limit", "nonfinite-number"),
+)
+def test_serialized_depth_limit_is_checked_before_other_structural_failures(
+    as_bytes: bool,
+    prefix: str,
+) -> None:
+    raw = "[" + prefix + "," + "[" * 200 + "]" * 200 + "]"
+    candidate: str | bytes = raw.encode("utf-8") if as_bytes else raw
+    assert isinstance(json.loads(candidate), list)
+
+    report = PlanValidator().validate_candidate(candidate, request=None, budget=None)
+
+    assert report.valid is False
+    assert report.error_codes == ("MALFORMED_JSON",)
+
+
+def test_serialized_depth_check_ignores_brackets_and_escaped_quotes_in_strings() -> None:
+    candidate = valid_candidate()
+    candidate["created_by_model"] = 'model\\"' + "[{" * 100 + "}]" * 100
+    raw = json.dumps(candidate)
+
+    report = PlanValidator().validate_candidate(raw, request=None, budget=None)
+
+    assert report.valid is True
+    assert report.candidate is not None
+    assert report.candidate.created_by_model == candidate["created_by_model"]
 
 
 def test_plan_validator_bounds_preparsed_mapping_depth() -> None:

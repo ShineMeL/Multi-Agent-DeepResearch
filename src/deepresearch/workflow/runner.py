@@ -76,24 +76,26 @@ def paired_runtime_hooks() -> BaselineRuntimeHooks:
     origin_monotonic = time.monotonic()
     origin_utc = datetime.now(UTC)
     utc_calls = 0
-    last_elapsed = -1.0
+    last_utc: datetime | None = None
 
     def monotonic() -> float:
         return time.monotonic()
 
     def utc_now() -> datetime:
-        nonlocal last_elapsed, utc_calls
+        nonlocal last_utc, utc_calls
         utc_calls += 1
         elapsed = max(0.0, time.monotonic() - origin_monotonic)
         # The elapsed state is sampled immediately before most wall samples.
         # Keep the envelope a small amount ahead of that measurement so
         # sub-millisecond clock ordering cannot reject a valid manifest.
         slack = 0.001 if utc_calls > 1 else 0.0
-        elapsed = elapsed + slack
-        if elapsed <= last_elapsed:
-            elapsed = last_elapsed + 0.000001
-        last_elapsed = elapsed
-        return origin_utc + timedelta(seconds=elapsed)
+        timestamp = origin_utc + timedelta(seconds=elapsed + slack)
+        # Distinct float samples can round to the same datetime microsecond.
+        # Keep cached call starts strictly inside their later node finish.
+        if last_utc is not None and timestamp <= last_utc:
+            timestamp = last_utc + timedelta(microseconds=1)
+        last_utc = timestamp
+        return timestamp
 
     return BaselineRuntimeHooks(monotonic=monotonic, utc_now=utc_now)
 
@@ -515,22 +517,20 @@ class LangGraphResearchRunner:
             ):
                 raise cancellation_primary
             code = _exception_code(error)
+            finished = self._runtime_hooks.monotonic()
             return _failed_result(
                 run_id=run_id,
                 thread_id=thread_id,
                 usage=_usage_from_accountant(
                     accountant,
-                    run_wall_seconds=_cumulative_wall(
-                        base=(
-                            elapsed_before_resume
-                            + (
-                                context.elapsed_tracker.recovered_offset_seconds
-                                if context is not None
-                                else 0.0
-                            )
-                        ),
-                        start=start,
-                        now=self._runtime_hooks.monotonic(),
+                    run_wall_seconds=(
+                        context.elapsed_wall_seconds(now=finished)
+                        if context is not None
+                        else _cumulative_wall(
+                            base=elapsed_before_resume,
+                            start=start,
+                            now=finished,
+                        )
                     ),
                 ),
                 error_code=code,

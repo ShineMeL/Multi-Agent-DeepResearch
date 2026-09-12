@@ -9,11 +9,9 @@ import stat
 import subprocess
 import sys
 import tempfile
-import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Self, cast
@@ -68,6 +66,7 @@ from deepresearch.workflow import (
     DurableRunEventSink,
     LangGraphResearchRunner,
     build_baseline_graph,
+    paired_runtime_hooks,
 )
 
 if TYPE_CHECKING:
@@ -553,25 +552,7 @@ def _runtime_root(checkpoint_db: Path) -> Path:
 
 def _runtime_hooks() -> BaselineRuntimeHooks:
     """Pair wall timestamps to one monotonic source for manifest envelopes."""
-    origin_monotonic = time.monotonic()
-    origin_utc = datetime.now(UTC)
-    utc_calls = 0
-
-    def monotonic() -> float:
-        return time.monotonic()
-
-    def utc_now() -> datetime:
-        nonlocal utc_calls
-        utc_calls += 1
-        elapsed = max(0.0, time.monotonic() - origin_monotonic)
-        # A timestamp is sampled after the monotonic measurement that updates
-        # elapsed state.  Keep the wall envelope just ahead of that sample so
-        # sub-millisecond clock ordering cannot make a valid run fail strict
-        # manifest reconciliation.
-        slack = 0.001 if utc_calls > 1 else 0.0
-        return origin_utc + timedelta(seconds=elapsed + slack)
-
-    return BaselineRuntimeHooks(monotonic=monotonic, utc_now=utc_now)
+    return paired_runtime_hooks()
 
 
 def _new_run_id() -> str:

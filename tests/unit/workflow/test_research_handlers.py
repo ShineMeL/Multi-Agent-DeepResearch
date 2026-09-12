@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from types import SimpleNamespace
+from dataclasses import replace
 from typing import Any, cast
 
 import pytest
@@ -11,7 +11,7 @@ from deepresearch.domain import Claim, EvidenceSpan, HtmlLocator
 from deepresearch.evidence.claims import EvidenceJudge
 from deepresearch.runtime import CancellationToken
 from deepresearch.storage import ArtifactIntegrityError, LocalArtifactStore
-from deepresearch.workflow.baseline_graph import BaselineNodeHandlers
+from deepresearch.workflow.baseline_graph import BaselineNodeHandlers, BaselineRuntimeContext
 from deepresearch.workflow.research_handlers import (
     _CLAIM_GRAPH_MEDIA_TYPE,
     ResearchNodeHandlers,
@@ -19,6 +19,7 @@ from deepresearch.workflow.research_handlers import (
     _remove_unsupported_claims,
 )
 from deepresearch.workflow.state import ResearchState
+from tests.integration.replay.test_baseline_graph import _runtime_context
 from tests.integration.replay.test_research_graph import _state
 
 
@@ -49,11 +50,10 @@ def _handlers(tmp_path, evidence: EvidenceSpan) -> ResearchNodeHandlers:
     return ResearchNodeHandlers(cast("BaselineNodeHandlers", baseline))
 
 
-def _context() -> SimpleNamespace:
-    return SimpleNamespace(
+def _context() -> BaselineRuntimeContext:
+    return replace(
+        _runtime_context(ticks=iter((0.0,)), run_id="run-1", thread_id="thread-1"),
         deadline=100.0,
-        cancellation_token=CancellationToken(),
-        elapsed_tracker=SimpleNamespace(recovered_offset_seconds=0.0),
     )
 
 

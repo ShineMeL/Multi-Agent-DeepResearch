@@ -236,6 +236,21 @@ class BaselineRuntimeContext:
     audit: _AuditBuffer = field(default_factory=_AuditBuffer)
     elapsed_tracker: _ElapsedTracker = field(default_factory=_ElapsedTracker)
 
+    def elapsed_wall_seconds(self, *, now: float) -> float:
+        base = self.elapsed_base_seconds + self.elapsed_tracker.recovered_offset_seconds
+        delta = now - self.run_started_monotonic
+        if not math.isfinite(delta) or delta < 0.0:
+            delta = 0.0
+        elapsed = base + delta
+        wall_limit = float(self.config.budget.max_wall_time_seconds)
+        remaining = max(0.0, wall_limit - base)
+        wall_deadline = self.run_started_monotonic + remaining
+        if math.isfinite(now) and now >= wall_deadline:
+            # Subtracting fractional clock origins can put elapsed just below the
+            # limit even though the absolute deadline has already been reached.
+            elapsed = max(elapsed, wall_limit)
+        return elapsed if math.isfinite(elapsed) else base
+
 
 def _effective_deadline(context: BaselineRuntimeContext) -> float:
     effective = context.deadline - context.elapsed_tracker.recovered_offset_seconds
@@ -247,6 +262,13 @@ def _effective_deadline(context: BaselineRuntimeContext) -> float:
             public_message="workflow deadline expired",
             retryable=False,
         )
+    if (
+        context.elapsed_base_seconds + context.elapsed_tracker.recovered_offset_seconds
+        >= context.config.budget.max_wall_time_seconds
+    ):
+        # Adding the budget to a fractional origin and subtracting it again
+        # must not grant a new interval to an already exhausted resumed run.
+        effective = min(effective, context.run_started_monotonic)
     return effective
 
 
@@ -5399,9 +5421,7 @@ async def _publish_missing_event_failure_transition(
         raise ArtifactIntegrityError("node audit clock moved backwards")
     failure_elapsed = max(
         cast("float", update["elapsed_wall_seconds"]),
-        context.elapsed_base_seconds
-        + context.elapsed_tracker.recovered_offset_seconds
-        + max(0.0, failure_monotonic - context.run_started_monotonic),
+        context.elapsed_wall_seconds(now=failure_monotonic),
     )
     terminal_receipt_id = _put_audit_receipt(
         composition.artifact_store,
@@ -5593,9 +5613,7 @@ def _safe_node(
             if node == "PersistResults"
             else max(
                 restored["elapsed_wall_seconds"],
-                context.elapsed_base_seconds
-                + context.elapsed_tracker.recovered_offset_seconds
-                + max(0.0, context.monotonic() - context.run_started_monotonic),
+                context.elapsed_wall_seconds(now=context.monotonic()),
             )
         )
         update["elapsed_wall_seconds"] = elapsed_wall_seconds
@@ -5836,9 +5854,7 @@ def _safe_node(
             failure_finished_at = context.utc_now()
             failure_elapsed = max(
                 successful_state["elapsed_wall_seconds"],
-                context.elapsed_base_seconds
-                + context.elapsed_tracker.recovered_offset_seconds
-                + max(0.0, context.monotonic() - context.run_started_monotonic),
+                context.elapsed_wall_seconds(now=context.monotonic()),
             )
             terminal_receipt_id = _put_audit_receipt(
                 audit_composition.artifact_store,
