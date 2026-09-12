@@ -156,6 +156,8 @@ configuration suitable for public hosting, and Docker Engine releases before
 28.0.0 have a documented local-network reachability caveat for published
 localhost ports. Postgres has no published host port and is reachable only
 inside the Compose network by default.
+See Docker's [port-publishing guidance](https://docs.docker.com/engine/network/port-publishing/)
+for the host-binding and pre-28.0.0 caveats.
 
 API and UI startup invokes the Python modules already installed in the locked
 image environment, so container startup performs no dependency resolution. The
@@ -187,7 +189,25 @@ external database is explicitly configured. Static Compose validation is not a
 Postgres restart/recovery test. On the current Windows implementation host,
 Docker was unavailable, so no Docker image build, container startup, or real
 Postgres recovery was verified locally. CI includes image build/config checks;
-operators still need to validate their actual database and volume deployment.
+it is also configured to start the full Compose stack, exercise the replay HTTP
+acceptance below, and clean up only its uniquely named disposable stack and
+volumes. A separate disposable PostgreSQL service activates the store contract
+tests. These are verification gates, not a claim that a particular CI run has
+passed; operators still need to validate their actual database and volumes.
+
+After the services are ready, validate the complete offline demonstration:
+
+```powershell
+uv run python -m scripts.smoke_replay --api-url http://127.0.0.1:8000 --ui-url http://127.0.0.1:8501 --timeout 90
+```
+
+The command submits only the advertised fixed Replay example, retains its
+owner cookie, checks durable completion and zero cost, and verifies the report,
+evidence and manifest downloads against their SHA-256 identifiers. It does not
+fall back to Live or call paid providers. Failure returns a nonzero exit status
+and a static error code without raw response bodies. A timed-out accepted run
+receives a bounded cancellation attempt; run records and artifacts are retained.
+Omit `--ui-url` for an API-only check and use your chosen host ports if overridden.
 
 ## Provider catalogs and requests
 
@@ -318,7 +338,7 @@ shapes, but real Postgres interruption/restart needs environment verification.
 ## Verification and known platform limits
 
 The deployment type gate covers `src apps benchmarks experiments` in strict
-mode, plus the five critical service regression modules listed in CI. This
+mode, plus the replay acceptance script and critical regression modules listed in CI. This
 follows the plan's production/application completion checklist and retains
 strict research-tooling coverage. Whole-repository test typing is still an
 opt-in diagnostic: older unannotated fixtures generate thousands of errors;
@@ -328,7 +348,7 @@ no blanket ignores or production diagnostic exclusions were added.
 uv run pytest -q tests/unit tests/contracts tests/integration/replay tests/integration/api tests/integration/deployment -m "not online"
 uv run ruff check .
 uv run pyright src apps benchmarks experiments
-uv run pyright tests/integration/api/test_accounting_recovery.py tests/unit/runtime/test_build_provenance.py tests/integration/deployment/test_proxy_identity.py tests/integration/replay/test_full_service.py tests/integration/deployment/test_smoke.py
+uv run pyright scripts/smoke_replay.py tests/integration/api/test_accounting_recovery.py tests/unit/runtime/test_build_provenance.py tests/integration/deployment/test_proxy_identity.py tests/integration/replay/test_full_service.py tests/integration/deployment/test_smoke.py tests/integration/deployment/test_replay_smoke.py
 docker compose config --quiet
 docker build -t multi-agent-deep-research .
 ```
@@ -346,10 +366,10 @@ parser router through the shipped registry, and asserts HTTP 202, durable
 completion, the recorded parent identity, artifacts, and event replay. Neither
 case claims that arbitrary questions can use that bundle. Existing contract tests
 cover health failure, policy, SSRF, redaction and unavailable graph/resume paths.
-The e2e uses Core's existing deterministic clock fixture. With independent real
-UTC and monotonic clocks, Core can reject a manifest with `active wall time
-exceeds the run envelope`, producing `PERSIST_RESULTS_FAILED`; this pre-existing
-Core precision issue remains outside the service changes.
+The ASGI e2e uses Core's deterministic clock fixture. The production service
+factory now pairs wall timestamps with a monotonic source to avoid the former
+independent-clock envelope mismatch. The HTTP acceptance command exercises
+those production clocks and does not inject test time.
 
 Windows checkouts can rewrite hash-addressed fixture bytes to CRLF. A
 `REPLAY_CORRUPT`/hash mismatch in a frozen fixture must be investigated against
