@@ -1,16 +1,27 @@
 """Server-selected demo modes. This is configuration discovery, not an online probe."""
 
 import os
+from pathlib import Path
 from typing import Literal
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
-from deepresearch.runtime.runner_factory import FileProviderRouteCatalog
+from deepresearch.providers import ProviderError
+from deepresearch.providers.replay_schema import ReplayBundle
+from deepresearch.runtime.runner_factory import FileProviderRouteCatalog, FrozenProviderRoutes
 
 from .settings import ServiceSettings
 
 router = APIRouter()
+
+_SHIPPED_REPLAY_FILE_SHA256 = {
+    "documents.jsonl": "25d7a516d29e1b5144c2c48e06a9e71f2b57120be2f019cfc276778c6c67ecd9",
+    "embeddings.jsonl": "88dff3a9eeef98d21cd86c0576417ef58aed9c693047418a71305205551875c7",
+    "model_responses.jsonl": "6e07f242ba0aa8f1f76ca8fc28d3597a2ded53a21fdc140a6b67ac8a089c8d2e",
+    "search.jsonl": "84809bdb8d17b79c85a08eb895503af97e3b531240487f6cbf3706b0e6b095f0",
+    "snapshot.json": "c3e40e217d7c6eaade4134388ca85c74554a898708b0da3ee9ebb5adbd9abbd6",
+}
 
 
 class DemoProfile(BaseModel):
@@ -24,6 +35,7 @@ class DemoProfile(BaseModel):
 
 
 class ReplayExample(BaseModel):
+    provider_profile_id: str | None = None
     question: str = "Compare planner strategies"
     report_language: str = "en"
     source_languages: tuple[str, ...] = ("en",)
@@ -36,6 +48,27 @@ class DemoCapabilities(BaseModel):
     replay_example: ReplayExample | None
     budget_presets: tuple[str, ...]
     unpriced_live: bool
+
+
+def _is_shipped_replay(routes: FrozenProviderRoutes) -> bool:
+    bundle_paths = {
+        path
+        for route in routes.routes
+        if route.operation != "parse"
+        for path in (route.parameters.get("bundle_path"),)
+        if isinstance(path, str) and path
+    }
+    if len(bundle_paths) != 1 or any(
+        route.operation != "parse" and "bundle_path" not in route.parameters
+        for route in routes.routes
+    ):
+        return False
+    try:
+        bundle = ReplayBundle.load(Path(next(iter(bundle_paths))))
+    except (OSError, TypeError, ValueError, ProviderError):
+        return False
+    verification = bundle.verify()
+    return verification.valid and verification.file_sha256 == _SHIPPED_REPLAY_FILE_SHA256
 
 
 @router.get("/capabilities", response_model=DemoCapabilities)
@@ -89,17 +122,10 @@ async def capabilities(request: Request) -> DemoCapabilities:
                 workflow_id="research-v1" if replay else "baseline-v1",
             )
         )
-        # Only advertise the shipped example, not a guessed question for a
-        # custom recording. Execution still verifies the bundle's byte hashes.
-        if (
-            replay
-            and reason is None
-            and any(
-                r.operation == "model" and r.model_id == "baseline-model-v1"
-                for r in selected.routes
-            )
-        ):
-            example = ReplayExample()
+        # ReplayBundle.load verifies the bundle manifest before its recorded
+        # run identity can select this one shipped, fixed request.
+        if replay and reason is None and _is_shipped_replay(selected):
+            example = ReplayExample(provider_profile_id=profile_id)
     return DemoCapabilities(
         profiles=profiles,
         replay_example=example,

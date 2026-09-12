@@ -372,12 +372,16 @@ def test_app_submits_replay_shows_downloads_metrics_and_preserves_session():
     def respond(request):
         seen.append(request.url.path)
         if request.url.path == "/capabilities":
-            return httpx.Response(200, json=capabilities(live_available=False))
+            data = capabilities(live_available=False)
+            builtin = data["profiles"][0]
+            data["profiles"].insert(0, {**builtin, "profile_id": "custom-replay"})
+            return httpx.Response(200, json=data)
         if request.url.path == "/runs":
             keys.append(request.headers["Idempotency-Key"])
             body = json.loads(request.content)
             assert body["request"]["execution_mode"] == "replay"
             assert body["request"]["question"] == "Compare planner strategies"
+            assert body["request"]["provider_profile_id"] == "replay-default"
             return httpx.Response(
                 202,
                 json={
@@ -432,6 +436,31 @@ def test_app_submits_replay_shows_downloads_metrics_and_preserves_session():
         for _ in range(3):
             app.run()
         assert seen.count("/runs/r1") == status_reads
+
+
+@pytest.mark.parametrize("binding", ["missing-replay", None], ids=["missing", "ambiguous-legacy"])
+def test_app_never_submits_an_unresolved_replay_example(binding):
+    requested = []
+    data = capabilities(live_available=False)
+    if binding is None:
+        data["replay_example"].pop("provider_profile_id")
+        data["profiles"].insert(0, {**data["profiles"][0], "profile_id": "custom-replay"})
+    else:
+        data["replay_example"]["provider_profile_id"] = binding
+
+    def respond(request):
+        requested.append(request.url.path)
+        assert request.url.path == "/capabilities"
+        return httpx.Response(200, json=data)
+
+    with ResearchApiClient("http://api", transport=httpx.MockTransport(respond)) as client:
+        app = AppTest.from_file(str(Path("apps/ui/app.py").resolve()), default_timeout=5)
+        app.session_state["showcase"] = ShowcaseSession(client)
+        app.run()
+
+    assert not app.exception
+    assert any(button.disabled for button in app.button)
+    assert requested == ["/capabilities"]
 
 
 def test_submit_retry_keeps_idempotency_key_and_payload():

@@ -200,11 +200,12 @@ def test_config_uses_server_budget_and_strategy_versions(rig: Rig) -> None:
     )
     assert (research.workflow_id, research.planner_id, research.ranker_id) == (
         "research-v1",
-        "P2",
-        "R2",
+        "P1",
+        "R1",
     )
-    assert research.prompt_versions["planner"] == "adaptive-planner-v1"
-    assert research.prompt_versions["ranker"] == "r2-utility-v1"
+    assert research.prompt_versions["planner"] == "fixed-planner-v1"
+    assert research.prompt_versions["planner_queries"] == "fixed-planner-v1-queries"
+    assert "ranker" not in research.prompt_versions
 
 
 def test_idempotency_is_scoped_and_changed_config_conflicts(rig: Rig) -> None:

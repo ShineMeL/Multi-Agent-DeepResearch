@@ -1,3 +1,6 @@
+import hashlib
+import json
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -7,20 +10,22 @@ from apps.api.main import create_app
 from apps.api.schemas import CreateRunRequest
 from apps.api.settings import ServiceSettings
 from apps.ui.replay import research_replay_payload
+from deepresearch.providers.replay_schema import ReplayBundle
 
 
 def settings(tmp_path, **changes):
-    return ServiceSettings(
-        database_url=f"sqlite+aiosqlite:///{tmp_path / 'runs.sqlite'}",
-        artifact_root=tmp_path,
-        checkpoint_sqlite_path=tmp_path / "checkpoints.sqlite",
-        session_signing_key="demo-test-signing-value-at-least-32-bytes",
-        langgraph_strict_msgpack=True,
-        deployment_access_profile="local",
-        provider_profile_catalog_path=Path("deploy/replay/profiles.json"),
-        pricing_catalog_path=Path("deploy/replay/pricing.json"),
-        **changes,
-    )
+    values = {
+        "database_url": f"sqlite+aiosqlite:///{tmp_path / 'runs.sqlite'}",
+        "artifact_root": tmp_path,
+        "checkpoint_sqlite_path": tmp_path / "checkpoints.sqlite",
+        "session_signing_key": "demo-test-signing-value-at-least-32-bytes",
+        "langgraph_strict_msgpack": True,
+        "deployment_access_profile": "local",
+        "provider_profile_catalog_path": Path("deploy/replay/profiles.json"),
+        "pricing_catalog_path": Path("deploy/replay/pricing.json"),
+    }
+    values.update(changes)
+    return ServiceSettings(**values)
 
 
 def test_capabilities_provide_only_server_selected_modes_and_fixed_replay_example(tmp_path):
@@ -40,10 +45,75 @@ def test_capabilities_provide_only_server_selected_modes_and_fixed_replay_exampl
             }
         ]
         assert data["replay_example"]["question"] == "Compare planner strategies"
+        assert data["replay_example"]["provider_profile_id"] == "replay-default"
         assert data["replay_example"]["budget_preset"] == "medium"
         assert data["replay_example"]["report_language"] == "en"
         assert "bundle_path" not in response.text
         assert "signing-value" not in response.text
+
+
+def _custom_replay_bundle(tmp_path: Path) -> Path:
+    source = Path("tests/fixtures/replay/baseline")
+    bundle = tmp_path / "custom-recording"
+    bundle.mkdir()
+    for item in source.iterdir():
+        if item.is_file():
+            bundle.joinpath(item.name).write_bytes(item.read_bytes())
+    snapshot = json.loads(bundle.joinpath("snapshot.json").read_text(encoding="utf-8"))
+    snapshot["providers"]["embed"]["snapshot_sha256"] = "a" * 64
+    snapshot_bytes = json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode()
+    bundle.joinpath("snapshot.json").write_bytes(snapshot_bytes)
+    manifest = json.loads(bundle.joinpath("manifest.sha256").read_text(encoding="utf-8"))
+    manifest["file_sha256"]["snapshot.json"] = hashlib.sha256(snapshot_bytes).hexdigest()
+    bundle.joinpath("manifest.sha256").write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
+    assert ReplayBundle.load(bundle).verify().valid
+    return bundle
+
+
+def _catalog_with_custom_replay_first(tmp_path: Path) -> Path:
+    payload = json.loads(Path("deploy/replay/profiles.json").read_text(encoding="utf-8"))
+    builtin = payload["profiles"]["replay-default"]
+    custom = deepcopy(builtin)
+    custom_bundle = _custom_replay_bundle(tmp_path)
+    for route in custom["routes"]:
+        if "bundle_path" in route["parameters"]:
+            route["parameters"]["bundle_path"] = str(custom_bundle)
+    payload["profiles"] = {"custom-replay": custom, "replay-default": builtin}
+    path = tmp_path / "profiles.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def test_capabilities_bind_the_builtin_example_when_a_custom_replay_profile_is_first(tmp_path):
+    current = settings(
+        tmp_path,
+        provider_profile_catalog_path=_catalog_with_custom_replay_first(tmp_path),
+        allowed_provider_profile_ids=("custom-replay", "replay-default"),
+    )
+
+    with TestClient(create_app(current), client=("127.0.0.1", 1234)) as client:
+        data = client.get("/capabilities").json()
+
+    assert [profile["profile_id"] for profile in data["profiles"]] == [
+        "custom-replay",
+        "replay-default",
+    ]
+    assert data["replay_example"]["provider_profile_id"] == "replay-default"
+
+
+def test_capabilities_do_not_infer_the_builtin_example_from_a_custom_model_id(tmp_path):
+    current = settings(
+        tmp_path,
+        provider_profile_catalog_path=_catalog_with_custom_replay_first(tmp_path),
+        allowed_provider_profile_ids=("custom-replay",),
+    )
+
+    with TestClient(create_app(current), client=("127.0.0.1", 1234)) as client:
+        data = client.get("/capabilities").json()
+
+    assert data["replay_example"] is None
 
 
 def test_local_unpriced_live_policy_keeps_replay_budget_identity(tmp_path):

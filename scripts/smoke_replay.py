@@ -251,18 +251,7 @@ async def _accept_replay(
 
     capabilities = _model(DemoCapabilities, await _json_request(client, "GET", "/capabilities"))
     example = capabilities.replay_example
-    profile = next(
-        (
-            item
-            for item in capabilities.profiles
-            if item.execution_mode == "replay"
-            and item.available
-            and item.workflow_id == "research-v1"
-            and item.planner_id == "P1"
-            and item.ranker_id == "R1"
-        ),
-        None,
-    )
+    profile = capabilities.replay_profile()
     if (
         example is None
         or profile is None

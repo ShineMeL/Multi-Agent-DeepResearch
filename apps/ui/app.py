@@ -368,8 +368,16 @@ def main() -> None:
     if capabilities is not None:
         mode_label = st.radio("运行模式", ("离线示例", "在线 API"), horizontal=True)
         execution_mode: Literal["replay", "live"] = "replay" if mode_label == "离线示例" else "live"
-        profile = _profile_for(capabilities, execution_mode)
         example = capabilities.replay_example
+        profile = (
+            (
+                capabilities.replay_profile()
+                if example is not None
+                else _profile_for(capabilities, "replay")
+            )
+            if execution_mode == "replay"
+            else _profile_for(capabilities, execution_mode)
+        )
         available = profile is not None and profile.available and bool(capabilities.budget_presets)
         if execution_mode == "replay":
             available = (

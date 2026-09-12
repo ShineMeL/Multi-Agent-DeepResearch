@@ -10,11 +10,13 @@ from pathlib import Path
 import httpx
 import pytest
 from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from starlette.types import ASGIApp
 
 from apps.api.main import create_app
 from apps.api.settings import ServiceSettings
+from apps.ui.replay import research_replay_payload
 from deepresearch.workflow.runner import BaselineRuntimeHooks
 from scripts.smoke_replay import SmokeError, main, replay_smoke
 from tests.integration.replay.test_baseline_graph import ControlledSegmentClock
@@ -101,6 +103,31 @@ async def test_real_service_replay_proves_terminal_artifacts_and_zero_cost(
     assert all(len(value) == 64 for value in result["artifact_sha256"].values())
 
 
+def test_public_create_defaults_to_shipped_replay_and_rejects_unavailable_strategies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    app = _replay_app(tmp_path, monkeypatch)
+    explicit = research_replay_payload("Compare planner strategies")
+    explicit.update(planner_id="P2", ranker_id="R2")
+    defaulted = research_replay_payload("Compare planner strategies")
+    defaulted.pop("planner_id")
+    defaulted.pop("ranker_id")
+
+    with TestClient(app, client=("127.0.0.1", 1234)) as client:
+        rejected = client.post("/runs", json=explicit)
+        assert rejected.status_code == 422
+        assert rejected.json()["code"] == "RESEARCH_GRAPH_UNAVAILABLE"
+
+        accepted = client.post("/runs", json=defaulted)
+        assert accepted.status_code == 202, accepted.text
+        run_id = accepted.json()["run_id"]
+        assert client.portal is not None
+        client.portal.call(app.state.manager.wait, run_id)
+        final = client.get(f"/runs/{run_id}")
+
+    assert final.json()["status"] == "completed", final.text
+
+
 @pytest.mark.parametrize(
     ("capabilities", "code"),
     [
@@ -130,6 +157,56 @@ async def test_capability_rejection_is_explicit_and_never_creates_a_run(
         )
 
     assert caught.value.code == code
+    assert "/runs" not in requested
+
+
+@pytest.mark.parametrize("binding", ["missing-replay", None], ids=["missing", "ambiguous-legacy"])
+async def test_unsafe_replay_example_binding_never_creates_a_run(binding):
+    requested: list[str] = []
+    replay_profile = {
+        "profile_id": "replay-default",
+        "execution_mode": "replay",
+        "available": True,
+        "reason": None,
+        "workflow_id": "research-v1",
+        "planner_id": "P1",
+        "ranker_id": "R1",
+    }
+    example = {
+        "question": "Compare planner strategies",
+        "report_language": "en",
+        "source_languages": ["en"],
+        "budget_preset": "medium",
+        "seed": 0,
+    }
+    if binding is not None:
+        example["provider_profile_id"] = binding
+    profiles = [replay_profile]
+    if binding is None:
+        profiles.insert(0, {**replay_profile, "profile_id": "custom-replay"})
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(request.url.path)
+        if request.url.path == "/health/ready":
+            return httpx.Response(200, json={"status": "ok", "checks": {"database": "ok"}})
+        if request.url.path == "/capabilities":
+            return httpx.Response(
+                200,
+                json={
+                    "profiles": profiles,
+                    "replay_example": example,
+                    "budget_presets": ["medium"],
+                    "unpriced_live": False,
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.url.path}")
+
+    with pytest.raises(SmokeError) as caught:
+        await replay_smoke(
+            "http://testserver", timeout=1, api_transport=httpx.MockTransport(handler)
+        )
+
+    assert caught.value.code == "NO_REPLAY_CAPABILITY"
     assert "/runs" not in requested
 
 
@@ -189,6 +266,7 @@ async def test_accepted_run_timeout_attempts_bounded_owner_scoped_cancel():
                         }
                     ],
                     "replay_example": {
+                        "provider_profile_id": "replay-default",
                         "question": "Compare planner strategies",
                         "report_language": "en",
                         "source_languages": ["en"],

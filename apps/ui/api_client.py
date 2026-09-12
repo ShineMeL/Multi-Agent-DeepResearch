@@ -35,6 +35,7 @@ class CapabilityProfile(BaseModel):
 class ReplayExample(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    provider_profile_id: str | None = None
     question: str
     report_language: str
     source_languages: tuple[str, ...]
@@ -49,6 +50,26 @@ class DemoCapabilities(BaseModel):
     replay_example: ReplayExample | None
     budget_presets: tuple[Literal["low", "medium"], ...]
     unpriced_live: bool
+
+    def replay_profile(self) -> CapabilityProfile | None:
+        example = self.replay_example
+        if example is None:
+            return None
+        eligible = tuple(
+            profile
+            for profile in self.profiles
+            if profile.execution_mode == "replay"
+            and profile.available
+            and profile.workflow_id == "research-v1"
+            and profile.planner_id == "P1"
+            and profile.ranker_id == "R1"
+        )
+        if example.provider_profile_id is None:
+            return eligible[0] if len(eligible) == 1 else None
+        matches = tuple(
+            profile for profile in eligible if profile.profile_id == example.provider_profile_id
+        )
+        return matches[0] if len(matches) == 1 else None
 
 
 class RunAccepted(BaseModel):

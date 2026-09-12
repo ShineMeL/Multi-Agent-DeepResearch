@@ -5,7 +5,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from apps.ui.api_client import ResearchApiClient, StreamReconnectExhausted
+from apps.ui.api_client import DemoCapabilities, ResearchApiClient, StreamReconnectExhausted
 from apps.ui.replay import live_payload, replay_payload
 from deepresearch.domain import ResourceUsage
 
@@ -63,6 +63,7 @@ def capabilities(*, live_available=True, unpriced_live=True):
             },
         ],
         "replay_example": {
+            "provider_profile_id": "replay-default",
             "question": "Compare planner strategies",
             "report_language": "en",
             "source_languages": ["en"],
@@ -166,9 +167,52 @@ def test_capabilities_are_typed_and_fetched_with_the_session_owned_http_client()
         result = client.get_capabilities()
 
     assert result.replay_example is not None
+    assert result.replay_example.provider_profile_id == "replay-default"
     assert result.replay_example.question == "Compare planner strategies"
     assert result.profiles[1].available is False
     assert result.profiles[1].reason == "PROVIDER_NOT_CONFIGURED"
+
+
+def test_replay_profile_uses_the_example_binding_instead_of_profile_order():
+    data = capabilities()
+    builtin = data["profiles"][0]
+    data["profiles"].insert(0, {**builtin, "profile_id": "custom-replay"})
+
+    discovered = DemoCapabilities.model_validate(data)
+
+    assert discovered.replay_profile() is not None
+    assert discovered.replay_profile().profile_id == "replay-default"
+
+
+def test_legacy_replay_example_is_safe_with_exactly_one_eligible_profile():
+    data = capabilities()
+    data["replay_example"].pop("provider_profile_id")
+
+    discovered = DemoCapabilities.model_validate(data)
+
+    assert discovered.replay_profile() is not None
+    assert discovered.replay_profile().profile_id == "replay-default"
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["missing", "unavailable", "wrong-mode", "ambiguous-legacy"],
+)
+def test_replay_profile_fails_closed_for_an_unsafe_example_binding(case):
+    data = capabilities()
+    if case == "missing":
+        data["replay_example"]["provider_profile_id"] = "missing-replay"
+    elif case == "unavailable":
+        data["profiles"][0].update(available=False, reason="PROVIDER_PROFILE_DRIFT")
+    elif case == "wrong-mode":
+        data["replay_example"]["provider_profile_id"] = "live-default"
+    else:
+        data["replay_example"].pop("provider_profile_id")
+        data["profiles"].insert(0, {**data["profiles"][0], "profile_id": "custom-replay"})
+
+    discovered = DemoCapabilities.model_validate(data)
+
+    assert discovered.replay_profile() is None
 
 
 def test_live_payload_posts_server_selected_baseline_profile_without_seed():

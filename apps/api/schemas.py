@@ -17,8 +17,8 @@ class CreateRunRequest(BaseModel):
 
     request: ResearchRequest
     workflow_id: Literal["baseline-v1", "research-v1"] = "research-v1"
-    planner_id: Literal["P0", "P1", "P2"] = "P2"
-    ranker_id: Literal["R0", "R1", "R2"] = "R2"
+    planner_id: Literal["P0", "P1", "P2"] = "P1"
+    ranker_id: Literal["R0", "R1", "R2"] = "R1"
     seed: int | None = None
 
     def to_run_config(self, policy: DeploymentPolicy) -> RunConfig:
