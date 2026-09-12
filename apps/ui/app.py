@@ -380,7 +380,7 @@ def main() -> None:
             st.info("离线模式只运行服务端公布的固定录制，不回答任意问题。")
             if example is not None:
                 _fixed_replay_summary(example)
-            else:
+            elif profile is None or profile.available:
                 st.warning("服务端没有可用的固定离线示例（PROVIDER_PROFILE_DRIFT）。")
             if profile is not None and not profile.available:
                 st.warning(

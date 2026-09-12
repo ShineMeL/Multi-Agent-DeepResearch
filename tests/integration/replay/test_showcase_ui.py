@@ -198,6 +198,30 @@ def test_empty_live_budget_cannot_be_submitted_and_explains_policy(advertised_av
     assert not any(select.label == "预算" for select in app.selectbox)
 
 
+@pytest.mark.parametrize("budgets", [[], ["low"], ["medium"]])
+def test_replay_policy_rejection_does_not_also_claim_provider_drift(budgets):
+    data = capabilities(live_available=False)
+    data["budget_presets"] = budgets
+    data["replay_example"] = None
+    replay = next(profile for profile in data["profiles"] if profile["execution_mode"] == "replay")
+    replay.update(available=False, reason="DEPLOYMENT_POLICY_VIOLATION")
+
+    def respond(request):
+        assert request.method == "GET" and request.url.path == "/capabilities"
+        return httpx.Response(200, json=data)
+
+    with ResearchApiClient("http://api", transport=httpx.MockTransport(respond)) as client:
+        app = AppTest.from_file(str(Path("apps/ui/app.py").resolve()), default_timeout=5)
+        app.session_state["showcase"] = ShowcaseSession(client)
+        app.run()
+
+    assert not app.exception
+    assert next(button for button in app.button if button.label == "开始研究").disabled
+    assert len(app.warning) == 1
+    assert "DEPLOYMENT_POLICY_VIOLATION" in app.warning[0].value
+    assert "PROVIDER_PROFILE_DRIFT" not in app.warning[0].value
+
+
 def test_live_form_uses_a_ready_profile_instead_of_the_first_unavailable_profile():
     data = capabilities(live_available=False)
     original = next(profile for profile in data["profiles"] if profile["execution_mode"] == "live")
