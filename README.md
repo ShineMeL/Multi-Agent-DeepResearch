@@ -153,6 +153,23 @@ docker compose up --build -d
 docker compose ps
 ```
 
+After the health checks pass, exercise the same replay-only acceptance used by
+CI. It discovers the server-advertised built-in example, waits for the durable
+terminal SSE event, and verifies the report, evidence graph, manifest, and zero
+paid cost. It never reads model/search keys or falls back to Live providers:
+
+```powershell
+python -m uv run python -m scripts.smoke_replay `
+  --api-url http://127.0.0.1:8000 `
+  --ui-url http://127.0.0.1:8501 `
+  --timeout 90
+```
+
+Omit `--ui-url` for API-only acceptance. The timeout bounds the main smoke run;
+after an accepted queued/running run times out or fails, the client allows at
+most two additional seconds for an owner-scoped cancellation attempt. It keeps
+the terminal record and any durable artifacts for inspection.
+
 The Compose service uses the official image's named `postgres` account rather
 than a brittle numeric UID, so its entrypoint can initialize the named data
 volume while the database remains non-root.

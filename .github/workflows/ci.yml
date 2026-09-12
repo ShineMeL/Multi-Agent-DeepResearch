@@ -13,6 +13,23 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      COMPOSE_PROJECT_NAME: deepresearch-ci-${{ github.run_id }}-${{ github.run_attempt }}
+    services:
+      contract-postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: deepresearch_test
+          POSTGRES_USER: deepresearch
+          POSTGRES_PASSWORD: ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U deepresearch -d deepresearch_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -31,15 +48,47 @@ jobs:
       # The plan's completion checklist permits a production/application type
       # gate. Keep research tooling strict too; legacy fixture typing is separate.
       - run: uv run pyright src apps benchmarks experiments
-      - run: uv run pyright tests/integration/api/test_accounting_recovery.py tests/unit/runtime/test_build_provenance.py tests/integration/deployment/test_proxy_identity.py tests/integration/replay/test_full_service.py tests/integration/deployment/test_smoke.py
-      - run: uv run pytest -q tests/unit tests/contracts tests/integration/replay tests/integration/api tests/integration/deployment -m "not online"
+      - run: uv run pyright scripts/smoke_replay.py tests/integration/api/test_accounting_recovery.py tests/unit/runtime/test_build_provenance.py tests/integration/deployment/test_proxy_identity.py tests/integration/replay/test_full_service.py tests/integration/deployment/test_smoke.py tests/integration/deployment/test_replay_smoke.py
+      - name: Offline and PostgreSQL verification
+        env:
+          DEEPRESEARCH_TEST_POSTGRES_URL: postgresql+asyncpg://deepresearch:ci-only@127.0.0.1:5432/deepresearch_test
+        run: uv run pytest -q tests/unit tests/contracts tests/integration/replay tests/integration/api tests/integration/deployment -m "not online"
       - name: Validate Compose with disposable CI-only values
         env:
           DATABASE_URL: postgresql+asyncpg://deepresearch:ci-only@postgres:5432/deepresearch
           POSTGRES_PASSWORD: ci-only
           SESSION_SIGNING_KEY: ci-only-signing-key-at-least-32-bytes
         run: docker compose config --quiet
-      - run: docker build --build-arg DEEPRESEARCH_CODE_COMMIT=${{ github.sha }} -t multi-agent-deep-research .
+      - name: Build Compose images at the tested revision
+        env:
+          DATABASE_URL: postgresql+asyncpg://deepresearch:ci-only@postgres:5432/deepresearch
+          POSTGRES_PASSWORD: ci-only
+          SESSION_SIGNING_KEY: ci-only-signing-key-at-least-32-bytes
+        run: docker compose build --build-arg DEEPRESEARCH_CODE_COMMIT=${{ github.sha }}
+      - name: Start disposable replay stack
+        env:
+          DATABASE_URL: postgresql+asyncpg://deepresearch:ci-only@postgres:5432/deepresearch
+          POSTGRES_PASSWORD: ci-only
+          SESSION_SIGNING_KEY: ci-only-signing-key-at-least-32-bytes
+        run: timeout 240s docker compose up -d --wait --wait-timeout 180
+      - name: Prove replay completion and artifact integrity over HTTP
+        run: uv run python -m scripts.smoke_replay --api-url http://127.0.0.1:8000 --ui-url http://127.0.0.1:8501 --timeout 90
+      - name: Inspect scoped Compose services on failure
+        if: failure()
+        env:
+          DATABASE_URL: postgresql+asyncpg://deepresearch:ci-only@postgres:5432/deepresearch
+          POSTGRES_PASSWORD: ci-only
+          SESSION_SIGNING_KEY: ci-only-signing-key-at-least-32-bytes
+        run: |
+          docker compose ps
+          docker compose logs --no-color --tail=200 api ui postgres
+      - name: Remove disposable Compose services and volumes
+        if: always()
+        env:
+          DATABASE_URL: postgresql+asyncpg://deepresearch:ci-only@postgres:5432/deepresearch
+          POSTGRES_PASSWORD: ci-only
+          SESSION_SIGNING_KEY: ci-only-signing-key-at-least-32-bytes
+        run: docker compose down --volumes --remove-orphans
 
   online-smoke:
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
