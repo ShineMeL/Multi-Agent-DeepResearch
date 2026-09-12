@@ -3,19 +3,20 @@
 本文只记录当前代码可证实的边界，不把“已有算法类但尚未接入生产”、
 “已接入但缺少目标环境验证”和“完全缺失”混为一谈。优先级按对用户与发布声明的影响排序。
 
-## P0：在外部证据补齐前禁止正式发布结论
+## P0：正式实验封存前，不得宣称已有完整 Benchmark 结论
 
 - 当前正式 Benchmark 结果仍未封存，`docs/results.md:3` 明确保留
   `primary result is not yet sealed`。这不是零分或失败结论。
 - C1 仍需要模型锁、推理环境锁和私有数据 manifest；对应固定检查位于
-  `scripts/release_preflight.py:50-53`。随后还需用同一封存配置完成 C2 的
+  `scripts/release_preflight.py` 的 `_C1_REQUIRED_FILES`。随后还需用同一封存配置完成 C2 的
   A/B/C/D、ranker、planner、稳定性、成本子集、P0/ORACLE 与 10,000 次 bootstrap。
 - C3 仍需要已授权且不可变的外部数据锁、`formal-portfolio.yaml`、严格
   10/20/10 外部结果，以及 20 个任务、每任务 3 位不同匿名评审的原始评分和 sidecar seal；
-  文件前置检查见 `scripts/release_preflight.py:288-327`，内容校验见
+  文件前置检查见 `scripts/release_preflight.py` 的 `_assess_c3`，内容校验见
   `scripts/release_c_gate.py` 的 `_validate_external` 与 `_validate_human`。
-- 缺少上述输入时必须保持 fail-closed；不得生成替代分数、伪造人工评分或把 skipped/blocked
-  写成通过。
+- 缺少某阶段所需输入时，该阶段必须保持 fail-closed；不得生成替代分数、伪造人工评分或把
+  skipped/blocked 写成通过。C4 可仅发布已独立验证的主实验；外部/人工评测是可选输入，
+  缺失时必须明示缺失，不能据此宣称 C3 已完成。
 
 ## P1：生产研究能力仍不完整
 
@@ -23,8 +24,8 @@
   （`src/deepresearch/planning/planners.py:208`、
   `src/deepresearch/evidence/rankers.py:161`），正式实验 runner 也认识这些组件；但服务
   builder 仍固定构造 `FixedPlanner` 与 `SimilarityRanker`
-  （`src/deepresearch/runtime/runner_factory.py:873-891`），并在
-  `:745-749` 拒绝非 P1/R1 的 `research-v1`。因此这是“算法已实现、生产组合未实现”，
+  （`src/deepresearch/runtime/runner_factory.py` 的 `DefaultCoreRunnerBuilder.build`），
+  并拒绝非 P1/R1 的 `research-v1`。因此这是“算法已实现、生产组合未实现”，
   不能宣称生产自适应规划或 R2 排序已交付。API 默认值暂用 P1/R1，避免默认请求选择
   尚不可执行的组合。
 - **定向补搜仍是占位路径。** 生产 claim verification 只路由到
@@ -57,3 +58,5 @@
   可能发生在两个替换之间；本轮不作 crash-atomic 声明，也不保证在回滚所依赖的 I/O
   同时失效时自动恢复所有文件。
   正式发布应在版本化工作树中执行，成功后核对 diff/哈希再提交；失败时保留旧提交作为恢复点。
+- 发布工作树应位于同一文件系统。事务目录位于 `docs` 旁边；如果 `docs` 或其子目录是独立挂载，
+  跨设备替换可能被安全拒绝。这种布局尚不保证发布可用性，但不会被当作发布成功。

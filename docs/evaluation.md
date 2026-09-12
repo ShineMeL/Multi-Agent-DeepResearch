@@ -119,7 +119,10 @@ metrics never enter the primary confidence intervals. Pending licenses,
 hashes stop with `PORTFOLIO_INPUT_MISSING` or
 `HUMAN_AGGREGATE_INCOMPLETE`.
 
-C4 renders the verified primary (and any separately verified optional inputs)
+C4 first re-runs the read-only formal summary verifier: the sealed group/config,
+full protocol coverage, ORACLE references, exact output manifests, and recorded
+10,000 bootstrap resamples must verify. A self-hashed summary alone cannot pass.
+It renders the verified primary (and any separately verified optional inputs)
 twice in temporary directories. Its publication allowlist is `results.md` and
 the three SVGs under `assets/results`; all four must be complete and byte-identical
 before promotion. The renderer's extra `evaluation.md` is not promoted: this
@@ -131,7 +134,9 @@ the page. Supplied human ratings must satisfy the same 20-task/3-distinct-rater
 contract as C3; a hash-valid but structurally incomplete JSON is insufficient.
 
 Promotion validates target paths before mutation and keeps recovery copies
-on the publication filesystem. A caught replacement failure rolls back the
+beside `docs` (the same filesystem in an ordinary checkout). If `docs` or a
+target subdirectory is a separate mount, a cross-device replacement fails closed;
+use a single-filesystem checkout for publication. A caught replacement failure rolls back the
 files already replaced; if restoration itself fails, remaining backups are
 retained in `.deepresearch-publication-*` beside `docs` for operator recovery.
 This is not a cross-file crash-atomic transaction. A verified seal describes

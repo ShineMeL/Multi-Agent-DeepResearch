@@ -420,7 +420,8 @@ Set `API_HOST_PORT` / `UI_HOST_PORT` in the gate process environment to override
 Compose and the acceptance client, including cleanup; invalid ports fail
 before stack mutation. Every Compose command pins the repository's
 `docker-compose.yml` with `--file`; automatic override files, `COMPOSE_FILE`,
-and external `COMPOSE_PROFILES` cannot select a different topology.
+and external `COMPOSE_PROFILES` cannot select a different topology. See
+[Compose flag precedence](https://docs.docker.com/reference/cli/docker/compose/#set-up-environment-variables).
 
 Image provenance requires a clean Git checkout. `GITHUB_SHA`, if supplied,
 must match the checkout's HEAD; dirty/untracked source, mismatched revisions,

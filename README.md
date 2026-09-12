@@ -8,7 +8,7 @@ and exports a citation-backed Markdown report.
 The current checkout keeps the Core foundation / P1+R1 strict Replay path
 reproducible. Benchmark publication wiring is present, but formal A/B/C/D
 quality, cost, confidence-interval, external, and human results remain
-unsealed unless a hash-verified public summary is supplied. This checkout does
+unsealed until the corresponding complete sealed experiment is verified. This checkout does
 not claim formal A/B/C/D results or a hosted Live endpoint.
 
 See [known gaps and release prerequisites](docs/known-gaps.md) for the remaining
