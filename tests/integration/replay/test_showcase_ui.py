@@ -471,9 +471,7 @@ def test_active_run_metrics_use_durable_usage_before_final_usage_is_published():
         assert any(
             metric.label == "Time (seconds)" and metric.value == "2.00" for metric in app.metric
         )
-        assert not next(
-            button for button in app.button if button.label == "取消 / Cancel"
-        ).disabled
+        assert not next(button for button in app.button if button.label == "取消 / Cancel").disabled
 
 
 def test_fragment_completion_refreshes_form_outside_fragment():
@@ -547,6 +545,43 @@ def test_reader_completion_forces_one_immediate_final_status_after_running_poll(
 
         assert session.view is not None and session.view.status == "completed"
         for tick in range(2, 3600):
+            session.refresh(now=tick)
+        assert len(status_calls) == 3
+        assert not session.automatic_refresh
+
+
+def test_reader_completion_waits_for_inflight_stale_poll_then_reads_terminal_immediately():
+    stale_entered, release_stale = Event(), Event()
+    status_calls = []
+
+    def respond(request):
+        if request.url.path.endswith("/events"):
+            return httpx.Response(200, content=frame(1, "completed", kind="run_completed"))
+        status_calls.append(request)
+        if len(status_calls) == 1:
+            stale_entered.set()
+            assert release_stale.wait(3)
+            return httpx.Response(200, json=view("running"))
+        return httpx.Response(200, json=view("completed"))
+
+    with ResearchApiClient("http://api", transport=httpx.MockTransport(respond)) as client:
+        session = ShowcaseSession(client, run_id="r1")
+        session.refresh(now=0)
+        assert stale_entered.wait(1)
+
+        session.watch()
+        assert session.finished.wait(2)
+        session.refresh(now=1)
+        assert len(status_calls) == 2
+
+        release_stale.set()
+        assert session.poll_finished.wait(2)
+        session.refresh(now=2)
+        assert session.poll_finished.wait(2)
+        session.drain(now=2)
+
+        assert session.view is not None and session.view.status == "completed"
+        for tick in range(3, 3600):
             session.refresh(now=tick)
         assert len(status_calls) == 3
         assert not session.automatic_refresh

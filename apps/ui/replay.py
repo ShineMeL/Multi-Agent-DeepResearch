@@ -323,6 +323,11 @@ class ShowcaseSession:
                 self.events.append(item)
                 self.cursor = item.seq
         if self.finished.is_set() and not self._reader_completion_observed:
+            if self._poll_worker is not None and self._poll_worker.is_alive():
+                # Let an older status request publish first. Observing SSE
+                # completion now would let that stale running view clear the
+                # forced final refresh in update_view().
+                return
             self._reader_completion_observed = True
             if self.stream_error is None and (
                 self.view is None or self.view.status in {"queued", "running"}

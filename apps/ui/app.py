@@ -159,10 +159,15 @@ def _details(session: ShowcaseSession, manifest: dict[str, Any]) -> None:
 def _results(session: ShowcaseSession, view: RunView) -> None:
     st.write(f"任务：{view.run_id} · 状态：{view.status} · 持久游标：{session.cursor}")
     status_message = _run_status_message(view)
-    if view.status == "completed" and not view.is_partial and view.stop_reason in {
-        None,
-        "SUFFICIENT",
-    }:
+    if (
+        view.status == "completed"
+        and not view.is_partial
+        and view.stop_reason
+        in {
+            None,
+            "SUFFICIENT",
+        }
+    ):
         st.success(status_message)
     elif view.status in {"queued", "running"}:
         st.info(status_message)
@@ -342,9 +347,7 @@ def main() -> None:
 
     if capabilities is not None:
         mode_label = st.radio("运行模式", ("离线示例", "在线 API"), horizontal=True)
-        execution_mode: Literal["replay", "live"] = (
-            "replay" if mode_label == "离线示例" else "live"
-        )
+        execution_mode: Literal["replay", "live"] = "replay" if mode_label == "离线示例" else "live"
         profile = _profile_for(capabilities, execution_mode)
         example = capabilities.replay_example
         available = profile is not None and profile.available

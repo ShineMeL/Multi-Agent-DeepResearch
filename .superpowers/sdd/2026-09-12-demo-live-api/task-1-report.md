@@ -148,3 +148,50 @@ dependencies and warning handling were not changed. `ShowcaseSession` now observ
 reader completion once and forces exactly one immediate background status read when its current
 view is absent/running. A terminal response then stops polling. `_run_panel` no longer carries the
 unused `watching_at_render` argument. Partial state is checked before any stop-reason success copy.
+
+### Concurrent stale-poll follow-up
+
+A second review isolated the remaining concurrency window: the event reader could finish while an
+older status worker was still in flight. The completion signal was consumed immediately, then the
+older worker's `running` result cleared `_force_refresh` and restored a five-second deadline.
+
+RED:
+
+```text
+python -m uv run --no-sync pytest \
+  tests/integration/replay/test_showcase_ui.py::test_reader_completion_waits_for_inflight_stale_poll_then_reads_terminal_immediately -q
+1 failed, 1 warning in 1.43s
+exit 1
+```
+
+The gated test kept the first poll in flight until after SSE EOF and failed with
+`session.view.status == "running"` instead of `"completed"`.
+
+GREEN and final scoped verification after formatting:
+
+```text
+python -m uv run --no-sync pytest tests/contracts/ui \
+  tests/integration/replay/test_showcase_ui.py -q
+56 passed, 1 warning in 5.72s
+exit 0
+
+python -m uv run --no-sync ruff check apps/ui tests/contracts/ui \
+  tests/integration/replay/test_showcase_ui.py --no-cache
+All checks passed!
+
+python -m uv run --no-sync ruff format --check apps/ui tests/contracts/ui \
+  tests/integration/replay/test_showcase_ui.py
+6 files already formatted
+
+python -m uv run --no-sync pyright apps/ui
+0 errors, 0 warnings, 0 informations
+
+git diff --check
+exit 0
+```
+
+The completion signal now remains unobserved while an older status worker is alive. On the next
+drain, that stale result publishes first; the still-pending completion signal then forces the
+single immediate authoritative read. Terminal state again disables further polling. Formatting
+changed only `apps/ui/app.py` and `tests/integration/replay/test_showcase_ui.py`; the unrelated
+baseline formatting noted by the controller was left untouched.
