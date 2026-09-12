@@ -405,9 +405,24 @@ uv run python scripts/release_preflight.py --gate b1 --format text
 uv run python scripts/release_b_gate.py --profile replay
 ```
 
-The replay profile validates Compose, builds the image with the validated
-`DEEPRESEARCH_CODE_COMMIT`, starts the API/Postgres/UI stack, checks
-`/health/live` and `/health/ready`, and then runs `docker compose down`. Named
+The replay profile validates Compose and builds the actual Compose service
+images with the validated `DEEPRESEARCH_CODE_COMMIT`. It starts the
+API/Postgres/UI stack with `--no-build --wait --wait-timeout 180`, then checks
+`/health/live` and `/health/ready` with bounded retries (30 seconds per probe).
+See the official [Compose startup options](https://docs.docker.com/reference/cli/docker/compose/up/).
+It finally runs the replay-only HTTP acceptance script: a completed,
+non-partial, zero-provider-cost report, durable SSE replay, all artifact SHA-256
+checks, and UI health must pass before the gate reports success. The script
+uses a 90-second deadline; each external command also has a bounded timeout.
+
+Set `API_HOST_PORT` / `UI_HOST_PORT` in the gate process environment to override
+8000 / 8501. The same explicit ports and validated environment are forwarded to
+Compose and the acceptance client, including cleanup; invalid ports fail
+before stack mutation. A source checkout or validated `GITHUB_SHA` is required
+for image provenance. This orchestration is regression-tested with controlled
+process/HTTP boundaries; that is not evidence of a local Docker engine run.
+
+The gate then runs `docker compose down`. Named
 volumes are retained by that cleanup. Only an explicitly chosen `down -v`
 operation removes persisted volumes. Use `--keep-up` when an operator needs
 to inspect a running stack, and `--dry-run` to print the redacted command plan

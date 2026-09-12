@@ -15,6 +15,7 @@ import secrets
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -56,7 +57,6 @@ Runner = Callable[..., subprocess.CompletedProcess[str] | None]
 HealthGetter = Callable[..., object]
 
 _ZERO_REVISION = "0" * 40
-_DOCKER_IMAGE = "multi-agent-deep-research"
 _ONLINE_JSON_VARIABLES = {
     "PRICING_CATALOG_JSON": "PRICING_CATALOG_PATH",
     "PROVIDER_PROFILE_CATALOG_JSON": "PROVIDER_PROFILE_CATALOG_PATH",
@@ -71,7 +71,7 @@ def _blocked(report: GateReport) -> BRunResult:
     return BRunResult("blocked", report.reason, steps)
 
 
-def _safe_revision(repository: Path) -> str:
+def _safe_revision(repository: Path, *, environ: Mapping[str, str]) -> str:
     """Return a validated 40-character revision, or the explicit unavailable value.
 
     Source archives used by unit tests do not have Git metadata.  Packaged
@@ -79,7 +79,7 @@ def _safe_revision(repository: Path) -> str:
     used; a real checkout is always required to provide a validated revision.
     """
 
-    candidate = os.environ.get("GITHUB_SHA", "").strip()
+    candidate = environ.get("GITHUB_SHA", "").strip()
     if (
         len(candidate) == 40
         and candidate != _ZERO_REVISION
@@ -116,6 +116,7 @@ def _invoke(
     repository: Path,
     *,
     environ: Mapping[str, str] | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str] | None:
     kwargs: dict[str, object] = {
         "cwd": str(repository),
@@ -125,6 +126,8 @@ def _invoke(
     }
     if environ is not None:
         kwargs["env"] = dict(environ)
+    if timeout is not None:
+        kwargs["timeout"] = timeout
     try:
         return runner(list(command), **kwargs)
     except (OSError, subprocess.SubprocessError):
@@ -139,21 +142,59 @@ def _command_detail(result: subprocess.CompletedProcess[str] | None) -> str:
     return f"exit_{result.returncode}"
 
 
+def _host_port(environ: Mapping[str, str], name: str, default: int) -> int:
+    value = environ.get(name) or str(default)
+    if not value.isascii() or not value.isdecimal() or len(value) > 5:
+        raise ValueError("invalid host port")
+    port = int(value)
+    if not 1 <= port <= 65535:
+        raise ValueError("invalid host port")
+    return port
+
+
+def _wait_for_health(health_getter: HealthGetter, url: str) -> bool:
+    deadline = time.monotonic() + 30.0
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            response = health_getter(url, timeout=min(10.0, remaining))
+            status = getattr(response, "status", None)
+            if isinstance(status, int) and 200 <= status < 300:
+                return True
+        except (OSError, URLError, TimeoutError, ValueError):
+            pass
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(0.5, remaining))
+    return False
+
+
 def _run_b1(
     repository: Path,
     *,
     keep_up: bool,
     runner: Runner,
     health_getter: HealthGetter,
+    environ: Mapping[str, str],
     dry_run: bool,
 ) -> BRunResult:
+    try:
+        api_port = _host_port(environ, "API_HOST_PORT", 8000)
+        ui_port = _host_port(environ, "UI_HOST_PORT", 8501)
+    except ValueError:
+        return BRunResult("blocked", "DEPLOYMENT_PORT_INVALID", ())
+    # Keep probes and Compose on the same explicit ports even if a local .env
+    # file contains different defaults. Never mutate the caller's environment.
+    prepared = dict(environ, API_HOST_PORT=str(api_port), UI_HOST_PORT=str(ui_port))
+    api_url = f"http://127.0.0.1:{api_port}"
+    ui_url = f"http://127.0.0.1:{ui_port}"
     if dry_run:
         commands = (
             "docker compose config --quiet",
-            "docker build --build-arg DEEPRESEARCH_CODE_COMMIT=<validated> -t multi-agent-deep-research .",
-            "docker compose up -d",
+            "docker compose build --build-arg DEEPRESEARCH_CODE_COMMIT=<validated>",
+            "docker compose up -d --no-build --wait --wait-timeout 180",
             "GET /health/live",
             "GET /health/ready",
+            "python -m scripts.smoke_replay --api-url <local-api> --ui-url <local-ui> --timeout 90",
             "docker compose down",
         )
         if keep_up:
@@ -161,7 +202,10 @@ def _run_b1(
         return BRunResult(
             "blocked",
             "DRY_RUN_NOT_EXECUTED",
-            tuple(BStep(f"plan_{index}", "blocked", command) for index, command in enumerate(commands, 1)),
+            tuple(
+                BStep(f"plan_{index}", "blocked", command)
+                for index, command in enumerate(commands, 1)
+            ),
         )
 
     steps: list[BStep] = []
@@ -169,21 +213,27 @@ def _run_b1(
     final_status: BRunStatus = "ready"
     reason: str | None = None
 
-    def run_command(name: str, command: Sequence[str]) -> bool:
+    def run_command(
+        name: str,
+        command: Sequence[str],
+        *,
+        timeout: float = 60.0,
+        failure_reason: str = "DEPLOYMENT_COMMAND_FAILED",
+    ) -> bool:
         nonlocal final_status, reason
-        result = _invoke(runner, command, repository)
+        result = _invoke(runner, command, repository, environ=prepared, timeout=timeout)
         if result is not None and result.returncode == 0:
             steps.append(BStep(name, "ready", "completed"))
             return True
         steps.append(BStep(name, "failed", _command_detail(result)))
         final_status = "failed"
-        reason = "DEPLOYMENT_COMMAND_FAILED"
+        reason = failure_reason
         return False
 
     try:
         if run_command("compose_config", ("docker", "compose", "config", "--quiet")):
-            revision = _safe_revision(repository)
-            if revision == _ZERO_REVISION and (repository / ".git").exists():
+            revision = _safe_revision(repository, environ=prepared)
+            if revision == _ZERO_REVISION:
                 steps.append(BStep("source_revision", "failed", "unavailable"))
                 final_status = "failed"
                 reason = "DEPLOYMENT_SOURCE_REVISION_MISSING"
@@ -191,43 +241,64 @@ def _run_b1(
                 "image_build",
                 (
                     "docker",
+                    "compose",
                     "build",
                     "--build-arg",
                     f"DEEPRESEARCH_CODE_COMMIT={revision}",
-                    "-t",
-                    _DOCKER_IMAGE,
-                    ".",
                 ),
+                timeout=1200.0,
             ):
                 # Compose can partially create services before returning a
                 # non-zero status, so cleanup is attempted after every up
                 # attempt unless the operator explicitly keeps the stack up.
                 stack_started = True
-                if run_command("stack_up", ("docker", "compose", "up", "-d")):
+                if run_command(
+                    "stack_up",
+                    (
+                        "docker",
+                        "compose",
+                        "up",
+                        "-d",
+                        "--no-build",
+                        "--wait",
+                        "--wait-timeout",
+                        "180",
+                    ),
+                    timeout=240.0,
+                ):
                     for name, path in (
                         ("health_live", "/health/live"),
                         ("health_ready", "/health/ready"),
                     ):
-                        try:
-                            response = health_getter(
-                                f"http://127.0.0.1:8000{path}", timeout=10.0
-                            )
-                            status = getattr(response, "status", 200)
-                            if isinstance(status, int) and 200 <= status < 300:
-                                steps.append(BStep(name, "ready", "http_2xx"))
-                                continue
-                            steps.append(BStep(name, "failed", "http_not_ready"))
-                            final_status = "failed"
-                            reason = "DEPLOYMENT_HEALTH_FAILED"
-                            break
-                        except (OSError, URLError, TimeoutError, ValueError):
-                            steps.append(BStep(name, "failed", "unavailable"))
-                            final_status = "failed"
-                            reason = "DEPLOYMENT_HEALTH_FAILED"
-                            break
+                        if _wait_for_health(health_getter, f"{api_url}{path}"):
+                            steps.append(BStep(name, "ready", "http_2xx"))
+                            continue
+                        steps.append(BStep(name, "failed", "readiness_deadline_exceeded"))
+                        final_status = "failed"
+                        reason = "DEPLOYMENT_HEALTH_FAILED"
+                        break
+                    else:
+                        run_command(
+                            "replay_smoke",
+                            (
+                                sys.executable,
+                                "-m",
+                                "scripts.smoke_replay",
+                                "--api-url",
+                                api_url,
+                                "--ui-url",
+                                ui_url,
+                                "--timeout",
+                                "90",
+                            ),
+                            timeout=100.0,
+                            failure_reason="DEPLOYMENT_REPLAY_SMOKE_FAILED",
+                        )
     finally:
         if stack_started and not keep_up:
-            result = _invoke(runner, ("docker", "compose", "down"), repository)
+            result = _invoke(
+                runner, ("docker", "compose", "down"), repository, environ=prepared, timeout=60.0
+            )
             if result is not None and result.returncode == 0:
                 steps.append(BStep("stack_down", "ready", "completed"))
             else:
@@ -283,7 +354,15 @@ def _run_b2(
             )
         result = _invoke(
             runner,
-            ("uv", "run", "pytest", "-q", "tests/integration/deployment/test_smoke.py", "-m", "online"),
+            (
+                "uv",
+                "run",
+                "pytest",
+                "-q",
+                "tests/integration/deployment/test_smoke.py",
+                "-m",
+                "online",
+            ),
             repository,
             environ=prepared,
         )
@@ -319,6 +398,7 @@ def run_b_gate(
             keep_up=keep_up,
             runner=runner,
             health_getter=health_getter,
+            environ=current_env,
             dry_run=dry_run,
         )
     return _run_b2(root, runner=runner, environ=current_env, dry_run=dry_run)
@@ -349,7 +429,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         dry_run=arguments.dry_run,
     )
     if arguments.format == "json":
-        print(json.dumps(_payload(result), ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+        print(
+            json.dumps(_payload(result), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        )
     else:
         print(f"release_b status={result.status} reason={result.reason or 'none'}")
         for step in result.steps:
