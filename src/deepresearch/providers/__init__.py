@@ -2,6 +2,7 @@ from .errors import ProviderError, ProviderErrorCode
 from .protocols import (
     Fetcher,
     ModelProvider,
+    ModelRequestNormalizer,
     Parser,
     ProviderUsageResult,
     Reranker,
@@ -9,6 +10,7 @@ from .protocols import (
     TextEmbedder,
     UsageReportingFetcher,
     UsageReportingSearchProvider,
+    normalize_model_request,
 )
 from .resilience import (
     ProviderCallAttempt,
@@ -39,6 +41,7 @@ __all__ = [
     "ModelMessage",
     "ModelProvider",
     "ModelRequest",
+    "ModelRequestNormalizer",
     "ModelResult",
     "ModelStreamChunk",
     "ParsedBlock",
@@ -61,6 +64,7 @@ __all__ = [
     "ToolCall",
     "UsageReportingFetcher",
     "UsageReportingSearchProvider",
+    "normalize_model_request",
     "validate_embeddings",
     "validate_model_stream",
 ]

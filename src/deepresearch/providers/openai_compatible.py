@@ -69,7 +69,9 @@ def _usage(payload: object) -> ResourceUsage:
         raise TypeError("token details must be objects")
     prompt_values = cast("dict[str, object]", prompt_details)
     completion_values = cast("dict[str, object]", completion_details)
-    cached_tokens = prompt_values.get("cached_tokens", 0)
+    cached_tokens = prompt_values.get("cached_tokens", values.get("cached_tokens", 0))
+    if "cached_tokens" in values and values["cached_tokens"] != cached_tokens:
+        raise ValueError("cached token fields disagree")
     reasoning_tokens = completion_values.get("reasoning_tokens", 0)
     if type(cached_tokens) is not int or cached_tokens < 0:
         raise ValueError("cached_tokens must be a non-negative integer")
@@ -114,10 +116,7 @@ def _tool_json_nesting_is_bounded(value: str) -> bool:
 
 
 def _is_strict_tool_json_object(value: str) -> bool:
-    if (
-        len(value) > _MAX_TOOL_ARGUMENT_CHARACTERS
-        or not _tool_json_nesting_is_bounded(value)
-    ):
+    if len(value) > _MAX_TOOL_ARGUMENT_CHARACTERS or not _tool_json_nesting_is_bounded(value):
         return False
     duplicate_key = False
 
@@ -169,9 +168,7 @@ class OpenAICompatibleModelProvider:
         self.model_revision = model_revision
         self._endpoint = f"{base_url.rstrip('/')}/chat/completions"
         self._api_key = api_key
-        self._executor = executor or ProviderCallExecutor(
-            policy=ProviderCallPolicy.defaults()
-        )
+        self._executor = executor or ProviderCallExecutor(policy=ProviderCallPolicy.defaults())
         self._client = client or httpx.AsyncClient(
             follow_redirects=False,
             trust_env=False,
@@ -459,9 +456,7 @@ class OpenAICompatibleModelProvider:
                 public_message=outcome.error.public_message,
                 retryable=outcome.error.retryable,
                 retry_after=outcome.error.retry_after,
-                usage=usage.model_copy(
-                    update={"retries": retries, "wall_seconds": elapsed}
-                ),
+                usage=usage.model_copy(update={"retries": retries, "wall_seconds": elapsed}),
             )
             raise failure from None
         if outcome.result is None:
@@ -522,6 +517,9 @@ class OpenAICompatibleModelProvider:
     ) -> StructuredModelResult[T]:
         operation = "model.structured"
         adapter = TypeAdapter(output_schema)
+        # Keep the concrete schema through model_copy() when retries/wall time
+        # are settled. An unspecialized Generic[T] round-trips output as dict.
+        result_type = StructuredModelResult[output_schema]  # pyright: ignore[reportInvalidTypeForm]
         schema = cast("dict[str, JsonValue]", adapter.json_schema())
         response_format: dict[str, JsonValue] = {
             "type": "json_schema",
@@ -534,9 +532,7 @@ class OpenAICompatibleModelProvider:
 
         async def invoke(call_deadline: float) -> StructuredModelResult[T]:
             response = await self._post_json(
-                self._request_payload(
-                    request, stream=False, response_format=response_format
-                ),
+                self._request_payload(request, stream=False, response_format=response_format),
                 operation=operation,
                 deadline=call_deadline,
                 cancellation_token=cancellation_token,
@@ -559,7 +555,7 @@ class OpenAICompatibleModelProvider:
                     retryable=False,
                     usage=response.usage,
                 )
-            return StructuredModelResult(
+            return result_type(
                 output=output,
                 usage=response.usage,
                 provider_id=self.provider_id,
@@ -688,9 +684,7 @@ class OpenAICompatibleModelProvider:
                         _is_strict_tool_json_object(arguments)
                         for arguments in tool_argument_buffers.values()
                     ):
-                        raise invalid_stream(
-                            "model stream tool arguments were invalid"
-                        )
+                        raise invalid_stream("model stream tool arguments were invalid")
                     continue
                 if terminal_usage_seen or finished or "usage" in decoded_mapping:
                     raise invalid_stream("model stream choice order was invalid")
@@ -774,26 +768,22 @@ class OpenAICompatibleModelProvider:
                             repeated_type = tool.get("type")
                             repeated_name = function.get("name")
                             if (
-                                repeated_id is not None
-                                and repeated_id != tool_ids_by_index[tool_index]
-                            ) or (
-                                repeated_type is not None
-                                and repeated_type != "function"
-                            ) or (
-                                repeated_name is not None
-                                and repeated_name != tool_names_by_index[tool_index]
-                            ):
-                                raise invalid_stream(
-                                    "model stream tool identity was inconsistent"
+                                (
+                                    repeated_id is not None
+                                    and repeated_id != tool_ids_by_index[tool_index]
                                 )
+                                or (repeated_type is not None and repeated_type != "function")
+                                or (
+                                    repeated_name is not None
+                                    and repeated_name != tool_names_by_index[tool_index]
+                                )
+                            ):
+                                raise invalid_stream("model stream tool identity was inconsistent")
                             if (
-                                len(tool_argument_buffers[tool_index])
-                                + len(arguments)
+                                len(tool_argument_buffers[tool_index]) + len(arguments)
                                 > _MAX_TOOL_ARGUMENT_CHARACTERS
                             ):
-                                raise invalid_stream(
-                                    "model stream tool arguments were invalid"
-                                )
+                                raise invalid_stream("model stream tool arguments were invalid")
                             tool_argument_buffers[tool_index] += arguments
                         tool_call_seen = True
                 raw_finish = choice_mapping.get("finish_reason")

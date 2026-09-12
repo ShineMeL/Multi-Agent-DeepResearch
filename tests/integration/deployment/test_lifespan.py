@@ -26,6 +26,7 @@ from deepresearch.runtime.runner_factory import (
     LangGraphServiceRunnerFactory,
     ProviderProfileDrift,
 )
+from deepresearch.security import wrap_untrusted_content
 from deepresearch.storage.migrations.runner import ServiceMigrationError, upgrade_service_schema
 from deepresearch.storage.protocols import RunRecord
 from tests.integration.replay.test_baseline_graph import config
@@ -169,7 +170,10 @@ async def test_local_replay_composition_preserves_shipped_fixture_identity(setti
 
     async with app.router.lifespan_context(app):
         builder = app.state.manager.runner_factory.builder
-        assert builder.content_boundary is identity_content_boundary
+        # Replay compatibility is selected for each local replay run; adding a
+        # live profile must not change its recorded prompt or unguard live input.
+        assert builder.content_boundary is wrap_untrusted_content
+        assert builder.local_replay_content_boundary is identity_content_boundary
 
 
 async def test_startup_marks_running_runs_interrupted(app):

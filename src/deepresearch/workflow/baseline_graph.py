@@ -54,6 +54,7 @@ from deepresearch.providers import (
     TextEmbedder,
     UsageReportingFetcher,
     UsageReportingSearchProvider,
+    normalize_model_request,
     validate_embeddings,
 )
 from deepresearch.reporting import ContentBoundary, MarkdownReportWriter
@@ -1362,6 +1363,7 @@ class _CachedModelProvider:
         deadline: float,
         cancellation_token: CancellationToken,
     ) -> ModelResult[str]:
+        request = normalize_model_request(self._inner, request)
         result = await self._owner._cached_model_call(  # pyright: ignore[reportPrivateUsage]
             provider=self._inner,
             request=request,
@@ -1382,6 +1384,7 @@ class _CachedModelProvider:
         deadline: float,
         cancellation_token: CancellationToken,
     ) -> StructuredModelResult[Output]:
+        request = normalize_model_request(self._inner, request)
         result = await self._owner._cached_model_call(  # pyright: ignore[reportPrivateUsage]
             provider=self._inner,
             request=request,
@@ -3919,6 +3922,30 @@ class BaselineNodeHandlers:
         active_id = state["active_subquestion_id"]
         active_ledger = next(item for item in ledger if item.subquestion_id == active_id)
         pending = tuple(item for item in state["pending_subquestion_ids"] if item != active_id)
+        blocked_needs = state["blocked_needs"]
+        if not pending:
+            # P1 has a finite query set and no adaptive replanning strategy.
+            # After its last search/rank pass, unmet needs are a partial result,
+            # not an impossible graph transition or fabricated sufficiency.
+            # These are *additional strategy* retries, not provider HTTP retries.
+            by_id = {entry.subquestion_id: entry for entry in ledger}
+            blocked_needs = tuple(
+                BaselineBlockedNeed(
+                    need_id=need.need_id,
+                    required_source_unavailable=True,
+                    alternative_strategies_exhausted=True,
+                    retry_count=0,
+                    max_retries=0,
+                )
+                for subquestion in plan.subquestions
+                if (
+                    by_id[subquestion.id].coverage_score < 0.85
+                    or by_id[subquestion.id].independent_source_count
+                    < subquestion.evidence_requirements.min_independent_sources
+                    or by_id[subquestion.id].unresolved_conflict_ids
+                )
+                for need in subquestion.information_needs
+            )
         return {
             "active_subquestion_id": None,
             "coverage_ledger": ledger,
@@ -3928,6 +3955,7 @@ class BaselineNodeHandlers:
                 active_ledger.last_marginal_gain,
             ),
             "selected_evidence_ids": selected,
+            "blocked_needs": blocked_needs,
         }
 
     async def draft_report(self, state: BaselineState) -> StateUpdate:
@@ -3954,6 +3982,12 @@ class BaselineNodeHandlers:
             user_strings=(state["request"].question,),
         )
         system = "Write one evidence-grounded Markdown report with inline evidence IDs."
+        if state["request"].execution_mode != "replay":
+            # Preserve recorded replay bytes. Use only supported language codes
+            # in system instructions, never an arbitrary user-supplied string.
+            language = state["request"].report_language
+            if language in {"en", "zh"}:
+                system += f" Report language: {language}."
         request = ModelRequest(
             model_id=_model_identity(model)[1],
             messages=(

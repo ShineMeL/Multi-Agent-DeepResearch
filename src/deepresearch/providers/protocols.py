@@ -21,6 +21,19 @@ from .types import (
 T = TypeVar("T")
 
 
+@runtime_checkable
+class ModelRequestNormalizer(Protocol):
+    """Optional, idempotent normalization of provider-fixed sampling parameters."""
+
+    def normalize_request(self, request: ModelRequest) -> ModelRequest: ...
+
+
+def normalize_model_request(provider: object, request: ModelRequest) -> ModelRequest:
+    if isinstance(provider, ModelRequestNormalizer):
+        return provider.normalize_request(request)
+    return request
+
+
 @dataclass(frozen=True)
 class ProviderUsageResult[T]:
     value: T

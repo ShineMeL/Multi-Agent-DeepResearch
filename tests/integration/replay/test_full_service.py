@@ -334,10 +334,12 @@ async def test_full_service_has_artifacts_terminal_event_and_owned_reconnect(
 
 
 @pytest.mark.parametrize("workflow_id", ["baseline-v1", "research-v1"])
+@pytest.mark.parametrize("mixed_modes", [False, True])
 async def test_full_service_strict_replay_completes_against_verified_baseline_bundle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     workflow_id: str,
+    mixed_modes: bool,
 ):
     source = Path("tests/fixtures/replay/baseline").resolve()
     bundle_root = tmp_path / "bundle"
@@ -415,7 +417,7 @@ async def test_full_service_strict_replay_completes_against_verified_baseline_bu
         provider_profile_catalog_path=profiles_path,
         pricing_catalog_path=pricing_path,
         deployment_access_profile="local",
-        allowed_execution_modes=("replay",),
+        allowed_execution_modes=("replay", "live") if mixed_modes else ("replay",),
         allowed_provider_profile_ids=("offline",),
         allowed_run_purposes=("demo",),
         allowed_budget_presets=("medium",),

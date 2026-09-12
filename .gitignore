@@ -2,6 +2,7 @@
 .worktrees/
 .venv/
 .env
+.env.demo
 artifacts/
 .cache/deepresearch/
 models/embedding/

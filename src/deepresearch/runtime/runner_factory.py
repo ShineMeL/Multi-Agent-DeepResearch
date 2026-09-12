@@ -20,11 +20,13 @@ from deepresearch.planning import FixedPlanner
 from deepresearch.providers import (
     Fetcher,
     ModelProvider,
+    ModelRequest,
     Parser,
     ProviderError,
     SearchProvider,
     TextEmbedder,
     UsageReportingSearchProvider,
+    normalize_model_request,
 )
 from deepresearch.providers.httpx_fetcher import HostSlot, no_op_host_slot
 from deepresearch.reporting import ContentBoundary, MarkdownReportWriter
@@ -174,7 +176,7 @@ class FrozenProviderRoute(BaseModel):
         allowed: set[str] = {"snapshot_id"} if self.operation in {"search", "fetch"} else set()
         if self.operation != "parse":
             allowed.add("bundle_path")
-        if self.operation == "embed" and self.provider_id == "deterministic-hash":
+        if self.operation == "embed" and self.provider_id in {"deterministic-hash", "lexical-hash"}:
             allowed.add("dimension")
         if set(self.parameters) - allowed:
             raise ValueError("route parameters are not supported by this operation")
@@ -416,6 +418,8 @@ def default_provider_constructors() -> dict[str, ProviderConstructor]:
     from deepresearch.providers.embeddings import DeterministicHashTextEmbedder
     from deepresearch.providers.httpx_fetcher import HttpxFetcher
     from deepresearch.providers.httpx_transport import PinnedPeerTransport
+    from deepresearch.providers.kimi import KimiInstantModelProvider
+    from deepresearch.providers.lexical import LexicalHashTextEmbedder
     from deepresearch.providers.openai_compatible import OpenAICompatibleModelProvider
     from deepresearch.providers.parsers import HtmlParser, PdfParser
     from deepresearch.providers.replay import (
@@ -458,7 +462,14 @@ def default_provider_constructors() -> dict[str, ProviderConstructor]:
         del slot
         if route.operation != "model" or route.base_url is None or secret is None:
             raise ProviderProfileDrift()
-        return OpenAICompatibleModelProvider(
+        if route.provider_id == "kimi-instant" and route.model_id not in {"kimi-k2.5", "kimi-k2.6"}:
+            raise ProviderProfileDrift()
+        constructor = (
+            KimiInstantModelProvider
+            if route.provider_id == "kimi-instant"
+            else OpenAICompatibleModelProvider
+        )
+        return constructor(
             base_url=str(route.base_url),
             api_key=SecretStr(secret),
             provider_id=route.provider_id,
@@ -482,6 +493,7 @@ def default_provider_constructors() -> dict[str, ProviderConstructor]:
     return {
         "replay": replay,
         "openai-compatible": model,
+        "kimi-instant": model,
         "tavily": search,
         "html": lambda route, secret, slot: HtmlParser(),
         "trafilatura-html": lambda route, secret, slot: HtmlParser(),
@@ -492,6 +504,9 @@ def default_provider_constructors() -> dict[str, ProviderConstructor]:
             transport=PinnedPeerTransport(), host_slot=slot
         ),
         "deterministic-hash": lambda route, secret, slot: DeterministicHashTextEmbedder(
+            dimension=cast(int, route.parameters.get("dimension", 384))
+        ),
+        "lexical-hash": lambda route, secret, slot: LexicalHashTextEmbedder(
             dimension=cast(int, route.parameters.get("dimension", 384))
         ),
     }
@@ -537,14 +552,21 @@ class _BoundModel:
             return _bind_runtime_profile_request(rebound)
         return rebound
 
+    def normalize_request(self, request: ModelRequest) -> ModelRequest:
+        return normalize_model_request(self.delegate, request)
+
     async def complete(self, request: Any, **kwargs: Any) -> Any:
-        return await self.delegate.complete(self._request(request), **kwargs)
+        return await self.delegate.complete(
+            self._request(self.normalize_request(request)), **kwargs
+        )
 
     async def structured(self, request: Any, output_schema: type[Any], **kwargs: Any) -> Any:
-        return await self.delegate.structured(self._request(request), output_schema, **kwargs)
+        return await self.delegate.structured(
+            self._request(self.normalize_request(request)), output_schema, **kwargs
+        )
 
     def stream(self, request: Any, **kwargs: Any) -> Any:
-        return self.delegate.stream(self._request(request), **kwargs)
+        return self.delegate.stream(self._request(self.normalize_request(request)), **kwargs)
 
 
 class _SlottedSearch:
@@ -679,6 +701,7 @@ class DefaultCoreRunnerBuilder:
         artifact_store: LocalArtifactStore,
         evidence_store: LocalEvidenceStore,
         content_boundary: ContentBoundary = wrap_untrusted_content,
+        local_replay_content_boundary: ContentBoundary | None = None,
         search_slot: SearchSlot = no_op_search_slot,
         host_slot: HostSlot = no_op_host_slot,
         secrets: Collection[str] = (),
@@ -689,6 +712,7 @@ class DefaultCoreRunnerBuilder:
         self.artifact_store = artifact_store
         self.evidence_store = evidence_store
         self.content_boundary = content_boundary
+        self.local_replay_content_boundary = local_replay_content_boundary
         self.search_slot = search_slot
         self.host_slot = host_slot
         self._secrets = tuple(secrets)
@@ -710,6 +734,13 @@ class DefaultCoreRunnerBuilder:
         cost_calculator: type[CostCalculator],
     ) -> ResearchRunner:
         validate_provider_route_binding(config, provider_routes)
+        content_boundary = self.content_boundary
+        if (
+            config.request.access_profile == "local"
+            and config.request.execution_mode == "replay"
+            and self.local_replay_content_boundary is not None
+        ):
+            content_boundary = self.local_replay_content_boundary
         provenance = resolve_build_provenance()
         if config.workflow_id == "research-v1" and (
             config.planner_id,
@@ -718,6 +749,8 @@ class DefaultCoreRunnerBuilder:
             raise ResearchGraphUnavailable()
         routes = {route.operation: route for route in provider_routes.routes}
         if set(routes) != {"model", "search", "fetch", "parse", "embed"}:
+            raise ProviderProfileDrift()
+        if routes["model"].provider_id == "kimi-instant" and config.seed is not None:
             raise ProviderProfileDrift()
         replay_parent: str | None = None
         if provider_routes.execution_mode == "replay":
@@ -841,11 +874,11 @@ class DefaultCoreRunnerBuilder:
             model=model,
             artifact_store=self.artifact_store,
             budget=config.budget,
-            content_boundary=self.content_boundary,
+            content_boundary=content_boundary,
             prompt_version=config.prompt_versions.get("planner", "fixed-planner-v1"),
         )
         writer = MarkdownReportWriter(
-            self.evidence_store, model=model, content_boundary=self.content_boundary
+            self.evidence_store, model=model, content_boundary=content_boundary
         )
         search = cast(SearchProvider, adapters["search"])
         slotted_search = (

@@ -29,6 +29,7 @@ from deepresearch.storage import LocalArtifactStore, LocalEvidenceStore
 from deepresearch.storage.migrations.runner import upgrade_service_schema
 from deepresearch.storage.sqlalchemy_store import SqlAlchemyRunStore
 
+from .capabilities import router as capabilities_router
 from .error_handlers import APIError, error_response, install_error_handlers
 from .health import router as health_router
 from .identity import OwnerSessionMiddleware, TrustedClientIpResolver
@@ -131,14 +132,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
             # All selected profiles must exist and agree with the server policy;
             # credentials resolve only through the dedicated provider allowlist.
             settings.validate_route_catalog(route_catalog)
-            replay_only_local = (
-                settings.deployment_access_profile == "local"
-                and set(settings.allowed_execution_modes) == {"replay"}
-                and all(
-                    route_catalog.resolve(profile_id).execution_mode == "replay"
-                    for profile_id in settings.allowed_provider_profile_ids
-                )
-            )
             builder = DefaultCoreRunnerBuilder(
                 provider_constructors=default_provider_constructors(),
                 credential_resolver=EnvCredentialResolver(
@@ -150,9 +143,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
                 # untrusted-content marker existed.  Local replay never sends
                 # these prompts to an external provider, so preserve its exact
                 # request identity.  Any live/public composition stays guarded.
-                content_boundary=(
-                    identity_content_boundary if replay_only_local else wrap_untrusted_content
-                ),
+                content_boundary=wrap_untrusted_content,
+                local_replay_content_boundary=identity_content_boundary,
                 search_slot=limits.search_slot,
                 host_slot=limits.fetch_slot,
                 secrets=secrets,
@@ -204,4 +196,5 @@ def create_app(settings: ServiceSettings | None = None) -> FastAPI:
     app.include_router(runs_router)
     app.include_router(events_router)
     app.include_router(health_router)
+    app.include_router(capabilities_router)
     return app

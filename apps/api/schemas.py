@@ -40,7 +40,7 @@ class CreateRunRequest(BaseModel):
             workflow_id=self.workflow_id,
             planner_id=self.planner_id,
             ranker_id=self.ranker_id,
-            budget=policy.budget_presets[request.budget_preset].model_copy(deep=True),
+            budget=policy.budget_for_request(request),
             prompt_versions=versions,
             ranker_weights_version="r2-v1" if self.ranker_id == "R2" else None,
             seed=self.seed,

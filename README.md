@@ -11,6 +11,34 @@ quality, cost, confidence-interval, external, and human results remain
 unsealed unless a hash-verified public summary is supplied. This checkout does
 not claim formal A/B/C/D results or a hosted Live endpoint.
 
+## Local Web Demo / 本地演示
+
+```powershell
+python -m uv sync --extra dev --frozen
+python -m uv run python -m scripts.run_demo
+```
+
+Open <http://127.0.0.1:8501>. **离线示例** runs the fixed English recording without
+keys or paid calls; `SUFFICIENT` means **信息已充分，研究正常完成**, not insufficient.
+Inputs are pinned to the recording so changing the question cannot accidentally
+produce a replay mismatch.
+
+For **在线 API**, copy `.env.demo.example` to `.env.demo` in the checkout you launch,
+then fill `MODEL_API_KEY` (Kimi) and `SEARCH_API_KEY` (Tavily) locally. Restart the
+launcher and select 在线 API to ask your own question. Do not paste keys into chat
+or commit them. A Kimi key alone does not authorize the separate search service.
+See [the demo guide](docs/demo.md) for configuration, limits and troubleshooting.
+
+```powershell
+Copy-Item .env.demo.example .env.demo  # only if .env.demo does not already exist
+python -m uv run python -m scripts.run_demo --check
+```
+
+This is a loopback-only local demo, not a public deployment. Online runs can incur
+charges; without a frozen price catalog their USD cost is **unknown**, not zero.
+The model/search HTTP integration is tested with controlled responses; configured
+credentials still need an actual authorized online run to verify provider access.
+
 ## Navigation
 
 - [Architecture](#architecture)

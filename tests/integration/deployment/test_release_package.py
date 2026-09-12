@@ -94,8 +94,12 @@ def test_operator_documentation_describes_release_boundaries() -> None:
     assert "MODEL_API_KEY" in deployment and "KIMI" in deployment
     assert "applies the `local` replay policy" in deployment
     ui = Path("apps/ui/app.py").read_text(encoding="utf-8")
-    assert "Compare planner strategies" in ui
-    assert "Custom API deployments" in ui
+    demo = Path("docs/demo.md").read_text(encoding="utf-8")
+    # The API now owns the recorded question; UI acceptance tests verify it is
+    # displayed verbatim instead of requiring a second hard-coded copy here.
+    assert "Compare planner strategies" in demo
+    assert "docs/demo.md" in readme
+    assert "在线 API" in ui and "离线示例" in ui
     assert "catalog entry is empty" not in ui
 
 

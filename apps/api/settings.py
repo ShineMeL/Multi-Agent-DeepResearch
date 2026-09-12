@@ -29,6 +29,7 @@ class ServiceSettings(BaseSettings):
     allowed_run_purposes: tuple[RunPurpose, ...] = ("demo", "test")
     allowed_budget_presets: tuple[Literal["low", "medium", "high"], ...] = ("low", "medium")
     daily_cost_limit_usd: Decimal = Decimal("5.00")
+    local_unpriced_live: bool = False
     session_signing_key: SecretStr
     cookie_secure: bool = False
     trusted_proxy_cidrs: tuple[str, ...] = ()
@@ -73,6 +74,10 @@ class ServiceSettings(BaseSettings):
 
     @model_validator(mode="after")
     def consistent_policy(self) -> Self:
+        if self.local_unpriced_live and (
+            self.deployment_access_profile != "local" or "benchmark" in self.allowed_run_purposes
+        ):
+            raise ValueError("unpriced live runs are local demos only")
         for values in (
             self.allowed_execution_modes,
             self.allowed_provider_profile_ids,
@@ -136,6 +141,7 @@ class ServiceSettings(BaseSettings):
             allowed_run_purposes=frozenset(self.allowed_run_purposes),
             allowed_budget_presets=frozenset(self.allowed_budget_presets),
             budget_presets={name: RunBudget.preset(name) for name in self.allowed_budget_presets},
+            local_unpriced_live=self.local_unpriced_live,
         )
 
     def loaded_secret_values(self) -> tuple[str, ...]:

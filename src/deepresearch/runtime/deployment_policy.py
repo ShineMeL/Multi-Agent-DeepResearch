@@ -24,8 +24,13 @@ class DeploymentPolicy:
     allowed_run_purposes: frozenset[RunPurpose]
     allowed_budget_presets: frozenset[Literal["low", "medium", "high"]]
     budget_presets: Mapping[str, RunBudget]
+    local_unpriced_live: bool = False
 
     def __post_init__(self) -> None:
+        if self.local_unpriced_live and (
+            self.forced_access_profile != "local" or "benchmark" in self.allowed_run_purposes
+        ):
+            raise ValueError("unpriced live runs are local demos only")
         if not self.allowed_execution_modes:
             raise ValueError("allowed_execution_modes must not be empty")
         if not self.allowed_provider_profile_ids:
@@ -45,9 +50,18 @@ class DeploymentPolicy:
         self._validate_request(config.request)
         if config.request.access_profile != self.forced_access_profile:
             raise PolicyViolation("access profile has not been normalized")
-        preset = self.budget_presets[config.request.budget_preset]
+        preset = self.budget_for_request(config.request)
         if config.budget.model_dump(mode="json") != preset.model_dump(mode="json"):
             raise PolicyViolation("budget does not match canonical preset")
+
+    def budget_for_request(self, request: ResearchRequest) -> RunBudget:
+        self._validate_request(request)
+        preset = self.budget_presets[request.budget_preset].model_copy(deep=True)
+        if self.local_unpriced_live and request.execution_mode == "live":
+            # Missing prices are unknown, never free. Keep every non-monetary
+            # limit; replay's frozen request/budget identity is unchanged.
+            return preset.model_copy(update={"max_cost_usd": None})
+        return preset
 
     def _validate_request(self, request: ResearchRequest) -> None:
         if request.execution_mode not in self.allowed_execution_modes:
