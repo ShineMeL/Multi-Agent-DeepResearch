@@ -39,9 +39,7 @@ def test_compose_packages_api_ui_and_postgres_without_embedded_secrets():
 
     assert environment["LANGGRAPH_STRICT_MSGPACK"] == "true"
     assert environment["DEPLOYMENT_ACCESS_PROFILE"] == "local"
-    assert environment["PROVIDER_PROFILE_CATALOG_PATH"] == (
-        "/app/deploy/replay/profiles.json"
-    )
+    assert environment["PROVIDER_PROFILE_CATALOG_PATH"] == ("/app/deploy/replay/profiles.json")
     assert environment["PRICING_CATALOG_PATH"] == "/app/deploy/replay/pricing.json"
     assert json.loads(environment["ALLOWED_EXECUTION_MODES"]) == ["replay"]
     assert json.loads(environment["ALLOWED_PROVIDER_PROFILE_IDS"]) == ["replay-default"]
@@ -57,12 +55,8 @@ def test_compose_packages_api_ui_and_postgres_without_embedded_secrets():
 def test_compose_publishes_local_services_only_on_loopback():
     config = yaml.safe_load(Path("docker-compose.yml").read_text(encoding="utf-8"))
 
-    assert config["services"]["api"]["ports"] == [
-        "127.0.0.1:${API_HOST_PORT:-8000}:8000"
-    ]
-    assert config["services"]["ui"]["ports"] == [
-        "127.0.0.1:${UI_HOST_PORT:-8501}:8501"
-    ]
+    assert config["services"]["api"]["ports"] == ["127.0.0.1:${API_HOST_PORT:-8000}:8000"]
+    assert config["services"]["ui"]["ports"] == ["127.0.0.1:${UI_HOST_PORT:-8501}:8501"]
     assert "ports" not in config["services"]["postgres"]
 
 

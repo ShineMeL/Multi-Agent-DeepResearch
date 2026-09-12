@@ -35,6 +35,19 @@ python -m uv run python -m scripts.run_demo
 证据不足不能通过改标签变成充分；本次没有降低证据充分性阈值。
 Windows 的回放文件必须保持 LF，不能通过重新生成哈希来掩盖 CRLF 变化。
 
+## 一条命令验收 Demo
+
+服务启动后，在另一个终端执行：
+
+```powershell
+python -m uv run python -m scripts.smoke_replay --api-url http://127.0.0.1:8000 --ui-url http://127.0.0.1:8501 --timeout 90
+```
+
+成功时输出 `ok: true`、`stop_reason: SUFFICIENT`、`is_partial: false` 和三个下载文件的
+SHA-256。它会真正创建一次离线研究，检查 API、页面健康接口、完整事件流、零费用和下载完整性，
+不会切换在线模式。超时或失败会返回非零退出码；已接受但未结束的任务会尝试取消，记录不会删除。
+自定义端口时同步修改命令中的地址。这个命令不替代浏览器交互或付费 Provider 验收。
+
 ## 接入 Kimi 与 Tavily
 
 如果 `.env.demo` 不存在，将 `.env.demo.example` 复制为 `.env.demo`，在编辑器中填写：
@@ -89,6 +102,8 @@ Kimi 默认采用独立的 `kimi-instant` 适配器，支持 `kimi-k2.5` / `kimi
   USD 显示 Unknown，不能据此认为免费或保证美元费用上限。公开服务和 Benchmark 仍要求完整定价。
 - `AUTHENTICATION`：检查密钥是否有效、区域/域名是否匹配。`RATE_LIMITED`：检查配额并稍后重试。
 - `PLAN_INVALID`：模型计划未通过结构/可执行性校验；缩小问题后重试。
+- `DEPLOYMENT_POLICY_VIOLATION`：管理员未允许 Demo 用途或兼容的预算，不能通过补填密钥解决。
+  固定离线样例需要允许中等预算；页面会停用不满足条件的提交入口。
 - 网页不可访问或证据不足时可能只得到部分报告；这应显式呈现，不能伪造引用。
 - 真正的中断续跑仍有限制；页面上的继续能力以服务器响应为准。
 - 本文的接口回归测试使用受控 HTTP 响应，不能替代真实密钥/额度的在线验收。
