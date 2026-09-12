@@ -99,3 +99,52 @@ No online/paid provider call was made.
   imports, credential collection, exception strings, or secret-bearing capability fields exist.
 - Known gap: no paid live-provider smoke call was authorized or attempted. The live request is
   verified at the HTTP boundary with a mock transport; controller owns real adapter validation.
+
+## Review fix round
+
+Review found two uncovered interleavings: a contradictory partial `SUFFICIENT` view inherited
+success wording, and an SSE EOF terminal GET was intentionally consumed inside the HTTP event
+iterator while an earlier running poll kept the next UI status read five seconds away.
+
+RED:
+
+```text
+python -m uv run --no-sync pytest \
+  tests/integration/replay/test_showcase_ui.py::test_run_status_message_never_labels_partial_or_failed_as_success \
+  tests/integration/replay/test_showcase_ui.py::test_partial_completed_sufficient_is_never_rendered_as_success \
+  tests/integration/replay/test_showcase_ui.py::test_reader_completion_forces_one_immediate_final_status_after_running_poll -q
+3 failed, 9 passed, 1 warning in 2.83s
+exit 1
+```
+
+The failures showed the exact defects: partial `SUFFICIENT` returned the success sentence, the
+AppTest had no incomplete warning, and the session view remained `running` after SSE completion.
+
+GREEN:
+
+```text
+python -m uv run --no-sync pytest <the three review regression selections above> -q
+12 passed, 1 warning in 2.08s
+exit 0
+
+python -m uv run --no-sync pytest tests/contracts/ui \
+  tests/integration/replay/test_showcase_ui.py -q
+55 passed, 1 warning in 5.16s
+exit 0
+
+python -m uv run --no-sync ruff check apps/ui tests/contracts/ui \
+  tests/integration/replay/test_showcase_ui.py --no-cache
+All checks passed!
+
+python -m uv run --no-sync pyright apps/ui
+0 errors, 0 warnings, 0 informations
+
+git diff --check
+exit 0
+```
+
+The Starlette `httpx` TestClient deprecation remains visible as the recorded dependency warning;
+dependencies and warning handling were not changed. `ShowcaseSession` now observes each event
+reader completion once and forces exactly one immediate background status read when its current
+view is absent/running. A terminal response then stops polling. `_run_panel` no longer carries the
+unused `watching_at_render` argument. Partial state is checked before any stop-reason success copy.

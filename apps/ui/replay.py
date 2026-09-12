@@ -146,6 +146,7 @@ class ShowcaseSession:
     _next_poll: float = 0
     _force_refresh: bool = False
     _paused: bool = False
+    _reader_completion_observed: bool = True
 
     @property
     def _poll_allowed(self) -> bool:
@@ -273,6 +274,7 @@ class ShowcaseSession:
             return
         self.drain()
         self.stream_error = None
+        self._reader_completion_observed = False
         self.finished.clear()
         run_id, cursor = self.run_id, self.cursor
         api, queue, finished = self.api, self._queue, self.finished
@@ -314,9 +316,20 @@ class ShowcaseSession:
             try:
                 item = self._queue.get_nowait()
             except Empty:
-                return
+                break
             if isinstance(item, Exception):
                 self.stream_error = item
             elif item.seq > self.cursor:
                 self.events.append(item)
                 self.cursor = item.seq
+        if self.finished.is_set() and not self._reader_completion_observed:
+            self._reader_completion_observed = True
+            if self.stream_error is None and (
+                self.view is None or self.view.status in {"queued", "running"}
+            ):
+                # SSE's EOF terminal check belongs to the HTTP client and is
+                # intentionally not exposed as a RunView. Override a previous
+                # running poll deadline once so the UI promptly drains the
+                # authoritative final view without moving HTTP into Streamlit.
+                self._force_refresh = True
+                self._next_poll = 0

@@ -94,6 +94,8 @@ def _run_status_message(view: RunView) -> str:
         "BLOCKED": "研究受阻",
     }
     if view.is_partial:
+        if view.stop_reason == "SUFFICIENT":
+            return "研究已结束，但结果不完整"
         return reasons.get(view.stop_reason or "", "研究已结束，但结果不完整")
     if view.stop_reason is not None and view.stop_reason != "SUFFICIENT":
         return reasons[view.stop_reason]
@@ -255,9 +257,7 @@ def _results(session: ShowcaseSession, view: RunView) -> None:
         st.info("Report is not yet available.")
 
 
-def _run_panel(
-    session: ShowcaseSession, watching_at_render: bool, automatic_at_render: bool = False
-) -> None:
+def _run_panel(session: ShowcaseSession, automatic_at_render: bool = False) -> None:
     if session.run_id is None:
         return
     session.drain()
@@ -414,7 +414,7 @@ def main() -> None:
                 st.error(_error_message(error))
     automatic = session.automatic_refresh
     st.fragment(run_every=1 if automatic else None)(_run_panel)(
-        session, watching_at_render=session.watching, automatic_at_render=automatic
+        session, automatic_at_render=automatic
     )
 
 

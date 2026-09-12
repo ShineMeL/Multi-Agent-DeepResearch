@@ -137,6 +137,7 @@ def test_research_replay_payload_selects_supported_production_composition():
         ("queued", None, False, "正在研究，尚未结束"),
         ("running", None, False, "正在研究，尚未结束"),
         ("completed", "SUFFICIENT", False, "信息已充分，研究正常完成"),
+        ("completed", "SUFFICIENT", True, "研究已结束，但结果不完整"),
         ("completed", "PLATEAU", True, "新增信息不足，已返回现有证据的部分结果"),
         ("completed", "BUDGET_EXHAUSTED", True, "已达到预算/时间上限"),
         ("completed", "BLOCKED", True, "研究受阻"),
@@ -151,6 +152,25 @@ def test_run_status_message_never_labels_partial_or_failed_as_success(
     current = view(status)
     current.update(stop_reason=stop_reason, is_partial=partial)
     assert _run_status_message(RunView.model_validate(current)) == expected
+
+
+def test_partial_completed_sufficient_is_never_rendered_as_success():
+    current = view()
+    current.update(stop_reason="SUFFICIENT", is_partial=True)
+
+    def respond(request):
+        assert request.url.path == "/capabilities"
+        return httpx.Response(200, json=capabilities(live_available=False))
+
+    with ResearchApiClient("http://api", transport=httpx.MockTransport(respond)) as client:
+        session = ShowcaseSession(client, run_id="r1", view=RunView.model_validate(current))
+        app = AppTest.from_file(str(Path("apps/ui/app.py").resolve()), default_timeout=5)
+        app.session_state["showcase"] = session
+        app.run()
+
+    assert not app.exception
+    assert not app.success
+    assert any("结果不完整" in item.value for item in app.warning)
 
 
 @pytest.mark.parametrize(
@@ -468,7 +488,7 @@ from apps.ui.app import _run_panel
 if not st.session_state.get("rendered"):
     st.session_state["rendered"] = True
     st.button("Start replay", disabled=True)
-    _run_panel(st.session_state["showcase"], watching_at_render=True)
+    _run_panel(st.session_state["showcase"])
 else:
     st.button("Start replay", disabled=False)
 """,
@@ -500,6 +520,36 @@ def test_final_run_stops_status_reads_even_after_many_refresh_ticks(status):
         assert len(calls) == 1
         assert not session.automatic_refresh
         assert session.view.status == status
+
+
+def test_reader_completion_forces_one_immediate_final_status_after_running_poll():
+    status_calls = []
+
+    def respond(request):
+        if request.url.path.endswith("/events"):
+            return httpx.Response(200, content=frame(1, "completed", kind="run_completed"))
+        status_calls.append(request)
+        status = "running" if len(status_calls) == 1 else "completed"
+        return httpx.Response(200, json=view(status))
+
+    with ResearchApiClient("http://api", transport=httpx.MockTransport(respond)) as client:
+        session = ShowcaseSession(client, run_id="r1")
+        session.refresh(now=0)
+        assert session.poll_finished.wait(2)
+        session.drain(now=0)
+        assert session.view is not None and session.view.status == "running"
+
+        session.watch()
+        assert session.finished.wait(2)
+        session.refresh(now=1)
+        assert session.poll_finished.wait(2)
+        session.drain(now=1)
+
+        assert session.view is not None and session.view.status == "completed"
+        for tick in range(2, 3600):
+            session.refresh(now=tick)
+        assert len(status_calls) == 3
+        assert not session.automatic_refresh
 
 
 def test_poll_transport_failures_back_off_then_require_explicit_retry():
