@@ -87,7 +87,8 @@ def _base_url(value: str) -> str:
         or parsed.query
         or parsed.fragment
         or parsed.path not in {"", "/"}
-        or port is None and ":" in parsed.netloc.removeprefix("[").removesuffix("]")
+        or port is None
+        and ":" in parsed.netloc.removeprefix("[").removesuffix("]")
     ):
         raise SmokeError("INVALID_BASE_URL")
     return value.rstrip("/")
@@ -110,9 +111,7 @@ async def _response_bytes(
     headers: dict[str, str] | None = None,
 ) -> tuple[httpx.Headers, bytes]:
     try:
-        async with client.stream(
-            method, path, json=json_body, headers=headers
-        ) as response:
+        async with client.stream(method, path, json=json_body, headers=headers) as response:
             if response.status_code not in expected:
                 raise SmokeError("HTTP_ERROR")
             length = response.headers.get("content-length")
@@ -250,9 +249,7 @@ async def _accept_replay(
     ):
         raise SmokeError("API_NOT_READY")
 
-    capabilities = _model(
-        DemoCapabilities, await _json_request(client, "GET", "/capabilities")
-    )
+    capabilities = _model(DemoCapabilities, await _json_request(client, "GET", "/capabilities"))
     example = capabilities.replay_example
     profile = next(
         (
@@ -266,7 +263,11 @@ async def _accept_replay(
         ),
         None,
     )
-    if example is None or profile is None or example.budget_preset not in capabilities.budget_presets:
+    if (
+        example is None
+        or profile is None
+        or example.budget_preset not in capabilities.budget_presets
+    ):
         raise SmokeError("NO_REPLAY_CAPABILITY")
 
     payload: dict[str, object] = {
@@ -371,8 +372,7 @@ async def _accept_replay(
         or {item.profile_id for item in manifest.provider_profiles} != {profile.profile_id}
         or not required_ids.issubset(set(manifest.artifact_ids))
         or any(
-            call.estimated_cost_usd not in {None, Decimal(0)}
-            for call in manifest.provider_calls
+            call.estimated_cost_usd not in {None, Decimal(0)} for call in manifest.provider_calls
         )
     ):
         raise SmokeError("MANIFEST_MISMATCH", run_id=run_id, status=final.status)
@@ -473,7 +473,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         exit_code = 0
     except SmokeError as error:
         payload = error.payload()
-        exit_code = 124 if error.code == "TIMEOUT" else 2 if error.code.startswith("INVALID_") else 1
+        exit_code = (
+            124 if error.code == "TIMEOUT" else 2 if error.code.startswith("INVALID_") else 1
+        )
     print(json.dumps(payload, ensure_ascii=True, allow_nan=False, separators=(",", ":")))
     return exit_code
 

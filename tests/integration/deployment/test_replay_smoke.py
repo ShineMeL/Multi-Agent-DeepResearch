@@ -104,8 +104,10 @@ async def test_real_service_replay_proves_terminal_artifacts_and_zero_cost(
 @pytest.mark.parametrize(
     ("capabilities", "code"),
     [
-        ({"profiles": [], "replay_example": None, "budget_presets": [], "unpriced_live": False},
-         "NO_REPLAY_CAPABILITY"),
+        (
+            {"profiles": [], "replay_example": None, "budget_presets": [], "unpriced_live": False},
+            "NO_REPLAY_CAPABILITY",
+        ),
         ({"profiles": "not-a-list"}, "MALFORMED_RESPONSE"),
     ],
 )
@@ -175,15 +177,17 @@ async def test_accepted_run_timeout_attempts_bounded_owner_scoped_cancel():
             return httpx.Response(
                 200,
                 json={
-                    "profiles": [{
-                        "profile_id": "replay-default",
-                        "execution_mode": "replay",
-                        "available": True,
-                        "reason": None,
-                        "workflow_id": "research-v1",
-                        "planner_id": "P1",
-                        "ranker_id": "R1",
-                    }],
+                    "profiles": [
+                        {
+                            "profile_id": "replay-default",
+                            "execution_mode": "replay",
+                            "available": True,
+                            "reason": None,
+                            "workflow_id": "research-v1",
+                            "planner_id": "P1",
+                            "ranker_id": "R1",
+                        }
+                    ],
                     "replay_example": {
                         "question": "Compare planner strategies",
                         "report_language": "en",

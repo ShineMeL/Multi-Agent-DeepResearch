@@ -39,7 +39,27 @@ def test_ci_keeps_provider_secrets_out_of_verification_and_gates_online():
     assert "uv sync --all-extras --locked" in commands
     assert "ruff check ." in commands and "pyright src apps benchmarks experiments\n" in commands
     assert "docker compose config" in commands
-    assert "docker build" in commands
+    steps = verify["steps"]
+
+    def command_index(fragment: str) -> int:
+        return next(index for index, step in enumerate(steps) if fragment in step.get("run", ""))
+
+    build_index = command_index("docker compose build --build-arg")
+    up_index = command_index("docker compose up -d --wait --wait-timeout 180")
+    replay_index = command_index("python -m scripts.smoke_replay")
+    cleanup_index = command_index("docker compose down --volumes --remove-orphans")
+    assert build_index < up_index < replay_index < cleanup_index
+    assert "timeout 240s" in steps[up_index]["run"]
+    assert steps[cleanup_index]["if"] == "always()"
+    assert verify["env"]["COMPOSE_PROJECT_NAME"] == (
+        "deepresearch-ci-${{ github.run_id }}-${{ github.run_attempt }}"
+    )
+
+    test_step = steps[command_index(' -m "not online"')]
+    assert "DATABASE_URL" not in test_step["env"]
+    assert test_step["env"]["DEEPRESEARCH_TEST_POSTGRES_URL"].startswith(
+        "postgresql+asyncpg://deepresearch:ci-only@127.0.0.1:5432/"
+    )
     smoke = workflow["jobs"]["online-smoke"]
     assert smoke["if"] == (
         "github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'"
