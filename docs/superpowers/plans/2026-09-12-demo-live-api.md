@@ -43,13 +43,24 @@ User-authorized scope: fix confusing offline completion status and enable API-ba
   Updated deployment plus full-service replay suite: 52 passed.
 - First full run: 1887 passed, 10 skipped, 2 failed. Both failures asserted retired
   wiring (global replay boundary, UI-owned question literal); the tests now cover
-  per-run boundary selection and API-owned example documentation. Full rerun is pending.
+  per-run boundary selection and API-owned example documentation. Full rerun:
+  **1895 passed, 10 skipped, 1 existing Starlette/httpx deprecation warning**
+  (`python -m uv run --no-sync pytest -q --tb=short`, 428.86 seconds).
 - Production Pyright and Ruff lint pass. Whole-repository formatting has existing
   drift (127 files on the first check); unrelated code was not mechanically rewritten.
 - Actual paid Kimi/Tavily smoke remains unverified: no fresh local credentials.
   External HTTP is mocked in online integration tests; replay never substitutes
   for live verification. Browser automation is unavailable, so UI behavior uses
   Streamlit AppTest and real HTTP service acceptance, not screenshot evidence.
+- Final real-API Streamlit acceptance run `48d897cb-2576-4687-af4e-95e513ef9804`:
+  completed/SUFFICIENT/nonpartial, 21 events, all three downloads present, USD 0,
+  automatic polling stopped; switching to online shows the editable form and
+  disables submission with a model/search credential explanation. The launcher
+  is serving the updated demo at `http://127.0.0.1:8501`.
+- Whole-branch review found no Critical/Important issue in the shipped local-demo
+  configuration. The button-label documentation issue is fixed. Custom deployments
+  permitting only `high` budgets or no `demo` purpose remain a minor discovery/UI
+  compatibility limitation; the launcher always supplies supported demo settings.
 
 ## Additional findings resolved during implementation
 
