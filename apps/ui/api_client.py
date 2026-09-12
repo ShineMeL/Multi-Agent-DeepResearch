@@ -20,6 +20,37 @@ ArtifactKind = Literal["report", "evidence", "manifest"]
 _TERMINAL = {"interrupted", "completed", "failed", "cancelled"}
 
 
+class CapabilityProfile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    profile_id: str
+    execution_mode: Literal["replay", "live"]
+    available: bool
+    reason: str | None
+    workflow_id: Literal["baseline-v1", "research-v1"]
+    planner_id: Literal["P0", "P1", "P2"]
+    ranker_id: Literal["R0", "R1", "R2"]
+
+
+class ReplayExample(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question: str
+    report_language: str
+    source_languages: tuple[str, ...]
+    budget_preset: Literal["low", "medium"]
+    seed: int
+
+
+class DemoCapabilities(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    profiles: tuple[CapabilityProfile, ...]
+    replay_example: ReplayExample | None
+    budget_presets: tuple[Literal["low", "medium"], ...]
+    unpriced_live: bool
+
+
 class RunAccepted(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -102,6 +133,11 @@ class ResearchApiClient:
         )
         response.raise_for_status()
         return RunAccepted.model_validate_json(response.content)
+
+    def get_capabilities(self) -> DemoCapabilities:
+        response = self.client.get("/capabilities", timeout=5)
+        response.raise_for_status()
+        return DemoCapabilities.model_validate_json(response.content)
 
     def get_run(self, run_id: str) -> RunView:
         response = self.client.get(self._run_path(run_id), timeout=5)

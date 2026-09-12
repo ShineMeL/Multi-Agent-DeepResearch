@@ -10,10 +10,11 @@ from streamlit.testing.v1 import AppTest
 
 from apps.api.main import create_app
 from apps.api.settings import ServiceSettings
-from apps.ui.api_client import ResearchApiClient, StreamReconnectExhausted
+from apps.ui.api_client import ResearchApiClient, RunView, StreamReconnectExhausted
+from apps.ui.app import _run_error_message, _run_status_message
 from apps.ui.replay import ShowcaseSession, replay_payload, research_replay_payload
 from deepresearch.domain import RunEvent
-from tests.contracts.ui.test_api_client import frame, view
+from tests.contracts.ui.test_api_client import capabilities, frame, view
 from tests.unit.runtime.test_manager import ControlledRunner
 
 
@@ -130,6 +131,132 @@ def test_research_replay_payload_selects_supported_production_composition():
     assert payload["request"]["execution_mode"] == "replay"
 
 
+@pytest.mark.parametrize(
+    ("status", "stop_reason", "partial", "expected"),
+    [
+        ("queued", None, False, "正在研究，尚未结束"),
+        ("running", None, False, "正在研究，尚未结束"),
+        ("completed", "SUFFICIENT", False, "信息已充分，研究正常完成"),
+        ("completed", "PLATEAU", True, "新增信息不足，已返回现有证据的部分结果"),
+        ("completed", "BUDGET_EXHAUSTED", True, "已达到预算/时间上限"),
+        ("completed", "BLOCKED", True, "研究受阻"),
+        ("failed", None, True, "研究失败"),
+        ("cancelled", None, True, "研究已取消"),
+        ("interrupted", None, True, "研究已中断"),
+    ],
+)
+def test_run_status_message_never_labels_partial_or_failed_as_success(
+    status, stop_reason, partial, expected
+):
+    current = view(status)
+    current.update(stop_reason=stop_reason, is_partial=partial)
+    assert _run_status_message(RunView.model_validate(current)) == expected
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        ("REPLAY_MISS", "原始离线示例"),
+        ("AUTHENTICATION", "API 密钥被上游拒绝"),
+        ("UNRECOGNIZED_CODE", "查看错误代码"),
+    ],
+)
+def test_run_errors_are_actionable_without_rendering_raw_exceptions(code, expected):
+    assert expected in _run_error_message(code)
+
+
+def test_app_uses_fixed_server_replay_example_and_exposes_no_secret_fields():
+    calls = []
+
+    def respond(request):
+        calls.append(request.url.path)
+        return httpx.Response(200, json=capabilities(live_available=False))
+
+    with ResearchApiClient("http://api", transport=httpx.MockTransport(respond)) as client:
+        session = ShowcaseSession(client)
+        app = AppTest.from_file(str(Path("apps/ui/app.py").resolve()), default_timeout=5)
+        app.session_state["showcase"] = session
+        app.run()
+
+    assert not app.exception
+    assert calls == ["/capabilities"]
+    assert any("Compare planner strategies" in item.value for item in app.markdown)
+    assert not app.text_area
+    assert not app.text_input
+    assert not app.number_input
+    assert all("key" not in item.label.lower() for item in [*app.text_input, *app.text_area])
+    assert next(button for button in app.button if button.label == "开始研究").disabled is False
+
+
+def test_unavailable_live_mode_explains_server_configuration_and_disables_submit():
+    def respond(request):
+        return httpx.Response(200, json=capabilities(live_available=False))
+
+    with ResearchApiClient("http://api", transport=httpx.MockTransport(respond)) as client:
+        session = ShowcaseSession(client)
+        app = AppTest.from_file(str(Path("apps/ui/app.py").resolve()), default_timeout=5)
+        app.session_state["showcase"] = session
+        app.run()
+        next(item for item in app.radio if item.label == "运行模式").set_value("在线 API").run()
+
+    assert not app.exception
+    assert next(button for button in app.button if button.label == "开始研究").disabled
+    configuration = " ".join(item.value for item in [*app.warning, *app.info, *app.error])
+    assert "MODEL_API_KEY" in configuration
+    assert "SEARCH_API_KEY" in configuration
+    assert ".env.demo" in configuration
+    assert "python -m scripts.run_demo" in configuration
+    assert not app.text_input
+
+
+def test_live_mode_posts_online_question_and_server_selected_composition():
+    posted, capability_calls = [], []
+
+    def respond(request):
+        if request.url.path == "/capabilities":
+            capability_calls.append(request)
+            return httpx.Response(200, json=capabilities())
+        if request.url.path == "/runs":
+            posted.append(json.loads(request.content))
+            return httpx.Response(
+                202,
+                json={
+                    "run_id": "live-1",
+                    "thread_id": "live-1",
+                    "status": "queued",
+                    "events_url": "/runs/live-1/events",
+                },
+            )
+        if request.url.path.endswith("/events"):
+            return httpx.Response(200, content=frame(1, "completed", run_id="live-1"))
+        return httpx.Response(200, json={**view(), "run_id": "live-1", "thread_id": "live-1"})
+
+    with ResearchApiClient("http://api", transport=httpx.MockTransport(respond)) as client:
+        session = ShowcaseSession(client)
+        app = AppTest.from_file(str(Path("apps/ui/app.py").resolve()), default_timeout=5)
+        app.session_state["showcase"] = session
+        app.run()
+        next(item for item in app.radio if item.label == "运行模式").set_value("在线 API").run()
+        next(item for item in app.text_area if item.label == "研究问题").input("What changed?")
+        next(item for item in app.selectbox if item.label == "报告语言").set_value("zh")
+        next(item for item in app.selectbox if item.label == "预算").set_value("low")
+        next(button for button in app.button if button.label == "开始研究").click().run()
+
+    assert not app.exception
+    assert len(capability_calls) == 1
+    assert len(posted) == 1
+    assert posted[0]["request"]["execution_mode"] == "live"
+    assert posted[0]["request"]["question"] == "What changed?"
+    assert posted[0]["request"]["report_language"] == "zh"
+    assert posted[0]["request"]["provider_profile_id"] == "live-default"
+    assert posted[0]["workflow_id"] == "baseline-v1"
+    assert (posted[0]["planner_id"], posted[0]["ranker_id"], posted[0]["seed"]) == (
+        "P1",
+        "R1",
+        None,
+    )
+
+
 def test_app_submits_replay_shows_downloads_metrics_and_preserves_session():
     seen, keys = [], []
     manifest = {
@@ -147,14 +274,19 @@ def test_app_submits_replay_shows_downloads_metrics_and_preserves_session():
         report_artifact_id="report-id",
         evidence_graph_artifact_id="evidence-id",
         manifest_artifact_id="manifest-id",
+        stop_reason="SUFFICIENT",
     )
     current["final_usage"].update(input_tokens=42, total_tokens=42, wall_seconds=1.5)
 
     def respond(request):
         seen.append(request.url.path)
+        if request.url.path == "/capabilities":
+            return httpx.Response(200, json=capabilities(live_available=False))
         if request.url.path == "/runs":
             keys.append(request.headers["Idempotency-Key"])
-            assert json.loads(request.content)["request"]["execution_mode"] == "replay"
+            body = json.loads(request.content)
+            assert body["request"]["execution_mode"] == "replay"
+            assert body["request"]["question"] == "Compare planner strategies"
             return httpx.Response(
                 202,
                 json={
@@ -182,14 +314,16 @@ def test_app_submits_replay_shows_downloads_metrics_and_preserves_session():
         app.session_state["showcase"] = session
         app.run()
         assert not app.exception
-        assert any("research-v1" in info.value for info in app.info)
-        assert next(item for item in app.selectbox if item.label == "Budget").value == "medium"
-        app.text_area(key="question").input("Showcase question")
-        app.button(key="FormSubmitter:replay_request-Start replay").click().run()
+        assert any("固定录制" in info.value for info in app.info)
+        assert not app.text_area
+        app.button(key="FormSubmitter:research_request-开始研究").click().run()
         assert session.finished.wait(3)
+        app.run()
+        assert session.poll_finished.wait(3)
         app.run()
         assert not app.exception
         assert session.cursor == 2
+        assert any("信息已充分" in item.value for item in app.success)
         assert any(metric.label == "Tokens" and metric.value == "42" for metric in app.metric)
         assert any(
             metric.label == "Cost (USD)" and metric.value == "Unknown" for metric in app.metric
@@ -286,11 +420,11 @@ def test_app_resume_refusal_keeps_run_and_cancel_remains_available():
         app.run()
         assert session.poll_finished.wait(2)
         app.run()
-        next(button for button in app.button if button.label == "Resume").click().run()
+        next(button for button in app.button if button.label == "继续 / Resume").click().run()
         assert not app.exception
-        assert any("Checkpoint continuation is unavailable" in error.value for error in app.error)
+        assert any("不能继续该检查点" in error.value for error in app.error)
         app.run()
-        next(button for button in app.button if button.label == "Cancel").click().run()
+        next(button for button in app.button if button.label == "取消 / Cancel").click().run()
         assert not app.exception
         assert ("POST", "/runs/r1/resume") in seen
         assert ("POST", "/runs/r1/cancel") in seen
@@ -317,7 +451,9 @@ def test_active_run_metrics_use_durable_usage_before_final_usage_is_published():
         assert any(
             metric.label == "Time (seconds)" and metric.value == "2.00" for metric in app.metric
         )
-        assert not next(button for button in app.button if button.label == "Cancel").disabled
+        assert not next(
+            button for button in app.button if button.label == "取消 / Cancel"
+        ).disabled
 
 
 def test_fragment_completion_refreshes_form_outside_fragment():
@@ -339,6 +475,8 @@ else:
             default_timeout=5,
         )
         app.session_state["showcase"] = session
+        app.run()
+        assert session.poll_finished.wait(2)
         app.run()
         assert not app.exception
         assert not next(button for button in app.button if button.label == "Start replay").disabled

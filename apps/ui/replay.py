@@ -7,7 +7,14 @@ from time import monotonic
 from typing import Literal
 from uuid import uuid4
 
-from apps.ui.api_client import HTTPError, HTTPStatusError, ResearchApiClient, RunAccepted, RunView
+from apps.ui.api_client import (
+    DemoCapabilities,
+    HTTPError,
+    HTTPStatusError,
+    ResearchApiClient,
+    RunAccepted,
+    RunView,
+)
 from deepresearch.domain import FreshnessRequirement, ResearchRequest, RunEvent
 
 
@@ -77,6 +84,41 @@ def research_replay_payload(
     )
 
 
+def live_payload(
+    question: str,
+    *,
+    report_language: str = "en",
+    source_languages: tuple[str, ...] = ("en",),
+    budget_preset: Literal["low", "medium"] = "medium",
+    provider_profile_id: str = "live-default",
+    workflow_id: Literal["baseline-v1", "research-v1"] = "baseline-v1",
+    planner_id: Literal["P0", "P1", "P2"] = "P1",
+    ranker_id: Literal["R0", "R1", "R2"] = "R1",
+) -> dict[str, object]:
+    """Build an HTTP live request from a server-advertised composition."""
+    if not question.strip() or not provider_profile_id.strip():
+        raise ValueError("Question and live profile are required")
+    request = ResearchRequest(
+        question=question.strip(),
+        output_requirements={"answer_shape": "markdown"},
+        report_language=report_language,
+        source_languages=source_languages,
+        freshness_requirement=FreshnessRequirement(kind="none"),
+        execution_mode="live",
+        access_profile="showcase",
+        provider_profile_id=provider_profile_id.strip(),
+        run_purpose="demo",
+        budget_preset=budget_preset,
+    )
+    return {
+        "request": request.model_dump(mode="json"),
+        "workflow_id": workflow_id,
+        "planner_id": planner_id,
+        "ranker_id": ranker_id,
+        "seed": None,
+    }
+
+
 @dataclass
 class ShowcaseSession:
     """One browser session owns its cookie jar, cursor, and background event reader."""
@@ -93,6 +135,9 @@ class ShowcaseSession:
     poll_error: Exception | None = None
     poll_finished: Event = field(default_factory=Event)
     closed: bool = False
+    capabilities: DemoCapabilities | None = None
+    capability_error: Exception | None = None
+    _capabilities_attempted: bool = False
     _queue: Queue[RunEvent | Exception] = field(default_factory=Queue[RunEvent | Exception])
     _worker: Thread | None = None
     _poll_queue: Queue[RunView | Exception] = field(default_factory=Queue[RunView | Exception])
@@ -144,6 +189,19 @@ class ShowcaseSession:
         self._force_refresh = True
         self.poll_error = None
         self.stream_error = None
+
+    def load_capabilities(self, *, force: bool = False) -> DemoCapabilities | None:
+        """Cache one capability read per browser session unless explicitly refreshed."""
+        if self._capabilities_attempted and not force:
+            return self.capabilities
+        self._capabilities_attempted = True
+        try:
+            self.capabilities = self.api.get_capabilities()
+            self.capability_error = None
+        except (HTTPError, ValueError, RuntimeError) as error:
+            self.capabilities = None
+            self.capability_error = error
+        return self.capabilities
 
     def update_view(self, view: RunView, *, now: float | None = None) -> None:
         self.view = view

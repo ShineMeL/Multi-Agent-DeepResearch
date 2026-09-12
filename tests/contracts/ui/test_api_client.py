@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from apps.ui.api_client import ResearchApiClient, StreamReconnectExhausted
-from apps.ui.replay import replay_payload
+from apps.ui.replay import live_payload, replay_payload
 from deepresearch.domain import ResourceUsage
 
 
@@ -38,6 +38,40 @@ def frame(seq, status="running", *, run_id="r1", kind="node_completed"):
         "artifact_ids": [],
     }
     return f"id: {seq}\nevent: {kind}\ndata: {json.dumps(event)}\n\n".encode()
+
+
+def capabilities(*, live_available=True, unpriced_live=True):
+    return {
+        "profiles": [
+            {
+                "profile_id": "replay-default",
+                "execution_mode": "replay",
+                "available": True,
+                "reason": None,
+                "workflow_id": "research-v1",
+                "planner_id": "P1",
+                "ranker_id": "R1",
+            },
+            {
+                "profile_id": "live-default",
+                "execution_mode": "live",
+                "available": live_available,
+                "reason": None if live_available else "PROVIDER_NOT_CONFIGURED",
+                "workflow_id": "baseline-v1",
+                "planner_id": "P1",
+                "ranker_id": "R1",
+            },
+        ],
+        "replay_example": {
+            "question": "Compare planner strategies",
+            "report_language": "en",
+            "source_languages": ["en"],
+            "budget_preset": "medium",
+            "seed": 0,
+        },
+        "budget_presets": ["low", "medium"],
+        "unpriced_live": unpriced_live,
+    }
 
 
 class BrokenStream(httpx.SyncByteStream):
@@ -120,6 +154,56 @@ def test_replay_request_matches_strict_api_and_retains_cookie_for_all_routes():
     assert ("POST", "/runs/r1/resume") in seen
     assert ("POST", "/runs/r1/cancel") in seen
     assert seen[-1] == ("GET", "/runs/r1/artifacts/manifest")
+
+
+def test_capabilities_are_typed_and_fetched_with_the_session_owned_http_client():
+    def respond(request):
+        assert request.method == "GET"
+        assert request.url.path == "/capabilities"
+        return httpx.Response(200, json=capabilities(live_available=False))
+
+    with ResearchApiClient("http://api", transport=httpx.MockTransport(respond)) as client:
+        result = client.get_capabilities()
+
+    assert result.replay_example is not None
+    assert result.replay_example.question == "Compare planner strategies"
+    assert result.profiles[1].available is False
+    assert result.profiles[1].reason == "PROVIDER_NOT_CONFIGURED"
+
+
+def test_live_payload_posts_server_selected_baseline_profile_without_seed():
+    payload = live_payload(
+        "What changed?",
+        report_language="zh",
+        budget_preset="low",
+        provider_profile_id="live-default",
+        workflow_id="baseline-v1",
+        planner_id="P1",
+        ranker_id="R1",
+    )
+
+    assert payload == {
+        "request": {
+            "question": "What changed?",
+            "output_requirements": {"answer_shape": "markdown"},
+            "report_language": "zh",
+            "source_languages": ["en"],
+            "freshness_requirement": {
+                "kind": "none",
+                "published_after": None,
+                "retrieved_within_days": None,
+            },
+            "execution_mode": "live",
+            "access_profile": "showcase",
+            "provider_profile_id": "live-default",
+            "run_purpose": "demo",
+            "budget_preset": "low",
+        },
+        "workflow_id": "baseline-v1",
+        "planner_id": "P1",
+        "ranker_id": "R1",
+        "seed": None,
+    }
 
 
 def test_client_reconnects_from_last_durable_sequence(monkeypatch):
