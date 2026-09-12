@@ -16,7 +16,7 @@ python -m uv run python -m scripts.run_demo
 
 ## 离线示例
 
-选择「离线示例」并点击「开始离线示例」。问题固定为
+选择「离线示例」并点击「开始研究」。问题固定为
 `Compare planner strategies`，英语报告、中等预算、seed 0。
 这是真实工作流读取已校验的录制数据，不联网，也不产生 API 费用；不是任意问题问答。
 

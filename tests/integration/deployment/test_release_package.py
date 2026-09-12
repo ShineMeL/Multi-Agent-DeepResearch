@@ -98,6 +98,8 @@ def test_operator_documentation_describes_release_boundaries() -> None:
     # The API now owns the recorded question; UI acceptance tests verify it is
     # displayed verbatim instead of requiring a second hard-coded copy here.
     assert "Compare planner strategies" in demo
+    assert "「开始研究」" in demo
+    assert "「开始离线示例」" not in demo
     assert "docs/demo.md" in readme
     assert "在线 API" in ui and "离线示例" in ui
     assert "catalog entry is empty" not in ui
