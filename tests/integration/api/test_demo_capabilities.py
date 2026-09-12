@@ -79,6 +79,8 @@ def test_missing_live_credential_is_unavailable_without_exposing_secrets(tmp_pat
     from apps.api.demo import prepare_demo
 
     prepared = prepare_demo(Path.cwd(), tmp_path, environ={"MODEL_API_KEY": "fixture-model-secret"})
+    monkeypatch.setenv("MODEL_API_KEY", "fixture-model-secret")
+    monkeypatch.delenv("SEARCH_API_KEY", raising=False)
     with TestClient(create_app(prepared.settings), client=("127.0.0.1", 1234)) as client:
         response = client.get("/capabilities")
         live = next(p for p in response.json()["profiles"] if p["execution_mode"] == "live")
@@ -106,3 +108,54 @@ def test_demo_discovery_omits_budgets_that_the_thin_client_cannot_submit(tmp_pat
     with TestClient(create_app(current), client=("127.0.0.1", 1234)) as client:
         discovered = DemoCapabilities.model_validate_json(client.get("/capabilities").content)
         assert discovered.budget_presets == ("low", "medium")
+
+
+@pytest.mark.parametrize(
+    ("budgets", "purposes"),
+    [(("high",), ("demo",)), (("low",), ("demo",)), (("medium",), ("test",))],
+)
+def test_replay_capability_is_unavailable_when_the_fixed_request_is_forbidden(
+    tmp_path, budgets, purposes
+):
+    current = settings(tmp_path, allowed_budget_presets=budgets, allowed_run_purposes=purposes)
+    with TestClient(create_app(current), client=("127.0.0.1", 1234)) as client:
+        data = client.get("/capabilities").json()
+        assert data["profiles"][0]["available"] is False
+        assert data["profiles"][0]["reason"] == "DEPLOYMENT_POLICY_VIOLATION"
+        assert data["replay_example"] is None
+        rejected = client.post("/runs", json=research_replay_payload("Compare planner strategies"))
+        assert rejected.status_code == 422
+        assert rejected.json()["code"] == "DEPLOYMENT_POLICY_VIOLATION"
+
+
+@pytest.mark.parametrize(
+    ("budgets", "purposes", "available", "reason"),
+    [
+        (("high",), ("demo",), False, "DEPLOYMENT_POLICY_VIOLATION"),
+        (("medium",), ("test",), False, "DEPLOYMENT_POLICY_VIOLATION"),
+        (("low",), ("demo",), True, None),
+    ],
+)
+def test_live_capability_requires_both_provider_configuration_and_demo_policy(
+    tmp_path, monkeypatch, budgets, purposes, available, reason
+):
+    from apps.api.demo import prepare_demo
+
+    monkeypatch.setenv("MODEL_API_KEY", "fixture-model-key")
+    monkeypatch.setenv("SEARCH_API_KEY", "fixture-search-key")
+    prepared = prepare_demo(Path.cwd(), tmp_path, environ={})
+    values = prepared.settings.model_dump()
+    values.update(allowed_budget_presets=budgets, allowed_run_purposes=purposes)
+    with TestClient(
+        create_app(ServiceSettings.model_validate(values)), client=("127.0.0.1", 1234)
+    ) as client:
+        response = client.get("/capabilities")
+        assert response.status_code == 200
+        data = response.json()
+        live = next(profile for profile in data["profiles"] if profile["execution_mode"] == "live")
+        assert live["available"] is available
+        assert live["reason"] == reason
+        # Configuration discovery must never make an upstream request or expose
+        # the dummy credentials. This test deliberately does not submit live.
+        assert "fixture-model-key" not in str(data)
+        assert "fixture-search-key" not in str(data)

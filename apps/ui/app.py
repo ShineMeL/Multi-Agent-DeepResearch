@@ -311,10 +311,30 @@ def _run_panel(session: ShowcaseSession, automatic_at_render: bool = False) -> N
 def _profile_for(
     capabilities: DemoCapabilities, execution_mode: Literal["replay", "live"]
 ) -> CapabilityProfile | None:
-    return next(
-        (profile for profile in capabilities.profiles if profile.execution_mode == execution_mode),
-        None,
+    candidates = tuple(
+        profile for profile in capabilities.profiles if profile.execution_mode == execution_mode
     )
+    return next(
+        (profile for profile in candidates if profile.available),
+        candidates[0] if candidates else None,
+    )
+
+
+def _mode_unavailable_message(mode: Literal["replay", "live"], reason: str) -> str:
+    if reason == "DEPLOYMENT_POLICY_VIOLATION":
+        return (
+            "服务端策略未开放 Demo 用途或匹配的预算（DEPLOYMENT_POLICY_VIOLATION）。"
+            "请管理员检查允许的任务用途与预算；固定离线录制需要 medium 预算。"
+        )
+    if mode == "replay":
+        return f"离线配置当前不可用：{reason}。请检查服务端录制配置后刷新。"
+    if reason == "PROVIDER_NOT_CONFIGURED":
+        return (
+            f"在线模式不可用：{reason}。请在 API 主机的 `.env.demo` 配置 "
+            "`MODEL_API_KEY` 与 `SEARCH_API_KEY`（Tavily），然后重启 "
+            "`python -m scripts.run_demo`。"
+        )
+    return f"在线配置当前不可用：{reason}。请管理员检查服务端 Provider 配置后刷新。"
 
 
 def _fixed_replay_summary(example: ReplayExample) -> None:
@@ -350,9 +370,13 @@ def main() -> None:
         execution_mode: Literal["replay", "live"] = "replay" if mode_label == "离线示例" else "live"
         profile = _profile_for(capabilities, execution_mode)
         example = capabilities.replay_example
-        available = profile is not None and profile.available
+        available = profile is not None and profile.available and bool(capabilities.budget_presets)
         if execution_mode == "replay":
-            available = available and example is not None
+            available = (
+                available
+                and example is not None
+                and example.budget_preset in capabilities.budget_presets
+            )
             st.info("离线模式只运行服务端公布的固定录制，不回答任意问题。")
             if example is not None:
                 _fixed_replay_summary(example)
@@ -360,20 +384,22 @@ def main() -> None:
                 st.warning("服务端没有可用的固定离线示例（PROVIDER_PROFILE_DRIFT）。")
             if profile is not None and not profile.available:
                 st.warning(
-                    f"离线配置当前不可用：{profile.reason or 'PROVIDER_PROFILE_DRIFT'}。"
-                    "请修复服务端录制目录后刷新。"
+                    _mode_unavailable_message(
+                        execution_mode, profile.reason or "PROVIDER_PROFILE_DRIFT"
+                    )
                 )
         else:
             st.info("在线 API 会调用外部模型与 Tavily 搜索；密钥只配置在 API 主机。")
             if capabilities.unpriced_live:
                 st.warning("在线调用可能产生费用；当前服务未提供价格，费用显示为 Unknown（未知）。")
             if not available:
-                reason = profile.reason if profile is not None else "PROVIDER_NOT_CONFIGURED"
-                st.warning(
-                    f"在线模式不可用：{reason}。请在 API 主机的 `.env.demo` 配置 "
-                    "`MODEL_API_KEY` 与 `SEARCH_API_KEY`（Tavily），然后重启 "
-                    "`python -m scripts.run_demo`。"
+                reason = (
+                    "DEPLOYMENT_POLICY_VIOLATION"
+                    if not capabilities.budget_presets
+                    else (profile.reason if profile is not None else None)
+                    or "PROVIDER_NOT_CONFIGURED"
                 )
+                st.warning(_mode_unavailable_message(execution_mode, reason))
 
         with st.form("research_request"):
             online_question = ""
@@ -382,7 +408,8 @@ def main() -> None:
             if execution_mode == "live":
                 online_question = st.text_area("研究问题")
                 report_language = st.selectbox("报告语言", ("en", "zh"))
-                budget = st.selectbox("预算", capabilities.budget_presets)
+                if capabilities.budget_presets:
+                    budget = st.selectbox("预算", capabilities.budget_presets)
             submitted = st.form_submit_button(
                 "开始研究", disabled=not available or session.automatic_refresh
             )

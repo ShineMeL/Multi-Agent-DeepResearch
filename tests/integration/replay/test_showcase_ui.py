@@ -173,6 +173,53 @@ def test_partial_completed_sufficient_is_never_rendered_as_success():
     assert any("结果不完整" in item.value for item in app.warning)
 
 
+@pytest.mark.parametrize("advertised_available", [False, True])
+def test_empty_live_budget_cannot_be_submitted_and_explains_policy(advertised_available):
+    data = capabilities(live_available=advertised_available)
+    data["budget_presets"] = []
+    data["replay_example"] = None
+    live = next(profile for profile in data["profiles"] if profile["execution_mode"] == "live")
+    live["reason"] = "DEPLOYMENT_POLICY_VIOLATION" if not advertised_available else None
+
+    def respond(request):
+        assert request.method == "GET" and request.url.path == "/capabilities"
+        return httpx.Response(200, json=data)
+
+    with ResearchApiClient("http://api", transport=httpx.MockTransport(respond)) as client:
+        app = AppTest.from_file(str(Path("apps/ui/app.py").resolve()), default_timeout=5)
+        app.session_state["showcase"] = ShowcaseSession(client)
+        app.run()
+        app.radio[0].set_value("在线 API").run()
+
+    assert not app.exception
+    assert next(button for button in app.button if button.label == "开始研究").disabled
+    assert any("DEPLOYMENT_POLICY_VIOLATION" in item.value for item in app.warning)
+    assert not any("MODEL_API_KEY" in item.value for item in app.warning)
+    assert not any(select.label == "预算" for select in app.selectbox)
+
+
+def test_live_form_uses_a_ready_profile_instead_of_the_first_unavailable_profile():
+    data = capabilities(live_available=False)
+    original = next(profile for profile in data["profiles"] if profile["execution_mode"] == "live")
+    data["profiles"].append(
+        {**original, "profile_id": "ready-live", "available": True, "reason": None}
+    )
+
+    def respond(request):
+        assert request.url.path == "/capabilities"
+        return httpx.Response(200, json=data)
+
+    with ResearchApiClient("http://api", transport=httpx.MockTransport(respond)) as client:
+        app = AppTest.from_file(str(Path("apps/ui/app.py").resolve()), default_timeout=5)
+        app.session_state["showcase"] = ShowcaseSession(client)
+        app.run()
+        app.radio[0].set_value("在线 API").run()
+
+    assert not app.exception
+    assert not next(button for button in app.button if button.label == "开始研究").disabled
+    assert not any("PROVIDER_NOT_CONFIGURED" in item.value for item in app.warning)
+
+
 @pytest.mark.parametrize(
     ("code", "expected"),
     [
