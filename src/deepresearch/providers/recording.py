@@ -140,6 +140,8 @@ _RECORD_FILENAME: dict[ReplayOperation, str] = {
 def _is_link_or_reparse(path: Path) -> bool:
     if path.is_symlink():
         return True
+    if sys.platform != "win32":
+        return False
     try:
         attributes = path.lstat().st_file_attributes
     except (AttributeError, FileNotFoundError, OSError):
@@ -155,6 +157,8 @@ def _path_identity(path: Path) -> tuple[int, int]:
 
 
 def _open_windows_marker(path: Path, *, create_new: bool) -> tuple[Any, int]:
+    if sys.platform != "win32":
+        raise NotImplementedError("Windows filesystem operations require Windows")
     import ctypes
     from ctypes import wintypes
 
@@ -189,6 +193,8 @@ def _open_windows_marker(path: Path, *, create_new: bool) -> tuple[Any, int]:
 
 
 def _open_windows_directory(path: Path) -> tuple[Any, int]:
+    if sys.platform != "win32":
+        raise NotImplementedError("Windows filesystem operations require Windows")
     import ctypes
     from ctypes import wintypes
 
@@ -220,6 +226,8 @@ def _open_windows_directory(path: Path) -> tuple[Any, int]:
 
 
 def _windows_handle_identity(kernel32: Any, handle: int) -> tuple[int, int]:
+    if sys.platform != "win32":
+        raise NotImplementedError("Windows filesystem operations require Windows")
     import ctypes
     from ctypes import wintypes
 
@@ -274,6 +282,8 @@ def _windows_handle_identity(kernel32: Any, handle: int) -> tuple[int, int]:
 
 
 def _close_windows_handle(kernel32: Any, handle: int) -> None:
+    if sys.platform != "win32":
+        raise NotImplementedError("Windows filesystem operations require Windows")
     import ctypes
 
     if not kernel32.CloseHandle(handle):
@@ -281,6 +291,8 @@ def _close_windows_handle(kernel32: Any, handle: int) -> None:
 
 
 def _write_windows_marker(kernel32: Any, handle: int, payload: bytes) -> None:
+    if sys.platform != "win32":
+        raise NotImplementedError("Windows filesystem operations require Windows")
     import ctypes
     from ctypes import wintypes
 
@@ -307,6 +319,8 @@ def _write_windows_marker(kernel32: Any, handle: int, payload: bytes) -> None:
 def _read_windows_marker(
     kernel32: Any, handle: int, expected_size: int
 ) -> bytes | None:
+    if sys.platform != "win32":
+        raise NotImplementedError("Windows filesystem operations require Windows")
     import ctypes
     from ctypes import wintypes
 
@@ -360,6 +374,8 @@ def _marker_identity(path: Path) -> tuple[int, int]:
 
 
 def _set_windows_delete_disposition(kernel32: Any, handle: int) -> None:
+    if sys.platform != "win32":
+        raise NotImplementedError("Windows filesystem operations require Windows")
     import ctypes
     from ctypes import wintypes
 
@@ -718,6 +734,8 @@ def _fsync_directory(path: Path) -> None:
 
 def _flush_windows_directory(path: Path) -> None:
     """Flush directory metadata using a native backup-semantics handle."""
+    if sys.platform != "win32":
+        raise NotImplementedError("Windows filesystem operations require Windows")
     import ctypes
     from ctypes import wintypes
 

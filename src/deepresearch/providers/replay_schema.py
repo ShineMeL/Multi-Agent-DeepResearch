@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import stat
+import sys
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -399,6 +400,8 @@ class _ReplayManifest(_ReplayModel):
 def _is_link_or_reparse(path: Path) -> bool:
     if path.is_symlink():
         return True
+    if sys.platform != "win32":
+        return False
     try:
         attributes = path.lstat().st_file_attributes
     except (AttributeError, FileNotFoundError, OSError):

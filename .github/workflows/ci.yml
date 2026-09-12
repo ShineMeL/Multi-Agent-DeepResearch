@@ -48,6 +48,8 @@ jobs:
       # The plan's completion checklist permits a production/application type
       # gate. Keep research tooling strict too; legacy fixture typing is separate.
       - run: uv run pyright src apps benchmarks experiments
+      - name: Check Windows-only branches from the Linux runner
+        run: uv run pyright --pythonplatform Windows src apps benchmarks experiments
       - run: uv run pyright scripts/smoke_replay.py tests/integration/api/test_accounting_recovery.py tests/unit/runtime/test_build_provenance.py tests/integration/deployment/test_proxy_identity.py tests/integration/replay/test_full_service.py tests/integration/deployment/test_smoke.py tests/integration/deployment/test_replay_smoke.py
       - name: Offline and PostgreSQL verification
         env:

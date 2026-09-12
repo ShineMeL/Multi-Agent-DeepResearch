@@ -830,6 +830,8 @@ def _write_fsynced(path: Path, payload: bytes) -> None:
 
 def _flush_windows_directory(path: Path) -> None:
     """Flush directory metadata with a native backup-semantics handle."""
+    if sys.platform != "win32":
+        raise NotImplementedError("Windows filesystem operations require Windows")
     import ctypes
     from ctypes import wintypes
 

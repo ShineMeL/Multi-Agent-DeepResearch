@@ -7,6 +7,7 @@ import json
 import math
 import os
 import stat
+import sys
 import tempfile
 import threading
 from collections.abc import Callable, Mapping, Sequence
@@ -83,6 +84,8 @@ def _file_hash_and_size(path: Path) -> tuple[str, int]:
 def _is_link_or_reparse(path: Path) -> bool:
     if path.is_symlink():
         return True
+    if sys.platform != "win32":
+        return False
     try:
         attributes = path.lstat().st_file_attributes
     except (AttributeError, FileNotFoundError, OSError):
