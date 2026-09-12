@@ -34,10 +34,13 @@ def test_ci_keeps_provider_secrets_out_of_verification_and_gates_online():
         "tests/integration/replay",
         "tests/integration/api",
         "tests/integration/deployment",
+        "tests/integration/benchmarks/test_release_c_gate.py",
+        "tests/cli/test_experiment_commands.py",
     ):
         assert suite in commands
     assert "uv sync --all-extras --locked" in commands
     assert "ruff check ." in commands and "pyright src apps benchmarks experiments\n" in commands
+    assert "pyright --pythonplatform Windows src apps benchmarks experiments" in commands
     assert "docker compose config" in commands
     steps = verify["steps"]
 

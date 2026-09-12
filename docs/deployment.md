@@ -23,9 +23,9 @@ recordings for different inputs, and there is no automatic live fallback on
 The implemented production composition supports `baseline-v1` with `P1` / `R1`
 and the deterministic `research-v1` P1/R1 research showcase. The latter adds
 claim extraction, evidence verification, and conservative unsupported-claim
-resolution while reusing the audited retrieval/report pipeline. Explicitly
-choose P1/R1 for this composition. The API's default research settings
-(`research-v1` with P2/R2) remain unavailable and fail closed with
+resolution while reusing the audited retrieval/report pipeline. The API defaults
+to this supported P1/R1 combination. Explicit `research-v1` requests with
+P2/R2 remain unavailable and fail closed with
 `RESEARCH_GRAPH_UNAVAILABLE`; there is no silent baseline fallback.
 
 ## Build provenance
@@ -418,8 +418,15 @@ uses a 90-second deadline; each external command also has a bounded timeout.
 Set `API_HOST_PORT` / `UI_HOST_PORT` in the gate process environment to override
 8000 / 8501. The same explicit ports and validated environment are forwarded to
 Compose and the acceptance client, including cleanup; invalid ports fail
-before stack mutation. A source checkout or validated `GITHUB_SHA` is required
-for image provenance. This orchestration is regression-tested with controlled
+before stack mutation. Every Compose command pins the repository's
+`docker-compose.yml` with `--file`; automatic override files, `COMPOSE_FILE`,
+and external `COMPOSE_PROFILES` cannot select a different topology.
+
+Image provenance requires a clean Git checkout. `GITHUB_SHA`, if supplied,
+must match the checkout's HEAD; dirty/untracked source, mismatched revisions,
+and source archives without verifiable Git metadata stop before building with
+`DEPLOYMENT_SOURCE_REVISION_MISSING`. Do not edit the checkout during a gate run.
+This orchestration is regression-tested with controlled
 process/HTTP boundaries; that is not evidence of a local Docker engine run.
 
 The gate then runs `docker compose down`. Named

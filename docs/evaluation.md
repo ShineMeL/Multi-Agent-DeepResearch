@@ -120,12 +120,23 @@ hashes stop with `PORTFOLIO_INPUT_MISSING` or
 `HUMAN_AGGREGATE_INCOMPLETE`.
 
 C4 renders the verified primary (and any separately verified optional inputs)
-twice in temporary directories, compares every Markdown/SVG hash, and promotes
-the output only after the byte comparison succeeds. If `docs/results.md` still
-contains “primary result is not yet sealed”, or any summary/manifest/sidecar is
-missing or invalid, it returns `PUBLICATION_UNSEALED` and does not edit the
-page. A blocked or skipped C gate is never converted into a score or a sealed
-publication.
+twice in temporary directories. Its publication allowlist is `results.md` and
+the three SVGs under `assets/results`; all four must be complete and byte-identical
+before promotion. The renderer's extra `evaluation.md` is not promoted: this
+hand-written runbook and README remain separately reviewed documentation. An existing
+“primary result is not yet sealed” placeholder is an expected starting state,
+not a permanent block. Missing or invalid summary/manifest/sidecar inputs, or
+an unsealed **staging output**, return `PUBLICATION_UNSEALED` without replacing
+the page. Supplied human ratings must satisfy the same 20-task/3-distinct-rater
+contract as C3; a hash-valid but structurally incomplete JSON is insufficient.
+
+Promotion validates target paths before mutation and keeps recovery copies
+on the publication filesystem. A caught replacement failure rolls back the
+files already replaced; if restoration itself fails, remaining backups are
+retained in `.deepresearch-publication-*` beside `docs` for operator recovery.
+This is not a cross-file crash-atomic transaction. A verified seal describes
+provenance, not a positive scientific result: negative findings are retained,
+missing optional aggregates stay missing, and no score is imputed.
 
 For canonical replay and formal verification on Windows, use a fresh LF
 checkout and never rewrite expected hashes:

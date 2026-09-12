@@ -55,6 +55,8 @@ jobs:
         env:
           DEEPRESEARCH_TEST_POSTGRES_URL: postgresql+asyncpg://deepresearch:ci-only@127.0.0.1:5432/deepresearch_test
         run: uv run pytest -q tests/unit tests/contracts tests/integration/replay tests/integration/api tests/integration/deployment -m "not online"
+      - name: Verify publication gates using synthetic sealed fixtures only
+        run: uv run pytest -q tests/integration/benchmarks/test_release_c_gate.py tests/cli/test_experiment_commands.py
       - name: Validate Compose with disposable CI-only values
         env:
           DATABASE_URL: postgresql+asyncpg://deepresearch:ci-only@postgres:5432/deepresearch

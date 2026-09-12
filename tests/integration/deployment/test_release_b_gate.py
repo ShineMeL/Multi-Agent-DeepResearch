@@ -13,6 +13,10 @@ from scripts.release_b_gate import BRunResult, run_b_gate
 from scripts.release_preflight import GateReport
 
 
+def _compose(root: Path, *command: str) -> list[str]:
+    return ["docker", "compose", "--file", str(root / "docker-compose.yml"), *command]
+
+
 @pytest.fixture
 def ready_gate(monkeypatch):
     monkeypatch.setattr(
@@ -76,14 +80,10 @@ def test_b1_runs_config_build_up_health_and_cleanup_in_order(
         "replay_smoke",
         "stack_down",
     ]
-    assert calls[0][0][0:3] == ["docker", "compose", "config"]
-    assert calls[1][0] == [
-        "docker",
-        "compose",
-        "build",
-        "--build-arg",
-        f"DEEPRESEARCH_CODE_COMMIT={'a' * 40}",
-    ]
+    assert calls[0][0] == _compose(tmp_path, "config", "--quiet")
+    assert calls[1][0] == _compose(
+        tmp_path, "build", "--build-arg", f"DEEPRESEARCH_CODE_COMMIT={'a' * 40}"
+    )
     assert "--no-build" in calls[2][0]
     assert "--wait" in calls[2][0]
 
@@ -139,7 +139,7 @@ def test_b1_attempts_cleanup_after_partial_stack_start(
     def fake_runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
         command = list(args[0])
         commands.append(command)
-        failed = command[:3] == ["docker", "compose", "up"]
+        failed = "up" in command
         return subprocess.CompletedProcess(
             args=args, returncode=1 if failed else 0, stdout="", stderr=""
         )
@@ -147,7 +147,7 @@ def test_b1_attempts_cleanup_after_partial_stack_start(
     result = run_b_gate(tmp_path, profile="replay", runner=fake_runner)
 
     assert result.status == "failed"
-    assert commands[-1] == ["docker", "compose", "down"]
+    assert commands[-1] == _compose(tmp_path, "down")
     assert result.steps[-1].name == "stack_down"
 
 
@@ -158,10 +158,12 @@ def test_b1_forwards_validated_environment_and_checks_configured_ports(tmp_path,
         "API_HOST_PORT": "18003",
         "UI_HOST_PORT": "18503",
         "SESSION_SIGNING_KEY": "test-secret",
+        "COMPOSE_FILE": "unreviewed-live-stack.yaml",
+        "COMPOSE_PROFILES": "live,paid",
     }
 
     def runner(command, **kwargs):
-        assert kwargs["env"] == environment
+        assert kwargs["env"] == {**environment, "COMPOSE_PROFILES": ""}
         assert 0 < kwargs["timeout"] <= 1200
         commands.append(command)
         return subprocess.CompletedProcess(command, 0)
@@ -190,6 +192,10 @@ def test_b1_forwards_validated_environment_and_checks_configured_ports(tmp_path,
         "90",
     ]
     assert "test-secret" not in repr(result)
+    for command in commands:
+        if command[0] == "docker":
+            assert command[:4] == _compose(tmp_path)
+    assert environment["COMPOSE_PROFILES"] == "live,paid"
 
 
 @pytest.mark.parametrize("never_ready", [False, True])
@@ -226,7 +232,7 @@ def test_b1_waits_for_health_with_a_bounded_deadline(
 
     assert len(attempts) > 1
     assert 0 < now[0] <= 30
-    assert commands[-1] == ["docker", "compose", "down"]
+    assert commands[-1] == _compose(tmp_path, "down")
     assert "sensitive transport details" not in repr(result)
     if never_ready:
         assert result.reason == "DEPLOYMENT_HEALTH_FAILED"
@@ -236,12 +242,14 @@ def test_b1_waits_for_health_with_a_bounded_deadline(
         assert any("scripts.smoke_replay" in command for command in commands)
 
 
-def test_b1_report_failure_cannot_pass_on_healthy_probes(tmp_path, ready_gate):
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_b1_report_failure_cannot_pass_on_healthy_probes(tmp_path, ready_gate, cleanup_fails):
     commands = []
 
     def runner(command, **kwargs):
         commands.append(command)
-        return subprocess.CompletedProcess(command, 1 if "scripts.smoke_replay" in command else 0)
+        failed = "scripts.smoke_replay" in command or (cleanup_fails and command[-1] == "down")
+        return subprocess.CompletedProcess(command, 1 if failed else 0)
 
     result = run_b_gate(
         tmp_path,
@@ -252,7 +260,7 @@ def test_b1_report_failure_cannot_pass_on_healthy_probes(tmp_path, ready_gate):
 
     assert result.status == "failed"
     assert result.reason == "DEPLOYMENT_REPLAY_SMOKE_FAILED"
-    assert commands[-1] == ["docker", "compose", "down"]
+    assert commands[-1] == _compose(tmp_path, "down")
     assert any(step.name == "replay_smoke" and step.status == "failed" for step in result.steps)
 
 
@@ -282,4 +290,76 @@ def test_b1_unavailable_revision_stops_before_build(tmp_path, monkeypatch, ready
 
     assert result.status == "failed"
     assert result.reason == "DEPLOYMENT_SOURCE_REVISION_MISSING"
-    assert commands == [["docker", "compose", "config", "--quiet"]]
+    assert commands == [_compose(tmp_path, "config", "--quiet")]
+
+
+@pytest.fixture
+def committed_repository(tmp_path):
+    def git(*arguments):
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Release Test",
+                "-c",
+                "user.email=release@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=" + str(tmp_path / "no-hooks"),
+                *arguments,
+            ],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return result.stdout.strip()
+
+    git("init")
+    (tmp_path / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    git("add", "docker-compose.yml")
+    git("commit", "-m", "fixture")
+    return tmp_path, git("rev-parse", "HEAD")
+
+
+def test_b1_revision_is_the_clean_checked_out_commit(committed_repository):
+    repository, head = committed_repository
+    assert release_b_gate._safe_revision(repository, environ={}) == head
+    assert release_b_gate._safe_revision(repository, environ={"GITHUB_SHA": head}) == head
+
+
+@pytest.mark.parametrize("mutation", ["tracked", "untracked", "sha_mismatch", "invalid_sha"])
+def test_b1_rejects_dirty_or_mislabelled_source_before_build(
+    committed_repository, monkeypatch, mutation
+):
+    repository, _ = committed_repository
+    environment = {}
+    if mutation == "tracked":
+        (repository / "docker-compose.yml").write_text(
+            "services: {unreviewed: {}}\n", encoding="utf-8"
+        )
+    elif mutation == "untracked":
+        (repository / "uncommitted.py").write_text("print('unreviewed')\n", encoding="utf-8")
+    elif mutation == "sha_mismatch":
+        environment["GITHUB_SHA"] = "b" * 40
+    else:
+        environment["GITHUB_SHA"] = "invalid"
+    monkeypatch.setattr(
+        release_b_gate, "assess_gate", lambda *args, **kwargs: GateReport("b1", "ready", None, ())
+    )
+    commands = []
+
+    def runner(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    result = run_b_gate(repository, profile="replay", runner=runner, environ=environment)
+    assert result.status == "failed"
+    assert result.reason == "DEPLOYMENT_SOURCE_REVISION_MISSING"
+    assert commands == [_compose(repository, "config", "--quiet")]
+
+
+def test_b1_unverifiable_archive_does_not_trust_a_syntactic_sha(tmp_path):
+    assert release_b_gate._safe_revision(tmp_path, environ={"GITHUB_SHA": "b" * 40}) == "0" * 40

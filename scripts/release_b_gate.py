@@ -72,20 +72,9 @@ def _blocked(report: GateReport) -> BRunResult:
 
 
 def _safe_revision(repository: Path, *, environ: Mapping[str, str]) -> str:
-    """Return a validated 40-character revision, or the explicit unavailable value.
-
-    Source archives used by unit tests do not have Git metadata.  Packaged
-    builds still fail their own provenance check when the unavailable value is
-    used; a real checkout is always required to provide a validated revision.
-    """
+    """Bind image provenance to a clean checkout, never just a plausible SHA."""
 
     candidate = environ.get("GITHUB_SHA", "").strip()
-    if (
-        len(candidate) == 40
-        and candidate != _ZERO_REVISION
-        and all(character in "0123456789abcdefABCDEF" for character in candidate)
-    ):
-        return candidate.lower()
     git_marker = repository / ".git"
     if not git_marker.exists():
         return _ZERO_REVISION
@@ -97,11 +86,21 @@ def _safe_revision(repository: Path, *, environ: Mapping[str, str]) -> str:
             text=True,
             timeout=10,
         )
+        status = subprocess.run(
+            ["git", "-C", str(repository), "status", "--porcelain=v1", "--untracked-files=all"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
     except (OSError, subprocess.SubprocessError):
         return _ZERO_REVISION
     revision = result.stdout.strip()
     if (
         result.returncode == 0
+        and status.returncode == 0
+        and not status.stdout.strip()
+        and (not candidate or candidate.lower() == revision.lower())
         and len(revision) == 40
         and revision != _ZERO_REVISION
         and all(character in "0123456789abcdefABCDEF" for character in revision)
@@ -184,18 +183,21 @@ def _run_b1(
         return BRunResult("blocked", "DEPLOYMENT_PORT_INVALID", ())
     # Keep probes and Compose on the same explicit ports even if a local .env
     # file contains different defaults. Never mutate the caller's environment.
-    prepared = dict(environ, API_HOST_PORT=str(api_port), UI_HOST_PORT=str(ui_port))
+    prepared = dict(
+        environ, API_HOST_PORT=str(api_port), UI_HOST_PORT=str(ui_port), COMPOSE_PROFILES=""
+    )
+    compose = ("docker", "compose", "--file", str(repository / "docker-compose.yml"))
     api_url = f"http://127.0.0.1:{api_port}"
     ui_url = f"http://127.0.0.1:{ui_port}"
     if dry_run:
         commands = (
-            "docker compose config --quiet",
-            "docker compose build --build-arg DEEPRESEARCH_CODE_COMMIT=<validated>",
-            "docker compose up -d --no-build --wait --wait-timeout 180",
+            "docker compose --file <repository>/docker-compose.yml config --quiet",
+            "docker compose --file <repository>/docker-compose.yml build --build-arg DEEPRESEARCH_CODE_COMMIT=<validated>",
+            "docker compose --file <repository>/docker-compose.yml up -d --no-build --wait --wait-timeout 180",
             "GET /health/live",
             "GET /health/ready",
             "python -m scripts.smoke_replay --api-url <local-api> --ui-url <local-ui> --timeout 90",
-            "docker compose down",
+            "docker compose --file <repository>/docker-compose.yml down",
         )
         if keep_up:
             commands = commands[:-1]
@@ -231,7 +233,7 @@ def _run_b1(
         return False
 
     try:
-        if run_command("compose_config", ("docker", "compose", "config", "--quiet")):
+        if run_command("compose_config", (*compose, "config", "--quiet")):
             revision = _safe_revision(repository, environ=prepared)
             if revision == _ZERO_REVISION:
                 steps.append(BStep("source_revision", "failed", "unavailable"))
@@ -240,8 +242,7 @@ def _run_b1(
             elif run_command(
                 "image_build",
                 (
-                    "docker",
-                    "compose",
+                    *compose,
                     "build",
                     "--build-arg",
                     f"DEEPRESEARCH_CODE_COMMIT={revision}",
@@ -255,8 +256,7 @@ def _run_b1(
                 if run_command(
                     "stack_up",
                     (
-                        "docker",
-                        "compose",
+                        *compose,
                         "up",
                         "-d",
                         "--no-build",
@@ -296,15 +296,13 @@ def _run_b1(
                         )
     finally:
         if stack_started and not keep_up:
-            result = _invoke(
-                runner, ("docker", "compose", "down"), repository, environ=prepared, timeout=60.0
-            )
+            result = _invoke(runner, (*compose, "down"), repository, environ=prepared, timeout=60.0)
             if result is not None and result.returncode == 0:
                 steps.append(BStep("stack_down", "ready", "completed"))
             else:
                 steps.append(BStep("stack_down", "failed", _command_detail(result)))
                 final_status = "failed"
-                reason = "DEPLOYMENT_COMMAND_FAILED"
+                reason = reason or "DEPLOYMENT_COMMAND_FAILED"
     return BRunResult(final_status, reason, tuple(steps))
 
 
