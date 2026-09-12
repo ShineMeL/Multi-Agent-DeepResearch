@@ -19,6 +19,8 @@ import html
 import json
 import math
 import re
+import stat
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Final, cast
@@ -89,6 +91,19 @@ def _mapping(value: object, *, label: str) -> PublicMap:
     raise ResultValidationError(f"{label} must be a JSON object")
 
 
+def _is_link_or_reparse(path: Path) -> bool:
+    try:
+        details = path.lstat()
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(details.st_mode) or path.is_junction():
+        return True
+    if sys.platform == "win32":
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        return bool(getattr(details, "st_file_attributes", 0) & reparse_flag)
+    return False
+
+
 def _safe_path(path: Path, *, label: str) -> Path:
     """Reject links/reparse points before opening a publication input/output."""
 
@@ -96,7 +111,7 @@ def _safe_path(path: Path, *, label: str) -> Path:
     current = absolute
     while True:
         try:
-            if current.is_symlink():
+            if _is_link_or_reparse(current):
                 raise ResultValidationError(f"{label} contains a symlink or reparse point")
         except OSError as error:
             raise ResultValidationError(f"{label} is unavailable") from error
@@ -630,7 +645,11 @@ def _render_markdown(
         planner_noninferior=planner_noninferior,
     )
     outcome = (
-        "primary hypothesis not established" if negative else "primary result is not yet sealed"
+        "primary hypothesis not established"
+        if negative
+        else "primary result is sealed"
+        if verified
+        else "primary result is not yet sealed"
     )
 
     lines = [
@@ -918,8 +937,10 @@ sidecar hash manifest; no score is imputed when those inputs are absent.
 def _write_output(path: Path, content: str) -> None:
     _safe_path(path.parent, label="documentation output parent")
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() and path.is_symlink():
-        raise ResultValidationError(f"documentation output {path.name} is a symlink")
+    if _is_link_or_reparse(path):
+        raise ResultValidationError(
+            f"documentation output {path.name} is a symlink or reparse point"
+        )
     path.write_text(content, encoding="utf-8", newline="\n")
 
 

@@ -11,6 +11,8 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -25,6 +27,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from benchmarks.scripts.render_results import ResultValidationError, render_results
+from experiments.summarize import summarize_experiment
 from scripts.release_preflight import GateReport, assess_gate
 
 CStage = Literal["c1", "c2", "c3", "c4"]
@@ -57,12 +60,32 @@ _EXTERNAL_CONFIG = Path("benchmarks/configs/external.yaml")
 _EXTERNAL_LOCK = Path("benchmarks/external/external.lock.json")
 _EXTERNAL_COUNTS = {"livedrbench": 10, "frames": 20, "deepresearchbench": 10}
 _HASH_RE = frozenset("0123456789abcdef")
+_SEALED_PROVENANCE_LINE = "- public artifact seal verified: yes."
+_SEALED_OUTCOME_LINES = frozenset(
+    {
+        "> factual outcome: primary result is sealed.",
+        "> factual outcome: primary hypothesis not established.",
+    }
+)
 _PUBLICATION_FILES = (
     Path("results.md"),
     Path("assets/results/abcd-metrics.svg"),
     Path("assets/results/citation-support-vs-usd.svg"),
     Path("assets/results/completeness-vs-search.svg"),
 )
+
+
+def _is_link_or_reparse(path: Path) -> bool:
+    try:
+        details = path.lstat()
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(details.st_mode) or path.is_junction():
+        return True
+    if sys.platform == "win32":
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        return bool(getattr(details, "st_file_attributes", 0) & reparse_flag)
+    return False
 
 
 def _blocked(report: GateReport) -> CRunResult:
@@ -318,14 +341,6 @@ def _validate_human(path: Path) -> bool:
     return bool(validation.valid)
 
 
-def _validate_human_seal(path: Path) -> bool:
-    """Validate a renderer-facing aggregate without assuming raw ratings shape."""
-
-    if not path.is_file() or path.is_symlink() or not _human_sidecar_valid(path):
-        return False
-    return _read_json(path) is not None
-
-
 def _validate_external_inputs(repository: Path) -> bool:
     config = repository / _EXTERNAL_CONFIG
     lock = repository / _EXTERNAL_LOCK
@@ -390,18 +405,96 @@ def _tree_hashes(root: Path) -> dict[str, str]:
     return values
 
 
+def _primary_publication_is_sealed(path: Path) -> bool:
+    try:
+        lines = [line.strip().casefold() for line in path.read_text(encoding="utf-8").splitlines()]
+    except (OSError, UnicodeError):
+        return False
+    outcomes = [line for line in lines if line.startswith("> factual outcome:")]
+    return (
+        _SEALED_PROVENANCE_LINE in lines
+        and len(outcomes) == 1
+        and outcomes[0] in _SEALED_OUTCOME_LINES
+    )
+
+
 def _promote_publication(staging: Path, docs_root: Path) -> None:
+    plan: list[tuple[Path, Path, bool]] = []
+    publication_parents: set[Path] = {docs_root}
+    for relative in _PUBLICATION_FILES:
+        parent = docs_root
+        for part in relative.parts[:-1]:
+            parent /= part
+            publication_parents.add(parent)
+    for parent in sorted(publication_parents, key=lambda path: len(path.parts)):
+        if _is_link_or_reparse(parent):
+            raise ResultValidationError("publication parent must not be a symlink")
+        if parent.exists() and not parent.is_dir():
+            raise ResultValidationError("publication parent must be a directory")
+
     for relative in _PUBLICATION_FILES:
         source = staging / relative
-        if not source.is_file() or source.is_symlink():
+        if not source.is_file() or _is_link_or_reparse(source):
             raise ResultValidationError(f"renderer omitted {relative.as_posix()}")
-    docs_root.mkdir(parents=True, exist_ok=True)
-    for relative in _PUBLICATION_FILES:
         target = docs_root / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.is_symlink():
+        if _is_link_or_reparse(target):
             raise ResultValidationError(f"publication target is a symlink: {relative.as_posix()}")
-        os.replace(staging / relative, target)
+        existed = target.exists()
+        if existed and not target.is_file():
+            raise ResultValidationError(
+                f"publication target is not a regular file: {relative.as_posix()}"
+            )
+        plan.append((source, target, existed))
+
+    for _, target, _ in plan:
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+    transaction_root = Path(
+        tempfile.mkdtemp(prefix=".deepresearch-publication-", dir=docs_root.parent)
+    )
+    prepared_root = transaction_root / "prepared"
+    rollback_root = transaction_root / "rollback"
+    backups: dict[Path, Path] = {}
+    prepared: dict[Path, Path] = {}
+    try:
+        for relative, (source, target, existed) in zip(_PUBLICATION_FILES, plan, strict=True):
+            prepared_source = prepared_root / relative
+            prepared_source.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, prepared_source)
+            prepared[target] = prepared_source
+            if not existed:
+                continue
+            backup = rollback_root / relative
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(target, backup)
+            backups[target] = backup
+    except OSError:
+        shutil.rmtree(transaction_root, ignore_errors=True)
+        raise
+
+    promoted: list[Path] = []
+    try:
+        for _, target, _ in plan:
+            os.replace(prepared[target], target)
+            promoted.append(target)
+    except OSError as promotion_error:
+        rollback_failed = False
+        for target in reversed(promoted):
+            try:
+                backup = backups.get(target)
+                if backup is None:
+                    target.unlink(missing_ok=True)
+                else:
+                    os.replace(backup, target)
+            except OSError:
+                rollback_failed = True
+        if rollback_failed:
+            raise ResultValidationError(
+                "publication rollback was incomplete; recovery backup retained"
+            ) from promotion_error
+        shutil.rmtree(transaction_root, ignore_errors=True)
+        raise
+    shutil.rmtree(transaction_root, ignore_errors=True)
 
 
 def _run_c4(
@@ -426,13 +519,27 @@ def _run_c4(
             "PUBLICATION_UNSEALED",
             (CStep("primary_manifest", "blocked", "missing_or_invalid"),),
         )
+    try:
+        verified_summary = summarize_experiment(experiment_dir, verify_only=True)
+    except (OSError, TypeError, ValueError):
+        return CRunResult(
+            "blocked",
+            "PUBLICATION_UNSEALED",
+            (CStep("primary_manifest", "blocked", "missing_or_invalid"),),
+        )
+    if verified_summary.get("bootstrap_resamples") != 10_000:
+        return CRunResult(
+            "blocked",
+            "PUBLICATION_UNSEALED",
+            (CStep("primary_manifest", "blocked", "invalid_bootstrap_resamples"),),
+        )
     if external_experiment_dir is not None and not _validate_external(external_experiment_dir):
         return CRunResult(
             "blocked",
             "PUBLICATION_UNSEALED",
             (CStep("external_manifest", "blocked", "missing_or_invalid"),),
         )
-    if human_summary is not None and not _validate_human_seal(human_summary):
+    if human_summary is not None and not _validate_human(human_summary):
         return CRunResult(
             "blocked",
             "PUBLICATION_UNSEALED",
@@ -463,6 +570,19 @@ def _run_c4(
                     "failed",
                     "PUBLICATION_NONDETERMINISTIC",
                     (CStep("render_determinism", "failed", "hash_mismatch"),),
+                )
+            expected_files = {relative.as_posix() for relative in _PUBLICATION_FILES}
+            if set(first_hashes) != expected_files:
+                return CRunResult(
+                    "failed",
+                    "PUBLICATION_VALIDATION_FAILED",
+                    (CStep("render_validation", "failed", "incomplete"),),
+                )
+            if not _primary_publication_is_sealed(first / "results.md"):
+                return CRunResult(
+                    "blocked",
+                    "PUBLICATION_UNSEALED",
+                    (CStep("render_validation", "blocked", "unsealed"),),
                 )
             _promote_publication(first, docs_root)
     except (OSError, TypeError, ValueError, ResultValidationError):

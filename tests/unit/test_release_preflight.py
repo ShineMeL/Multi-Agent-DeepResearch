@@ -43,7 +43,7 @@ def test_c1_requires_formal_inputs_and_lf_fixture_bytes(tmp_path: Path) -> None:
     assert report.reason == "FORMAL_INPUT_MISSING"
 
 
-def test_c4_is_not_ready_when_results_are_unsealed(tmp_path: Path) -> None:
+def test_c4_placeholder_does_not_hide_missing_publication_inputs(tmp_path: Path) -> None:
     results = tmp_path / "docs" / "results.md"
     results.parent.mkdir(parents=True)
     results.write_text(
@@ -52,6 +52,38 @@ def test_c4_is_not_ready_when_results_are_unsealed(tmp_path: Path) -> None:
     report = assess_gate(tmp_path, "c4", environ={}, command_exists=lambda _name: True)
     assert report.status == "blocked"
     assert report.reason == "PUBLICATION_UNSEALED"
+    assert {check.name for check in report.checks if not check.present} >= {
+        "docs/assets/results/abcd-metrics.svg",
+        "summary.json",
+        "manifest.sha256",
+    }
+
+
+def test_c4_accepts_placeholder_as_expected_prepublication_state_when_inputs_exist(
+    tmp_path: Path,
+) -> None:
+    docs = tmp_path / "docs"
+    assets = docs / "assets" / "results"
+    experiment = tmp_path / "experiment"
+    assets.mkdir(parents=True)
+    experiment.mkdir()
+    (docs / "results.md").write_text(
+        "Factual outcome: primary result is not yet sealed.\n", encoding="utf-8"
+    )
+    (assets / "abcd-metrics.svg").write_text("<svg/>\n", encoding="utf-8")
+    (experiment / "summary.json").write_text("{}\n", encoding="utf-8")
+    (experiment / "manifest.sha256").write_text("{}\n", encoding="utf-8")
+
+    report = assess_gate(
+        tmp_path,
+        "c4",
+        experiment_dir=experiment,
+        environ={},
+        command_exists=lambda _name: True,
+    )
+
+    assert report.status == "ready"
+    assert report.reason is None
 
 
 def test_cli_json_is_stable_and_secret_free(tmp_path: Path, capsys) -> None:

@@ -193,15 +193,6 @@ def _lf_check(repository: Path) -> CheckResult:
     )
 
 
-def _result_marker(repository: Path) -> bool:
-    path = repository / "docs" / "results.md"
-    try:
-        text = path.read_text(encoding="utf-8").casefold()
-    except (OSError, UnicodeError):
-        return False
-    return "not yet sealed" in text or "not sealed" in text
-
-
 def _report(
     gate: GateName,
     checks: Sequence[CheckResult],
@@ -341,13 +332,6 @@ def _assess_c4(
     external_experiment_dir: Path | None,
     human_summary: Path | None,
 ) -> GateReport:
-    if _result_marker(repository):
-        return GateReport(
-            "c4",
-            "blocked",
-            "PUBLICATION_UNSEALED",
-            (CheckResult("docs/results.md", True, "unsealed"),),
-        )
     checks = [
         _file_check(repository, "docs/results.md"),
         _file_check(repository, "docs/assets/results/abcd-metrics.svg"),

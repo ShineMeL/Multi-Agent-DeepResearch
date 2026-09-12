@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +13,20 @@ from typer.testing import CliRunner
 
 from apps.cli.main import app
 from benchmarks.scripts.render_results import ResultValidationError, render_results
+
+
+def _make_windows_junction(link: Path, target: Path) -> None:
+    if sys.platform != "win32":
+        pytest.skip("Windows junction regression")
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip("Windows junction creation is unavailable")
+    assert link.is_junction()
 
 
 def test_invalid_formal_config_exits_nonzero(tmp_path: Path) -> None:
@@ -214,6 +231,47 @@ def test_renderer_preserves_negative_primary_result() -> None:
     assert "主假设未成立" in page
     assert "-0.04" in page
     assert "失败分析" in page
+
+
+def test_renderer_marks_verified_positive_result_as_sealed_without_claiming_hypothesis(
+    tmp_path: Path,
+) -> None:
+    experiment_dir = tmp_path / "experiment"
+    experiment_dir.mkdir()
+    summary_path = experiment_dir / "summary.json"
+    summary_path.write_text(json.dumps(_renderer_summary(), ensure_ascii=False), encoding="utf-8")
+    (experiment_dir / "manifest.sha256").write_text(
+        json.dumps(
+            {
+                "schema_version": "experiment-artifact-manifest-v1",
+                "files": {
+                    "summary.json": hashlib.sha256(summary_path.read_bytes()).hexdigest()
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    page = render_results(experiment_dir=experiment_dir)
+
+    assert "primary result is sealed" in page
+    assert "primary result is not yet sealed" not in page
+    assert "hypothesis established" not in page
+
+
+def test_renderer_rejects_a_junction_output_root_before_writing_outside_it(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside-docs"
+    outside.mkdir()
+    junction = tmp_path / "docs-junction"
+    _make_windows_junction(junction, outside)
+    try:
+        with pytest.raises(ResultValidationError, match="symlink|reparse"):
+            render_results(_renderer_summary(), docs_dir=junction)
+        assert list(outside.iterdir()) == []
+    finally:
+        os.rmdir(junction)
 
 
 def test_renderer_rejects_tampered_public_manifest(tmp_path: Path) -> None:
