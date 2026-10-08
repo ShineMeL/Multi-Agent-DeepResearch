@@ -2,11 +2,21 @@
 .worktrees/
 .venv/
 .env
-.env.demo
+.env.*
+!/.env.example
+!/.env.demo.example
 artifacts/
 .cache/deepresearch/
 models/embedding/
 __pycache__/
+
+# Local service state can include owner identities, queries and usage records.
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
 
 # Benchmark gold and generated experiment payloads stay evaluator-only.
 benchmarks/private/
