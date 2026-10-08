@@ -28,6 +28,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 COPY apps ./apps
 COPY src ./src
 COPY benchmarks ./benchmarks
+COPY experiments ./experiments
 COPY models ./models
 COPY deploy ./deploy
 COPY scripts ./scripts

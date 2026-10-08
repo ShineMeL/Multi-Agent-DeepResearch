@@ -7,15 +7,13 @@ dependencies = [
   "langgraph>=1.2.11,<2",
   "langgraph-checkpoint-sqlite>=3.1.1,<4",
   "numpy>=2.2,<3",
-  "pandas>=2.2,<3",
   "pydantic>=2.11,<3",
   "pydantic-settings>=2.10,<3",
   "pymupdf>=1.26,<2",
-  "pyyaml>=6.0,<7",
+  "python-dotenv>=1.2,<2",
+  "pyyaml>=6.0.3,<7",
   "rank-bm25>=0.2,<1",
-  "rich>=14,<15",
   "sentence-transformers>=6,<7",
-  "scipy>=1.14,<2",
   "trafilatura>=2.2,<3",
   "typer>=0.27,<1",
   "fastapi>=0.141.1",
@@ -34,7 +32,6 @@ dev = [
   "pyright>=1.1.400,<2",
   "pytest>=8.4,<9",
   "pytest-asyncio>=1.1,<2",
-  "pyyaml>=6.0.3",
   "respx>=0.22,<0.23",
   "ruff>=0.12,<1",
 ]
@@ -47,7 +44,16 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/deepresearch", "apps"]
+packages = ["src/deepresearch", "apps", "benchmarks", "experiments"]
+
+# Benchmark evaluator code ships with the CLI; private data and generated
+# experiment runs are never distribution assets.
+exclude = [
+  "benchmarks/private/**",
+  "benchmarks/snapshots/**",
+  "benchmarks/datasets/frozen_ai_cs_60/**",
+  "experiments/*/**",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

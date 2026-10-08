@@ -13,7 +13,7 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     env:
       COMPOSE_PROJECT_NAME: deepresearch-ci-${{ github.run_id }}-${{ github.run_attempt }}
     services:
@@ -41,9 +41,7 @@ jobs:
       - name: Release B/C capability preflight
         run: uv run python scripts/release_preflight.py --gate c1 --format json || test $? -eq 1
       - name: Release A readiness
-        run: |
-          uv run python scripts/release_readiness.py
-          uv run pytest -q tests/integration/deployment/test_release_package.py tests/integration/replay/test_full_service.py::test_full_service_strict_replay_completes_against_verified_baseline_bundle
+        run: uv run python scripts/release_readiness.py
       - run: uv run ruff check .
       # The plan's completion checklist permits a production/application type
       # gate. Keep research tooling strict too; legacy fixture typing is separate.
@@ -51,12 +49,12 @@ jobs:
       - name: Check Windows-only branches from the Linux runner
         run: uv run pyright --pythonplatform Windows src apps benchmarks experiments
       - run: uv run pyright scripts/smoke_replay.py tests/integration/api/test_accounting_recovery.py tests/unit/runtime/test_build_provenance.py tests/integration/deployment/test_proxy_identity.py tests/integration/replay/test_full_service.py tests/integration/deployment/test_smoke.py tests/integration/deployment/test_replay_smoke.py
-      - name: Offline and PostgreSQL verification
+      - name: Complete offline and PostgreSQL verification
         env:
           DEEPRESEARCH_TEST_POSTGRES_URL: postgresql+asyncpg://deepresearch:ci-only@127.0.0.1:5432/deepresearch_test
-        run: uv run pytest -q tests/unit tests/contracts tests/integration/replay tests/integration/api tests/integration/deployment -m "not online"
-      - name: Verify publication gates using synthetic sealed fixtures only
-        run: uv run pytest -q tests/integration/benchmarks/test_release_c_gate.py tests/cli/test_experiment_commands.py
+        # Covers CLI, gold/process isolation, experiment accounting and synthetic
+        # publication gates too. No live credentials or formal result claims.
+        run: uv run pytest -q -m "not online"
       - name: Validate Compose with disposable CI-only values
         env:
           DATABASE_URL: postgresql+asyncpg://deepresearch:ci-only@postgres:5432/deepresearch
@@ -76,7 +74,14 @@ jobs:
           SESSION_SIGNING_KEY: ci-only-signing-key-at-least-32-bytes
         run: timeout 240s docker compose up -d --wait --wait-timeout 180
       - name: Prove replay completion and artifact integrity over HTTP
-        run: uv run python -m scripts.smoke_replay --api-url http://127.0.0.1:8000 --ui-url http://127.0.0.1:8501 --timeout 90
+        env:
+          DATABASE_URL: postgresql+asyncpg://deepresearch:ci-only@postgres:5432/deepresearch
+          POSTGRES_PASSWORD: ci-only
+          SESSION_SIGNING_KEY: ci-only-signing-key-at-least-32-bytes
+        run: |
+          docker compose exec -T api deepresearch --help
+          docker compose exec -T api deepresearch experiment --help
+          uv run python -m scripts.smoke_replay --api-url http://127.0.0.1:8000 --ui-url http://127.0.0.1:8501 --timeout 90
       - name: Inspect scoped Compose services on failure
         if: failure()
         env:

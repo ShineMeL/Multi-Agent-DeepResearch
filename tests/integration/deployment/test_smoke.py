@@ -3,6 +3,9 @@
 import asyncio
 import json
 import os
+import shlex
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -28,16 +31,6 @@ def test_ci_keeps_provider_secrets_out_of_verification_and_gates_online():
     assert "secrets" not in json.dumps(verify)
     commands = "\n".join(step.get("run", "") for step in verify["steps"])
     assert ' -m "not online"' in commands
-    for suite in (
-        "tests/unit",
-        "tests/contracts",
-        "tests/integration/replay",
-        "tests/integration/api",
-        "tests/integration/deployment",
-        "tests/integration/benchmarks/test_release_c_gate.py",
-        "tests/cli/test_experiment_commands.py",
-    ):
-        assert suite in commands
     assert "uv sync --all-extras --locked" in commands
     assert "ruff check ." in commands and "pyright src apps benchmarks experiments\n" in commands
     assert "pyright --pythonplatform Windows src apps benchmarks experiments" in commands
@@ -63,6 +56,32 @@ def test_ci_keeps_provider_secrets_out_of_verification_and_gates_online():
     assert test_step["env"]["DEEPRESEARCH_TEST_POSTGRES_URL"].startswith(
         "postgresql+asyncpg://deepresearch:ci-only@127.0.0.1:5432/"
     )
+    # Exercise pytest discovery, not a source-string list of directories. This
+    # accepts complete testpaths discovery and catches silently omitted suites.
+    tokens = shlex.split(test_step["run"])
+    pytest_arguments = tokens[tokens.index("pytest") + 1 :]
+    collected = subprocess.run(
+        [sys.executable, "-m", "pytest", *pytest_arguments, "--collect-only"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    selected = {line.strip() for line in collected.stdout.splitlines() if "::" in line}
+    for suite in (
+        "tests/unit/",
+        "tests/contracts/",
+        "tests/integration/replay/",
+        "tests/integration/api/",
+        "tests/integration/deployment/",
+        "tests/integration/experiments/",
+        "tests/integration/benchmarks/test_process_isolation.py",
+        "tests/integration/benchmarks/test_release_c_gate.py",
+        "tests/cli/test_experiment_commands.py",
+        "tests/cli/test_research_command.py",
+    ):
+        assert any(node.startswith(suite) for node in selected), suite
     smoke = workflow["jobs"]["online-smoke"]
     assert smoke["if"] == (
         "github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'"
